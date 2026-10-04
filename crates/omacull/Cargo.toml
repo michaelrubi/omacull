@@ -10,5 +10,10 @@ egui = "0.36.2"
 env_logger = "0.11.11"
 log = "0.4.34"
 omacull-engine = { version = "0.1.0", path = "../omacull-engine" }
+rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.6"
+
+[dev-dependencies]
+omacull-engine = { version = "0.1.0", path = "../omacull-engine", features = ["testing"] }
+serde_json = "1.0.151"

@@ -76,6 +76,13 @@ darktable has stars and a reject flag but no pick flag, so:
 
 A pick is one star. In darktable, "rated 1 or more" is the keepers.
 
+The rest of M1's keys: arrows, Home and End step; Ctrl+Z and Ctrl+Shift+Z
+undo and redo marks; A turns auto-advance after a mark on and off
+(remembered); Ctrl+O opens a folder. The filmstrip's filters are Bridge's
+Ctrl+Alt keys: Ctrl+Alt+A all, Ctrl+Alt+0 undecided, Ctrl+Alt+1 picks and
+up, Ctrl+Alt+2 to 5 that many stars and up, and Ctrl+Alt+X rejects. A
+frame marked out of the filter stays on screen until the cursor leaves it.
+
 - Sidecars are named the way darktable names them: `DSC01234.ARW.xmp`.
 - No sidecar yet: write a minimal one holding just the rating.
 - Sidecar exists: change the rating field and nothing else. darktable's
@@ -121,13 +128,49 @@ crates/
   `commands.rs` pattern, including an `OMACULL_SCRIPT` hook).
 - **Preview pipeline:** extract the embedded JPEG, decode off the UI
   thread, upload as a GPU texture. A small ring of decoded frames around
-  the cursor is kept ready, biased in the direction of travel.
-- **Thumbnail cache:** `~/.cache/omacull/`, keyed by path, size and mtime.
-  Disposable.
-- **Decision log:** `~/.local/share/omacull/`, append-only. One row per
-  mark: file identity, the mark, what it replaced, the view it was made
-  in, the frames it was compared against, time spent, timestamp. This is
-  the training set for auto-cull, so its schema is settled in M1.
+  the cursor is kept ready, biased in the direction of travel: four ahead
+  and two behind, among the frames the filter shows. The loader is a pool
+  of threads with one queue the app replaces whenever the cursor moves,
+  so a frame already passed is never decoded late.
+- **Thumbnail cache:** `~/.cache/omacull/thumbnails/`, one small JPEG per
+  raw, named for a hash of its path, size and mtime. Disposable, and not
+  pruned yet.
+- **Decision log:** `~/.local/share/omacull/decisions.jsonl`, append-only.
+  One row per mark that reached its sidecar. This is the training set for
+  auto-cull; the schema is below.
+- **Writes off the UI thread:** sidecar writes (with their fsync) and log
+  appends go to one disk thread, in order, so a slow disk never delays the
+  next frame. A write that fails puts the frame back to what its sidecar
+  holds and says so in the status bar. Closing the window waits for the
+  queue to empty.
+
+### Decision log
+
+Settled in M1. JSON Lines, one object per mark, version 1:
+
+```json
+{"v":1,"at":1791133520394,"session":1791133520249,
+ "file":{"path":"/home/michael/Pictures/2026-10-04/DSC01234.ARW","size":24771584,
+         "modified":1791133349,"captured":"2026:10:04 15:43:16.123"},
+ "rating":3,"was":0,"how":"mark","view":"loupe","compared":[],
+ "filter":"all","dwell_ms":1840}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `v` | Schema version. Bump it when a field changes meaning; adding a field doesn't. |
+| `at` | When the mark was made, milliseconds since 1970. |
+| `session` | When Omacull was started, the same for a sitting. |
+| `file` | The raw: canonical `path`, `size` in bytes, `modified` (seconds since 1970), and `captured`, the Exif capture time with sub-seconds. Name, size and capture time find the raw again after a folder moves. |
+| `rating`, `was` | The mark made and the mark it replaced, as `xmp:Rating` (-1 to 5). |
+| `how` | `mark` for a mark key, `undo` or `redo` when those changed it. An undone mark stays in the log; the last row for a file is what it ended as. |
+| `view` | `loupe` (later `compare` and `survey`). |
+| `compared` | The other frames on screen, as `file` objects. Empty in the loupe. |
+| `filter` | The filter in use: `all`, `undecided`, `rejects`, or `{"at_least":N}`. |
+| `dwell_ms` | How long the frame had been on screen when it was marked. Undo and redo go to the frame they change, so theirs is usually 0. |
+
+A mark that repeats the frame's mark isn't logged, nor is one whose
+sidecar couldn't be written.
 - **Colour:** embedded previews are sRGB or Adobe RGB per the camera
   setting; convert to the monitor profile with lcms2 as Omapix does.
 
@@ -143,7 +186,12 @@ nothing larger. So:
   texture upload; 500 previews decode in half a second on all cores.
 - **Filmstrip thumbnails** for a 500-frame folder decode in under 20 ms
   from the camera's own thumbnails, cold. Those are 160×120 with black
-  bars, so M1 decides between them and downscaled previews in the cache.
+  bars, too small and the wrong shape for a HiDPI filmstrip, so M1 shrinks
+  the preview to 320 pixels on the long edge instead and caches it as a
+  JPEG. The first open of a folder fills the cache in the background on
+  every core, nearest the cursor first, after the loupe's previews; later
+  opens read the cache. Until a thumbnail lands its cell is empty, and the
+  loupe shows the enlarged thumbnail until the preview lands.
 - **100% zoom** needs a real decode of the raw: there is no full-size
   JPEG to zoom into. With `rawler`, untuned, that is about 25 ms to decode
   and 200 ms to develop a 24 MP frame, so it has to be prefetched for the

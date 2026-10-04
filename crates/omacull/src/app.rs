@@ -1,12 +1,38 @@
-//! The window: for now an empty one, themed, that takes commands.
+//! The window: a folder's frames in the loupe and the filmstrip, marked
+//! from the keyboard.
 
 use std::collections::VecDeque;
-use std::sync::mpsc::Receiver;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::time::SystemTime;
 
-use egui::{RichText, Ui};
+use egui::{Align2, FontId, RichText, Sense, Ui, pos2, vec2};
+use omacull_engine::cull::{Change, Cull, Filter, Step};
+use omacull_engine::disk::{self, Disk, How, Mark, Problem};
+use omacull_engine::thumbs;
 
 use crate::commands::Command;
+use crate::hotkeys::{self, format_shortcut};
+use crate::shoot::Shoot;
+use crate::state::State;
 use crate::theme::{self, Theme};
+
+/// Where Omacull keeps what it makes; somewhere else in tests.
+pub struct Paths {
+    /// Filmstrip thumbnails.
+    pub cache: Option<PathBuf>,
+    /// The decision log.
+    pub log: Option<PathBuf>,
+}
+
+/// A folder being read.
+struct Opening {
+    dir: PathBuf,
+    /// The raw to start at, when a raw was opened rather than a folder.
+    select: Option<PathBuf>,
+    result: Receiver<io::Result<(Cull, Vec<String>)>>,
+}
 
 pub struct App {
     theme: Theme,
@@ -17,10 +43,20 @@ pub struct App {
     /// command names, e.g. `Next,Pick,Quit`). For testing without a
     /// keyboard.
     script: VecDeque<Command>,
+    state: State,
+    paths: Paths,
+    shoot: Option<Shoot>,
+    opening: Option<Opening>,
+    /// The folder picker, while it's open.
+    picking: Option<Receiver<Option<PathBuf>>>,
+    disk: Disk,
+    /// The last thing to tell the user, and whether it's a problem.
+    message: Option<(String, bool)>,
+    title: String,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> Self {
         let ctx = &cc.egui_ctx;
         // Ctrl+= / Ctrl+- are for zooming the image, not the interface.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
@@ -32,37 +68,182 @@ impl App {
         for w in &warnings {
             log::warn!("{w}");
         }
+        let script = std::env::var("OMACULL_SCRIPT")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .filter_map(|step| {
+                let parsed = Command::from_name(step.trim());
+                if parsed.is_none() {
+                    log::warn!("OMACULL_SCRIPT: can't understand {step:?}");
+                }
+                parsed
+            })
+            .collect();
+        let paths = Paths { cache: thumbs::default_dir(), log: disk::default_log() };
+        let mut app = Self::build(theme, theme::watch(ctx.clone()), warnings, script, State::load(), paths, ctx);
+        if let Some(path) = open {
+            app.open(path, ctx);
+        }
+        app
+    }
+
+    fn build(
+        theme: Theme,
+        theme_rx: Receiver<Theme>,
+        warnings: Vec<String>,
+        script: VecDeque<Command>,
+        state: State,
+        paths: Paths,
+        ctx: &egui::Context,
+    ) -> Self {
+        let session = disk::millis(SystemTime::now());
+        let wake = ctx.clone();
+        let disk = Disk::new(paths.log.clone(), session, move || wake.request_repaint());
         Self {
             theme,
-            theme_rx: theme::watch(ctx.clone()),
+            theme_rx,
             warnings,
-            script: std::env::var("OMACULL_SCRIPT")
-                .unwrap_or_default()
-                .split(',')
-                .filter(|s| !s.trim().is_empty())
-                .filter_map(|step| {
-                    let parsed = Command::from_name(step.trim());
-                    if parsed.is_none() {
-                        log::warn!("OMACULL_SCRIPT: can't understand {step:?}");
-                    }
-                    parsed
-                })
-                .collect(),
+            script,
+            state,
+            paths,
+            shoot: None,
+            opening: None,
+            picking: None,
+            disk,
+            message: None,
+            title: String::new(),
+        }
+    }
+
+    /// Open a folder of raws in the background, or the folder a raw is in,
+    /// starting at that raw.
+    fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let (dir, select) = match path.parent() {
+            Some(parent) if path.is_file() => (parent.to_path_buf(), Some(path)),
+            _ => (path, None),
+        };
+        let (tx, rx) = channel();
+        let (ctx, target) = (ctx.clone(), dir.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Cull::open(&target));
+            ctx.request_repaint();
+        });
+        self.message = Some((format!("Opening {}…", dir.display()), false));
+        self.opening = Some(Opening { dir, select, result: rx });
+    }
+
+    fn finish_opening(&mut self, ctx: &egui::Context) {
+        let Some(opening) = &self.opening else { return };
+        let result = match opening.result.try_recv() {
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(io::Error::other("reading the folder failed")),
+            Ok(result) => result,
+        };
+        let Opening { dir, select, .. } = self.opening.take().unwrap();
+        match result {
+            Ok((mut cull, problems)) => {
+                if let Some(at) = select.and_then(|s| cull.frames().iter().position(|f| f.path == s)) {
+                    cull.go_to(at);
+                }
+                self.state.add_recent(cull.dir());
+                self.message = problems.first().map(|first| {
+                    let text = match problems.len() {
+                        1 => format!("Couldn't read {first}"),
+                        n => format!("Couldn't read {n} sidecars, e.g. {first}"),
+                    };
+                    (text, true)
+                });
+                self.shoot = Some(Shoot::new(cull, self.paths.cache.clone(), ctx));
+            }
+            Err(e) => {
+                if !dir.is_dir() {
+                    self.state.remove_recent(&dir);
+                }
+                self.message = Some((format!("Couldn't open {}: {e}", dir.display()), true));
+            }
+        }
+    }
+
+    /// Ask for a folder to open, with the system's picker.
+    fn pick(&mut self, ctx: &egui::Context) {
+        if self.picking.is_some() {
+            return;
+        }
+        let open = self.shoot.as_ref().map(|s| s.cull.dir().to_path_buf());
+        let start = open.or_else(|| self.state.recent.first().cloned());
+        let mut dialog = rfd::FileDialog::new().set_title("Open Folder");
+        if let Some(dir) = start {
+            dialog = dialog.set_directory(dir);
+        }
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(dialog.pick_folder());
+            ctx.request_repaint();
+        });
+        self.picking = Some(rx);
+    }
+
+    fn finish_picking(&mut self, ctx: &egui::Context) {
+        let Some(picking) = &self.picking else { return };
+        match picking.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) | Ok(None) => self.picking = None,
+            Ok(Some(dir)) => {
+                self.picking = None;
+                self.open(dir, ctx);
+            }
         }
     }
 
     fn run(&mut self, command: Command, ctx: &egui::Context) {
         match command {
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            // Nothing is open to step through or mark until M1.
-            Command::Undo | Command::Redo => {}
-            Command::Previous | Command::Next | Command::First | Command::Last => {}
-            Command::Reject | Command::Unmark | Command::Pick => {}
-            Command::Star1 | Command::Star2 | Command::Star3 | Command::Star4 | Command::Star5 => {}
+            Command::Open => self.pick(ctx),
+            Command::AutoAdvance => {
+                let on = !self.state.auto_advance;
+                self.state.set_auto_advance(on);
+                self.message = Some((format!("Auto-advance {}", if on { "on" } else { "off" }), false));
+            }
+            _ => {}
+        }
+        let Some(shoot) = &mut self.shoot else { return };
+        let cull = &mut shoot.cull;
+        match command {
+            Command::Undo => match cull.undo() {
+                Some(change) => record(&self.disk, shoot, change, How::Undo),
+                None => self.message = Some(("Nothing to undo".into(), false)),
+            },
+            Command::Redo => match cull.redo() {
+                Some(change) => record(&self.disk, shoot, change, How::Redo),
+                None => self.message = Some(("Nothing to redo".into(), false)),
+            },
+            Command::Previous => _ = cull.step(Step::Previous),
+            Command::Next => _ = cull.step(Step::Next),
+            Command::First => _ = cull.step(Step::First),
+            Command::Last => _ = cull.step(Step::Last),
+            _ => {}
+        }
+        if let Some(rating) = command.rating() {
+            if let Some(change) = shoot.cull.mark(rating) {
+                record(&self.disk, shoot, change, How::Mark);
+            }
+            if self.state.auto_advance {
+                shoot.cull.step(Step::Next);
+            }
+        }
+        if let Some(filter) = command.filter() {
+            shoot.cull.set_filter(filter);
         }
     }
 
     fn run_script(&mut self, ctx: &egui::Context) {
+        // A folder named on the command line is opened first.
+        if self.opening.is_some() {
+            return;
+        }
         let Some(command) = self.script.pop_front() else {
             return;
         };
@@ -71,49 +252,243 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// Marks that didn't reach their sidecar are put back as they are on
+    /// disk.
+    fn disk_problems(&mut self) {
+        let problems: Vec<Problem> = self.disk.problems().collect();
+        for problem in problems {
+            let text = match problem {
+                Problem::Sidecar { path, error, on_disk } => {
+                    if let Some(shoot) = &mut self.shoot {
+                        shoot.cull.restore(&path, on_disk);
+                    }
+                    format!("Couldn't mark {}: {error}", file_name(&path))
+                }
+                Problem::Log(error) => format!("Couldn't write the decision log: {error}"),
+            };
+            self.message = Some((text, true));
+        }
+    }
+
     /// A frame's work before anything is drawn.
     fn step(&mut self, ctx: &egui::Context) {
         if let Some(theme) = self.theme_rx.try_iter().last() {
             ctx.set_visuals(theme.visuals());
             self.theme = theme;
         }
+        self.finish_picking(ctx);
+        self.finish_opening(ctx);
+        self.disk_problems();
         if !ctx.egui_wants_keyboard_input() {
             for command in Command::pressed(ctx) {
                 self.run(command, ctx);
             }
         }
         self.run_script(ctx);
+        if let Some(shoot) = &mut self.shoot {
+            shoot.update(ctx);
+        }
+        let title = match &self.shoot {
+            Some(shoot) => format!("{} — Omacull", file_name(shoot.cull.dir())),
+            None => "Omacull".into(),
+        };
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
     }
 
     fn show(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
         let bar = egui::Frame::new()
             .fill(self.theme.dark_background)
             .inner_margin(egui::Margin::symmetric(8, 4));
-        egui::Panel::bottom("status")
+        let command = egui::Panel::bottom("status")
             .frame(bar)
-            .show(ui, |ui| self.status_bar(ui));
-        let pasteboard = egui::Frame::new().fill(self.theme.pasteboard());
-        egui::CentralPanel::no_frame()
-            .frame(pasteboard)
-            .show(ui, |ui| self.empty_state(ui));
-    }
-
-    fn status_bar(&self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            if self.warnings.is_empty() {
-                ui.label(RichText::new("No folder open").color(self.theme.dark_foreground));
-            } else {
-                ui.label(RichText::new(self.warnings.join("; ")).color(self.theme.red));
+            .show(ui, |ui| self.status_bar(ui))
+            .inner;
+        if let Some(command) = command {
+            self.run(command, &ctx);
+        }
+        let theme = self.theme.clone();
+        if let Some(shoot) = &mut self.shoot {
+            let strip = egui::Frame::new().fill(theme.darker_background);
+            let clicked = egui::Panel::bottom("filmstrip")
+                .frame(strip)
+                .resizable(false)
+                .show(ui, |ui| shoot.filmstrip(ui, &theme))
+                .inner;
+            if let Some(index) = clicked {
+                shoot.cull.go_to(index);
             }
+        }
+        let pasteboard = egui::Frame::new().fill(self.theme.pasteboard());
+        let mut clicked = None;
+        egui::CentralPanel::no_frame().frame(pasteboard).show(ui, |ui| match &self.shoot {
+            Some(shoot) => shoot.loupe(ui, &theme),
+            None => clicked = self.empty_state(ui),
         });
+        match clicked {
+            Some(Some(dir)) => self.open(dir, &ctx),
+            Some(None) => self.run(Command::Open, &ctx),
+            None => {}
+        }
     }
 
-    fn empty_state(&self, ui: &mut Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.4);
-            ui.label(RichText::new("Omacull").size(28.0).color(self.theme.accent));
+    /// Where the cull stands, and the filter and auto-advance switches.
+    /// Returns the command for a switch clicked.
+    fn status_bar(&self, ui: &mut Ui) -> Option<Command> {
+        let mut command = None;
+        ui.horizontal(|ui| {
+            match &self.shoot {
+                Some(shoot) => _ = ui.label(RichText::new(status(&shoot.cull)).color(self.theme.foreground)),
+                None => _ = ui.label(RichText::new("No folder open").color(self.theme.dark_foreground)),
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(shoot) = &self.shoot {
+                    let filter = shoot.cull.filter();
+                    egui::ComboBox::from_id_salt("filter")
+                        .selected_text(format!("Show: {}", filter.label()))
+                        .show_ui(ui, |ui| {
+                            for f in Filter::ALL {
+                                let label = ui.selectable_label(f == filter, f.label());
+                                if label.on_hover_text(shortcut(Command::show(f))).clicked() {
+                                    command = Some(Command::show(f));
+                                }
+                            }
+                        });
+                    let auto = ui.selectable_label(self.state.auto_advance, "Auto-advance");
+                    if auto.on_hover_text(shortcut(Command::AutoAdvance)).clicked() {
+                        command = Some(Command::AutoAdvance);
+                    }
+                }
+                let warnings = (!self.warnings.is_empty()).then(|| (self.warnings.join("; "), true));
+                if let Some((text, problem)) = self.message.clone().or(warnings) {
+                    let colour = if problem { self.theme.red } else { self.theme.dark_foreground };
+                    ui.add(egui::Label::new(RichText::new(text).color(colour)).truncate());
+                }
+            });
         });
+        command
     }
+
+    /// The title, Open… and the recent folders. Returns what was clicked: a
+    /// recent folder, or None for Open….
+    fn empty_state(&self, ui: &mut Ui) -> Option<Option<PathBuf>> {
+        let mut clicked = None;
+        ui.vertical_centered(|ui| {
+            let space = if self.state.recent.is_empty() { 0.4 } else { 0.18 };
+            ui.add_space(ui.available_height() * space);
+            ui.label(RichText::new("Omacull").size(28.0).color(self.theme.accent));
+            ui.add_space(8.0);
+            let open = format!("Open a folder of raws with {}", shortcut(Command::Open));
+            ui.label(RichText::new(open).color(self.theme.dark_foreground));
+            ui.add_space(12.0);
+            if ui.button("Open…").clicked() {
+                clicked = Some(None);
+            }
+            if self.state.recent.is_empty() {
+                return;
+            }
+            ui.add_space(20.0);
+            ui.label(RichText::new("Recent folders").strong().color(self.theme.foreground));
+            ui.add_space(6.0);
+            egui::Frame::new()
+                .fill(self.theme.dark_background)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_max_width(450.0);
+                    let (big, small) = (FontId::proportional(13.0), FontId::proportional(11.0));
+                    for dir in self.state.recent.iter().take(8) {
+                        let size = vec2(ui.available_width(), 26.0);
+                        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+                        if response.hovered() {
+                            ui.painter().rect_filled(rect, 0.0, self.theme.lighter_background);
+                        }
+                        let painter = ui.painter();
+                        let left = pos2(rect.left() + 6.0, rect.center().y);
+                        let (name, foreground) = (file_name(dir), self.theme.foreground);
+                        let name = painter.text(left, Align2::LEFT_CENTER, name, big.clone(), foreground);
+                        // The folder it's in, shortened from the left to fit.
+                        let room = rect.right() - 6.0 - (name.right() + 24.0);
+                        let parent = elided(painter, &home_relative(dir.parent().unwrap_or(dir)), &small, room);
+                        let right = pos2(rect.right() - 6.0, rect.center().y);
+                        painter.text(right, Align2::RIGHT_CENTER, parent, small.clone(), self.theme.dark_foreground);
+                        if response.clicked() {
+                            clicked = Some(Some(dir.clone()));
+                        }
+                    }
+                });
+        });
+        clicked
+    }
+}
+
+/// Record a change in the sidecar and the decision log.
+fn record(disk: &Disk, shoot: &mut Shoot, change: Change, how: How) {
+    let dwell = shoot.dwell();
+    let cull = &shoot.cull;
+    disk.write(Mark {
+        path: cull.frames()[change.index].path.clone(),
+        rating: change.now,
+        was: change.was,
+        how,
+        view: "loupe",
+        compared: Vec::new(),
+        filter: cull.filter(),
+        dwell,
+        at: SystemTime::now(),
+    });
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned()
+}
+
+/// A path with the home folder written as ~.
+fn home_relative(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) => Path::new("~").join(rest).display().to_string(),
+        None => path.display().to_string(),
+    }
+}
+
+/// `text` without as much of its start as it takes to fit `width`.
+fn elided(painter: &egui::Painter, text: &str, font: &FontId, width: f32) -> String {
+    let fits = |t: &str| painter.layout_no_wrap(t.to_owned(), font.clone(), egui::Color32::WHITE).size().x <= width;
+    if fits(text) {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    (1..chars.len())
+        .map(|skip| format!("…{}", chars[skip..].iter().collect::<String>()))
+        .find(|t| fits(t))
+        .unwrap_or_default()
+}
+
+/// A command's shortcut, for a tooltip.
+fn shortcut(command: Command) -> String {
+    hotkeys::current().command(command).map_or_else(|| "No shortcut".into(), |s| format_shortcut(&s))
+}
+
+/// The current frame, its place in the folder, and the cull so far.
+fn status(cull: &Cull) -> String {
+    let counts = cull.counts();
+    let filter = cull.filter();
+    let shown = match filter {
+        Filter::All => String::new(),
+        _ => format!(" ({} shown)", cull.frames().iter().filter(|f| filter.matches(f.rating)).count()),
+    };
+    format!(
+        "{}   {} / {}{shown}   {} picks   {} rejects   {} undecided",
+        file_name(&cull.frame().path),
+        cull.current() + 1,
+        cull.frames().len(),
+        counts.picks,
+        counts.rejects,
+        counts.undecided,
+    )
 }
 
 impl eframe::App for App {
@@ -124,14 +499,26 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.show(ui);
     }
-}
 
+    fn on_exit(&mut self) {
+        // Don't lose the last marks.
+        self.disk.finish();
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
 
-    use egui::{Event, Key, Modifiers};
+    use egui::{Event, Key, Modifiers, PointerButton};
+    use omacull_engine::cull::PICK;
+    use omacull_engine::sidecar::{self, REJECT};
+    use omacull_engine::testing::{Arw, Folder};
+
+    const NONE: Modifiers = Modifiers::NONE;
+    const CMD_SHIFT: Modifiers = Modifiers { shift: true, ..Modifiers::COMMAND };
+    const CMD_ALT: Modifiers = Modifiers { alt: true, ..Modifiers::COMMAND };
 
     /// The app driven with synthetic events, with no window or GPU.
     struct Harness {
@@ -142,17 +529,23 @@ mod tests {
 
     impl Harness {
         fn new(script: &[Command]) -> Self {
+            Self::with(Paths { cache: None, log: None }, script)
+        }
+
+        fn with(paths: Paths, script: &[Command]) -> Self {
             let (_tx, rx) = channel();
-            Self {
-                ctx: egui::Context::default(),
-                app: App {
-                    theme: Theme::default(),
-                    theme_rx: rx,
-                    warnings: Vec::new(),
-                    script: script.iter().copied().collect(),
-                },
-                time: 0.0,
-            }
+            let ctx = egui::Context::default();
+            let script = script.iter().copied().collect();
+            let app = App::build(Theme::default(), rx, Vec::new(), script, State::default(), paths, &ctx);
+            Self { ctx, app, time: 0.0 }
+        }
+
+        /// The app with `folder` open and its first preview shown.
+        fn open(folder: &Folder, paths: Paths) -> Self {
+            let mut h = Self::with(paths, &[]);
+            h.app.open(folder.0.clone(), &h.ctx.clone());
+            h.wait("the first preview", |app| app.shoot.as_ref().is_some_and(|s| s.preview_ready()));
+            h
         }
 
         fn frame(&mut self, events: Vec<Event>) -> egui::FullOutput {
@@ -184,6 +577,31 @@ mod tests {
                 },
             ])
         }
+
+        fn click(&mut self, at: egui::Pos2) {
+            let button =
+                |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: NONE };
+            self.frame(vec![Event::PointerMoved(at), button(true)]);
+            self.frame(vec![button(false)]);
+        }
+
+        /// Run frames until `done`, as the background threads finish.
+        fn wait(&mut self, what: &str, done: impl Fn(&App) -> bool) {
+            let started = Instant::now();
+            while !done(&self.app) {
+                assert!(started.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+                self.frame(vec![]);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn cull(&self) -> &Cull {
+            &self.app.shoot.as_ref().unwrap().cull
+        }
+
+        fn ratings(&self) -> Vec<i32> {
+            self.cull().frames().iter().map(|f| f.rating).collect()
+        }
     }
 
     fn closes(output: &egui::FullOutput) -> bool {
@@ -209,5 +627,157 @@ mod tests {
         assert!(!closes(&h.frame(vec![])));
         assert!(closes(&h.frame(vec![])));
         assert!(h.app.script.is_empty());
+    }
+
+    #[test]
+    fn marks_step_undo_and_redo_and_reach_the_sidecars_and_the_log() {
+        let folder = Folder::with_raws("app-marks", 5, &Arw::default());
+        sidecar::write(&folder.raw(3), 4).unwrap();
+        let log = folder.0.join("decisions.jsonl");
+        let mut h = Harness::open(&folder, Paths { cache: None, log: Some(log.clone()) });
+        assert_eq!(h.ratings(), [0, 0, 4, 0, 0], "existing ratings are read on open");
+        assert_eq!(h.app.title, format!("omacull-{}-app-marks — Omacull", std::process::id()));
+
+        h.press(NONE, Key::ArrowRight);
+        assert_eq!(h.cull().current(), 1);
+        h.press(NONE, Key::P);
+        h.press(NONE, Key::End);
+        assert_eq!(h.cull().current(), 4);
+        h.press(NONE, Key::X);
+        assert_eq!(h.ratings(), [0, PICK, 4, 0, REJECT]);
+        assert_eq!(h.cull().current(), 4, "no auto-advance by default");
+
+        h.press(Modifiers::COMMAND, Key::Z);
+        h.press(Modifiers::COMMAND, Key::Z);
+        assert_eq!(h.ratings(), [0, 0, 4, 0, 0]);
+        assert_eq!(h.cull().current(), 1, "undo shows the frame it changed");
+        h.press(CMD_SHIFT, Key::Z);
+        assert_eq!(h.ratings(), [0, PICK, 4, 0, 0]);
+        h.press(NONE, Key::Home);
+        assert_eq!(h.cull().current(), 0);
+        h.press(NONE, Key::Num0);
+        assert_eq!(status(h.cull()), "DSC00001.ARW   1 / 5   2 picks   0 rejects   3 undecided");
+
+        h.app.disk.finish();
+        assert_eq!(sidecar::read(&folder.raw(1)).unwrap(), None, "no sidecar made for no mark");
+        assert_eq!(sidecar::read(&folder.raw(2)).unwrap(), Some(PICK));
+        assert_eq!(sidecar::read(&folder.raw(5)).unwrap(), Some(0));
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(&log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let name = |r: &serde_json::Value| r["file"]["path"].as_str().unwrap().rsplit('/').next().unwrap().to_owned();
+        let summary: Vec<_> =
+            rows.iter().map(|r| (r["how"].as_str().unwrap(), name(r), r["rating"].as_i64().unwrap())).collect();
+        assert_eq!(
+            summary,
+            [
+                ("mark", "DSC00002.ARW".into(), 1),
+                ("mark", "DSC00005.ARW".into(), -1),
+                ("undo", "DSC00005.ARW".into(), 0),
+                ("undo", "DSC00002.ARW".into(), 0),
+                ("redo", "DSC00002.ARW".into(), 1),
+            ]
+        );
+        assert!(rows.iter().all(|r| r["view"] == "loupe" && r["session"] == rows[0]["session"]));
+    }
+
+    #[test]
+    fn auto_advance_and_filters() {
+        let folder = Folder::with_raws("app-filters", 6, &Arw::default());
+        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        h.press(NONE, Key::A);
+        assert!(h.app.state.auto_advance);
+        h.press(NONE, Key::P);
+        h.press(NONE, Key::X);
+        h.press(NONE, Key::Num3);
+        assert_eq!(h.ratings(), [PICK, REJECT, 3, 0, 0, 0]);
+        assert_eq!(h.cull().current(), 3);
+
+        h.press(CMD_ALT, Key::Num0);
+        assert_eq!(h.cull().filter(), Filter::Undecided);
+        assert_eq!(h.cull().shown_indices(), [3, 4, 5]);
+        h.press(NONE, Key::Num5);
+        assert_eq!(h.cull().current(), 4);
+        assert_eq!(h.cull().shown_indices(), [4, 5]);
+
+        h.press(CMD_ALT, Key::X);
+        assert_eq!(h.cull().current(), 1, "moved onto the only reject");
+        h.press(CMD_ALT, Key::Num1);
+        assert_eq!(h.cull().current(), 2);
+        h.press(NONE, Key::ArrowRight);
+        assert_eq!(h.cull().current(), 3);
+        h.press(NONE, Key::ArrowRight);
+        assert_eq!(h.cull().current(), 3, "nothing after it is a pick");
+        assert_eq!(status(h.cull()), "DSC00004.ARW   4 / 6 (3 shown)   3 picks   1 rejects   2 undecided");
+        h.press(CMD_ALT, Key::A);
+        assert_eq!(h.cull().shown_indices().len(), 6);
+
+        h.press(NONE, Key::A);
+        assert!(!h.app.state.auto_advance);
+    }
+
+    #[test]
+    fn neighbours_are_decoded_ahead_and_thumbnails_cached() {
+        let folder = Folder::with_raws("app-prefetch", 12, &Arw::default());
+        let cache = folder.0.join("cache");
+        let mut h = Harness::open(&folder, Paths { cache: Some(cache.clone()), log: None });
+        let previews = |app: &App, range: std::ops::RangeInclusive<usize>| {
+            range.into_iter().all(|i| app.shoot.as_ref().unwrap().has_preview(i))
+        };
+        h.wait("the next four previews", |app| previews(app, 0..=4));
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        h.wait("previews ahead", |app| previews(app, 0..=6));
+        h.wait("the loader", |app| app.shoot.as_ref().unwrap().idle());
+        h.frame(vec![]);
+        let shoot = h.app.shoot.as_ref().unwrap();
+        assert!(!shoot.has_preview(7), "only four ahead");
+        // Going back, the ring turns round.
+        h.press(NONE, Key::ArrowLeft);
+        h.wait("previews behind", |app| previews(app, 0..=1));
+        let shoot = h.app.shoot.as_ref().unwrap();
+        assert!(!shoot.has_preview(5) && !shoot.has_preview(6), "two behind");
+
+        assert!((0..=5).all(|i| shoot.has_thumbnail(i)), "the filmstrip's thumbnails");
+        h.wait("the whole folder in the cache", |_| std::fs::read_dir(&cache).unwrap().count() == 12);
+    }
+
+    #[test]
+    fn clicking_a_thumbnail_goes_to_it() {
+        let folder = Folder::with_raws("app-click", 4, &Arw::default());
+        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let cells = h.app.shoot.as_ref().unwrap().cells.clone();
+        let (index, rect) = cells.iter().copied().find(|&(i, _)| i == 2).unwrap();
+        assert!(rect.bottom() <= 600.0 && rect.top() > 300.0, "the strip is at the bottom: {rect:?}");
+        h.click(rect.center());
+        assert_eq!(h.cull().current(), index);
+    }
+
+    #[test]
+    fn opening_a_raw_starts_at_it() {
+        let folder = Folder::with_raws("app-open-raw", 4, &Arw::default());
+        let mut h = Harness::with(Paths { cache: None, log: None }, &[]);
+        h.app.open(folder.raw(3), &h.ctx.clone());
+        h.wait("the folder", |app| app.shoot.is_some());
+        assert_eq!(h.cull().current(), 2);
+        assert_eq!(h.cull().frames().len(), 4);
+
+        let empty = Folder::new("app-open-empty");
+        h.app.open(empty.0.clone(), &h.ctx.clone());
+        h.wait("the empty folder", |app| app.opening.is_none());
+        assert!(h.app.message.as_ref().is_some_and(|(m, problem)| *problem && m.contains("no raws")));
+        assert_eq!(h.cull().frames().len(), 4, "the open folder stays");
+    }
+
+    #[test]
+    fn a_mark_that_cant_be_written_is_taken_back() {
+        let folder = Folder::with_raws("app-unwritable", 2, &Arw::default());
+        std::fs::write(sidecar::path_for(&folder.raw(1)), "not a sidecar").unwrap();
+        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        assert!(h.app.message.as_ref().is_some_and(|(m, problem)| *problem && m.contains("DSC00001.ARW.xmp")));
+        h.press(NONE, Key::Num4);
+        assert_eq!(h.ratings(), [4, 0]);
+        h.wait("the write to fail", |app| app.message.as_ref().is_some_and(|(m, _)| m.starts_with("Couldn't mark")));
+        assert_eq!(h.ratings(), [0, 0]);
+        assert_eq!(std::fs::read_to_string(sidecar::path_for(&folder.raw(1))).unwrap(), "not a sidecar");
     }
 }

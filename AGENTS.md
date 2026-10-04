@@ -2,7 +2,7 @@
 
 Omacull is a fast, keyboard-first photo culler for Omarchy: a folder of raws in, XMP ratings out, then on to darktable. It is the first stage of the workflow Omapix (`~/dev/omapix`) finishes.
 
-**Status:** M0 done: the engine reads embedded previews, focus locations and sidecar ratings, and the app is an empty themed window. Read [docs/DESIGN.md](docs/DESIGN.md) for scope and architecture and [docs/ROADMAP.md](docs/ROADMAP.md) for the milestones. M1 is next.
+**Status:** M1 built: open a folder, step through embedded previews with a filmstrip, mark, filter and undo, with sidecars and the decision log written as you go. Waiting on a hand test with a real shoot. Read [docs/DESIGN.md](docs/DESIGN.md) for scope and architecture and [docs/ROADMAP.md](docs/ROADMAP.md) for the milestones. M2 is next.
 
 ## Principles
 
@@ -18,7 +18,7 @@ Omacull is a fast, keyboard-first photo culler for Omarchy: a folder of raws in,
 - Keep diffs minimal and surgical. No speculative abstractions or unnecessary dependencies.
 - Sidecar writes must leave everything except the rating byte-for-byte intact. Test against real darktable-written sidecars.
 - Hand testing: Michael tests from the installed binary, not `cargo run`. After a change he'll try by hand, run `make install` and ask him to restart Omacull.
-- Whenever non-trivial UI or engine logic is added, write a headless test. In `omacull`, use the `Harness` in `app.rs` (driving egui with synthetic events).
+- Whenever non-trivial UI or engine logic is added, write a headless test. In `omacull`, use the `Harness` in `app.rs` (driving egui with synthetic events). Fake raws with real embedded JPEGs come from `omacull_engine::testing` (the `testing` feature).
 
 ## Build and test commands
 
@@ -32,8 +32,8 @@ cargo build --release
 # Build and install to ~/.local/bin (the copy Michael actually runs)
 make install
 
-# Run the app
-cargo run --release
+# Run the app, with a folder of raws (or a raw, to start at it)
+cargo run --release -- path/to/shoot
 
 # Drive the UI without a keyboard: comma-separated Command names
 OMACULL_SCRIPT="Next,Pick,Quit" cargo run --release
