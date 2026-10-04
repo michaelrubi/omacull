@@ -70,7 +70,7 @@ darktable has stars and a reject flag but no pick flag, so:
 | Mark      | `xmp:Rating` | Key (default) |
 |-----------|--------------|---------------|
 | Reject    | -1           | X             |
-| Unmarked  | 0            | U             |
+| Unmarked  | 0            | U or 0        |
 | Pick      | 1            | P             |
 | Stars     | 1 to 5       | 1 to 5        |
 
@@ -83,10 +83,22 @@ A pick is one star. In darktable, "rated 1 or more" is the keepers.
 - Writes are atomic (write a temp file, rename over).
 - Marks are undoable for the length of the session.
 
+Checked in M0 against darktable 5.6.1, on copies, by importing into
+scratch libraries with `darktable-cli` and reading the result from the
+library database: stars arrive as stars, -1 arrives as rejected, a
+sidecar with a 26-step history keeps all 26 steps and differs from the
+original only in the rating's characters, and a fresh rating-only sidecar
+imports with the rating and darktable's default edit. darktable left our
+sidecars as we wrote them.
+
 Known wrinkle: darktable reads sidecars on import, but for images already
-in its library it only picks up changes when "look for updated XMP files
-on startup" is turned on. Re-culling an already-imported shoot depends on
-that preference. To be confirmed in the M0 round-trip test.
+in its library the database wins unless "look for updated XMP files on
+startup" is turned on (it is off in Michael's config), in which case
+darktable asks at startup which side to keep. Re-culling an
+already-imported shoot depends on that preference; without it darktable
+writes its own rating back over ours the next time it saves the sidecar.
+The normal flow, cull then import, is unaffected. Still to be looked at by
+eye in the darktable window.
 
 ## Architecture
 
@@ -119,20 +131,36 @@ crates/
 - **Colour:** embedded previews are sRGB or Adobe RGB per the camera
   setting; convert to the monitor profile with lcms2 as Omapix does.
 
-### Open technical question: how big is the embedded preview?
+### The embedded preview is small
 
-Everything about "instant 100% zoom" depends on it. Many Sony bodies embed
-only a 1616×1080 preview in the ARW; some newer ones embed a full-size
-JPEG. Which one Michael's camera writes decides the design:
+Answered in M0 with a real shoot (787 frames from the ILCE-7M3): every
+raw embeds a 1616×1080 preview (about 840 KB) and a 160×120 thumbnail, and
+nothing larger. So:
 
-- **Full-size preview:** 100% zoom, peaking and eye checks all run on the
-  embedded JPEG. Simple and instant.
-- **Small preview only:** stepping still uses the embedded JPEG, but
-  zooming to 100% triggers a fast real decode of the raw (half-size or
-  full demosaic, cached, prefetched for neighbours). More work, and the
-  zoomed image won't match the camera's rendering exactly.
+- **Stepping** uses the 1616×1080 preview. Finding it in the raw takes
+  0.01 ms, reading it 0.1 ms warm and 0.7 ms cold, decoding it to RGBA
+  about 10 ms on one core. Prefetched neighbours cost nothing but the
+  texture upload; 500 previews decode in half a second on all cores.
+- **Filmstrip thumbnails** for a 500-frame folder decode in under 20 ms
+  from the camera's own thumbnails, cold. Those are 160×120 with black
+  bars, so M1 decides between them and downscaled previews in the cache.
+- **100% zoom** needs a real decode of the raw: there is no full-size
+  JPEG to zoom into. With `rawler`, untuned, that is about 25 ms to decode
+  and 200 ms to develop a 24 MP frame, so it has to be prefetched for the
+  neighbours and cached, with the upscaled preview shown until it lands.
+  The zoomed image won't match the camera's rendering exactly. This is
+  M2's main piece of work.
+- **Focus location** is in the Sony makernotes (tag 0x2027: frame width,
+  frame height, x, y) and reads correctly for 777 of the 787 frames,
+  matching exiftool. The other ten were shot with tracking and record
+  zeros. Manual-focus frames record the frame centre, which means nothing,
+  so the overlay should be hidden for those.
 
-M0 answers this with real files before any UI is built.
+Other bodies may embed a full-size JPEG; the reader lists every embedded
+JPEG, so those would get instant zoom for free. Rerun the spike on a new
+camera's files:
+
+    cargo run --release -p omacull-engine --example spike -- <folder>
 
 ## Prior art
 
@@ -152,10 +180,18 @@ scoping; M0 includes checking the specifics that the design leans on.
 | gThumb, Shotwell, nomacs, qimgv | Little; general viewers, not cullers | — |
 | Aftershoot, Narrative Select (proprietary) | The auto-cull target: closed-eye and blur detection, stack winners, learning from the user's own choices; eye close-ups beside the frame | Cloud, subscription |
 
-Likely building blocks, to be confirmed in M0: `rawler` for ARW
-containers, embedded previews and makernotes; `zune-jpeg` or libjpeg-turbo
-for decoding; `quick-xml` for surgical sidecar edits; ONNX Runtime via the
-Omapix `omapix-ai` approach for faces.
+Building blocks, settled in M0:
+
+- **Raw container, embedded previews, makernotes:** our own TIFF directory
+  reader (`omacull-engine::raw`). It reads a few hundred bytes per raw
+  instead of the whole file, and needs no dependency.
+- **JPEG decode:** `zune-jpeg`. libjpeg-turbo was about 20% faster on the
+  previews (8.5 ms against 10.5 ms), not enough to take on a C library
+  when prefetching hides the decode anyway.
+- **XMP:** `quick-xml` to find the rating, then the bytes are spliced; the
+  sidecar is never serialised back out.
+- **Raw decode for 100% zoom:** `rawler`, added when M2 needs it.
+- **Faces:** ONNX Runtime via the Omapix `omapix-ai` approach, in M5.
 
 What doesn't exist on Linux, and is the reason for the project: a culler
 with Photo Mechanic's speed, compare and survey views, face-aware zoom,

@@ -3,39 +3,37 @@
 What's planned, in the order we plan to do it. [DESIGN.md](DESIGN.md)
 covers the scope and architecture.
 
-Status: nothing built yet. Scoped on 2026-10-04. M0 is next.
+Status: M0 done on 2026-10-04 (scoped the same day). M1 is next.
 
 Each milestone ends with something Michael can use on a real shoot. M1 is
 the point where Omacull replaces XnView MP for a basic cull; everything
 after it adds what XnView never had.
 
-## M0. Spikes and scaffold (next)
+## M0. Spikes and scaffold (done)
 
-Answer the questions the design depends on, with real files, before
-building UI.
+Answered the questions the design depends on, with a real 787-frame shoot
+from the ILCE-7M3, before building UI. The numbers and what follows from
+them are in DESIGN.md.
 
-- **Embedded preview size.** Check what the ARWs from Michael's camera
-  actually embed (dimensions of every embedded JPEG). Decides whether 100%
-  zoom runs on the embedded preview or needs a real raw decode. See
-  DESIGN.md.
-- **Decode timing.** Time embedded-JPEG extraction and decode for a
-  500-frame folder, cold and warm. Target: a frame ready in well under a
-  display refresh once prefetched, and a whole folder's thumbnails in a
-  few seconds.
-- **Sidecar round-trip.** Write a rating into a fresh sidecar and into one
-  darktable already wrote, then confirm in darktable: the rating shows,
-  reject shows as rejected, and the edit history is intact. Confirm how
-  darktable treats a changed sidecar for an already-imported image.
-- **AF point.** Confirm the focus location can be read from Sony
-  makernotes.
-- **Crate choices.** Settle raw container, JPEG decode and XMP crates from
-  the results above.
+- **Embedded preview size.** 1616×1080 and a 160×120 thumbnail, nothing
+  larger. 100% zoom needs a real raw decode.
+- **Decode timing.** About 10 ms a preview on one core, 500 in half a
+  second on all cores, a folder's camera thumbnails in under 20 ms.
+- **Sidecar round-trip.** Ratings, rejects and an intact edit history
+  confirmed against darktable 5.6.1 through `darktable-cli`. Left for
+  Michael to look at in the darktable window: that the stars and the
+  reject show in lighttable, and what an already-imported image does with
+  a changed sidecar. `cargo run -p omacull-engine --example rate -- <raw>
+  <rating>` writes a rating the way the app will.
+- **AF point.** Read from the Sony makernotes for every frame that has
+  one.
+- **Crate choices.** Our own TIFF reader, `zune-jpeg`, `quick-xml`, and
+  `rawler` when M2 needs a raw decode.
 - **Scaffold.** Workspace with `omacull-engine` and `omacull`, an empty
-  themed window, with theme, hotkeys, `Command` and the headless test
-  harness carried over from Omapix. `make install`, AGENTS.md updated with
-  real commands.
+  themed window, with theme, hotkeys, `Command`, `OMACULL_SCRIPT` and the
+  headless test harness carried over from Omapix. `make install`.
 
-## M1. Loupe cull
+## M1. Loupe cull (next)
 
 The minimum that replaces XnView MP.
 
@@ -58,7 +56,9 @@ The minimum that replaces XnView MP.
 
 - Instant 100% zoom: hold for a temporary look, tap to toggle, at the
   pointer. Pan while zoomed. Zoom position kept when stepping, so the same
-  spot can be checked across a burst.
+  spot can be checked across a burst. The embedded preview is too small
+  for this (see DESIGN.md), so it runs on a decode of the raw, prefetched
+  for the neighbours and cached.
 - Histogram, highlight and shadow clipping overlays.
 - EXIF readout: shutter, aperture, ISO, focal length, lens, time.
 - Focus peaking overlay.

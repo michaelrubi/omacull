@@ -2,7 +2,7 @@
 
 Omacull is a fast, keyboard-first photo culler for Omarchy: a folder of raws in, XMP ratings out, then on to darktable. It is the first stage of the workflow Omapix (`~/dev/omapix`) finishes.
 
-**Status:** scoped, nothing built. Read [docs/DESIGN.md](docs/DESIGN.md) for scope and architecture and [docs/ROADMAP.md](docs/ROADMAP.md) for the milestones. M0 is next.
+**Status:** M0 done: the engine reads embedded previews, focus locations and sidecar ratings, and the app is an empty themed window. Read [docs/DESIGN.md](docs/DESIGN.md) for scope and architecture and [docs/ROADMAP.md](docs/ROADMAP.md) for the milestones. M1 is next.
 
 ## Principles
 
@@ -17,4 +17,30 @@ Omacull is a fast, keyboard-first photo culler for Omarchy: a folder of raws in,
 - Same stack and conventions as Omapix: Rust 2024, egui on wgpu, Little CMS 2, GPL-3.0-or-later. When in doubt about theme, hotkeys, the `Command` pattern, the headless `Harness` tests or packaging, look at how Omapix does it and copy that.
 - Keep diffs minimal and surgical. No speculative abstractions or unnecessary dependencies.
 - Sidecar writes must leave everything except the rating byte-for-byte intact. Test against real darktable-written sidecars.
-- Build and test commands get added here once the M0 scaffold exists.
+- Hand testing: Michael tests from the installed binary, not `cargo run`. After a change he'll try by hand, run `make install` and ask him to restart Omacull.
+- Whenever non-trivial UI or engine logic is added, write a headless test. In `omacull`, use the `Harness` in `app.rs` (driving egui with synthetic events).
+
+## Build and test commands
+
+```bash
+# Run unit tests (engine, and the app's headless UI tests)
+cargo test
+
+# Build release binary
+cargo build --release
+
+# Build and install to ~/.local/bin (the copy Michael actually runs)
+make install
+
+# Run the app
+cargo run --release
+
+# Drive the UI without a keyboard: comma-separated Command names
+OMACULL_SCRIPT="Next,Pick,Quit" cargo run --release
+
+# What a folder of raws embeds and how fast it decodes (the M0 spike)
+cargo run --release -p omacull-engine --example spike -- path/to/shoot
+
+# Write a rating to a raw's sidecar the way the app will (-1 rejects)
+cargo run -p omacull-engine --example rate -- path/to/DSC01234.ARW 3
+```
