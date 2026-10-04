@@ -5,21 +5,24 @@
 //! shrinking the preview instead. That costs a preview decode the first
 //! time a folder is opened, so they're kept: one small JPEG a raw, named
 //! for the raw's path, size and modification time, so a changed or moved
-//! raw gets a new one. The cache is disposable.
+//! raw gets a new one. The cache is disposable. Thumbnails are kept in
+//! sRGB, whatever the camera's JPEGs were in.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
+use crate::color::{Display, Space};
 use crate::image::{self, Image};
 
 /// The long edge of a thumbnail, in pixels: sharp on a HiDPI filmstrip.
 pub const LONG_EDGE: usize = 320;
 const QUALITY: u8 = 85;
 /// Bumped when thumbnails are made differently, so old ones aren't used.
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 
 /// `$XDG_CACHE_HOME/omacull/thumbnails`, or `~/.cache/omacull/thumbnails`.
 pub fn default_dir() -> Option<PathBuf> {
@@ -50,7 +53,13 @@ fn cached(dir: &Path, raw: &Path) -> io::Result<PathBuf> {
 }
 
 fn make(raw: &Path) -> io::Result<Image> {
-    Ok(image::preview(raw)?.shrunk(LONG_EDGE))
+    static SRGB: LazyLock<Display> = LazyLock::new(Display::srgb);
+    let (preview, space, _) = image::preview_with_info(raw)?;
+    let mut thumbnail = preview.shrunk(LONG_EDGE);
+    if space == Space::AdobeRgb {
+        SRGB.convert(&mut thumbnail, space);
+    }
+    Ok(thumbnail)
 }
 
 /// Keep a thumbnail, replacing the file in one step so a reader never sees
@@ -70,8 +79,8 @@ fn store(path: &Path, thumbnail: &Image) -> io::Result<()> {
     written
 }
 
-/// A raw's thumbnail: from the cache in `dir` if it's there, else made and
-/// cached. With no cache it's made every time.
+/// A raw's thumbnail, in sRGB: from the cache in `dir` if it's there, else
+/// made and cached. With no cache it's made every time.
 pub fn load(raw: &Path, dir: Option<&Path>) -> io::Result<Image> {
     let Some(dir) = dir else { return make(raw) };
     let path = cached(dir, raw)?;
@@ -137,6 +146,20 @@ mod tests {
         warm(&other, &cache).unwrap();
         assert_eq!(entries().len(), 3);
         assert!(entries().iter().all(|p| p.extension().is_some_and(|e| e == "jpg")), "no temporary files left");
+    }
+
+    #[test]
+    fn thumbnails_of_adobe_rgb_previews_are_srgb() {
+        let folder = Folder::new("thumbs-adobe");
+        let raw = folder.0.join("DSC00001.ARW");
+        let leaf = crate::testing::jpeg(64, 48, [110, 160, 90]);
+        Arw { preview: leaf.clone(), ..Arw::default() }.write(&raw);
+        let srgb = load(&raw, None).unwrap().pixel(10, 10);
+        Arw { preview: leaf, color_space: 0xffff, ..Arw::default() }.write(&raw);
+        let adobe = load(&raw, None).unwrap().pixel(10, 10);
+        // The same numbers mean a more saturated green in Adobe RGB, so
+        // in sRGB there's less red in it.
+        assert!(adobe[0] + 15 < srgb[0], "{adobe:?} {srgb:?}");
     }
 
     #[test]

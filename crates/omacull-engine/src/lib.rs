@@ -1,6 +1,8 @@
 //! Omacull's engine: everything about a folder of raws that needs no window.
 
+pub mod color;
 pub mod cull;
+pub mod develop;
 pub mod disk;
 pub mod image;
 pub mod loader;

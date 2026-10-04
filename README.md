@@ -12,7 +12,9 @@ darktable, retouch in [Omapix](https://github.com/michaelrubi/omapix),
 export.
 
 **Status:** early. The basic culler is in (M1): `omacull <folder>`, arrows
-to step, P/X/U and 0-5 to mark, Ctrl+Z to undo. See [docs/DESIGN.md](docs/DESIGN.md)
+to step, P/X/U and 0-5 to mark, Ctrl+Z to undo. So is inspection (M2): Z
+for 100%, H histogram, J clipping, S focus peaking, F the focus point, I
+the shooting settings. See [docs/DESIGN.md](docs/DESIGN.md)
 for what it will and won't do and [docs/ROADMAP.md](docs/ROADMAP.md) for
 the plan.
 

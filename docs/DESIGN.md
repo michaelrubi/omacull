@@ -83,6 +83,14 @@ Ctrl+Alt keys: Ctrl+Alt+A all, Ctrl+Alt+0 undecided, Ctrl+Alt+1 picks and
 up, Ctrl+Alt+2 to 5 that many stars and up, and Ctrl+Alt+X rejects. A
 frame marked out of the filter stays on screen until the cursor leaves it.
 
+M2's inspection keys: Z zooms to 100% (tap to toggle, hold for a look
+that ends when it's let go), Shift+Z zooms to the focus point and follows
+each frame's from then on; H histogram, I shooting settings, J highlight
+and shadow clipping (Lightroom's), S focus peaking, F the focus point.
+The mouse does the same as Z on the loupe: click to toggle, press and hold
+for a look, drag to pan; the wheel pans. Which overlays are on is
+remembered. The status bar has a switch for each, its key in the tooltip.
+
 - Sidecars are named the way darktable names them: `DSC01234.ARW.xmp`.
 - No sidecar yet: write a minimal one holding just the rating.
 - Sidecar exists: change the rating field and nothing else. darktable's
@@ -172,7 +180,23 @@ Settled in M1. JSON Lines, one object per mark, version 1:
 A mark that repeats the frame's mark isn't logged, nor is one whose
 sidecar couldn't be written.
 - **Colour:** embedded previews are sRGB or Adobe RGB per the camera
-  setting; convert to the monitor profile with lcms2 as Omapix does.
+  setting (Exif ColorSpace "uncalibrated" with interop index R03 is Adobe
+  RGB); developed raws are sRGB. Both are converted to the monitor's
+  profile with lcms2 on the loader threads, as Omapix does: the monitor
+  from `hyprctl`, its profile from `~/.config/omacull/monitors.toml` or its
+  EDID, and nothing done where Hyprland manages the monitor's colours.
+  Thumbnails are cached in sRGB. Moving the window to another monitor
+  decodes what's on screen again.
+- **Overlays:** the histogram is of the camera's rendering, the preview.
+  Clipping (any channel at 254 or more is red, all at 2 or less blue) and
+  focus peaking (green) are measured on the frame before colour
+  conversion, as one byte of marks a pixel, and baked into the texture
+  when they're on: on the preview when whole, on the full development at
+  100%. Peaking marks Sobel edges at least as steep as a 40-level step and
+  among the frame's crispest 1.5%, so a frame with nothing in focus has
+  nothing marked. The thresholds want trying on real shoots.
+- **Focus point:** Sony's FocusLocation, turned with the frame; hidden
+  for manual focus (Sony's FocusMode 0, makernote tag 0x201b).
 
 ### The embedded preview is small
 
@@ -196,8 +220,21 @@ nothing larger. So:
   JPEG to zoom into. With `rawler`, untuned, that is about 25 ms to decode
   and 200 ms to develop a 24 MP frame, so it has to be prefetched for the
   neighbours and cached, with the upscaled preview shown until it lands.
-  The zoomed image won't match the camera's rendering exactly. This is
-  M2's main piece of work.
+  Built in M2 (`develop.rs`):
+  - The current frame and the next and previous ones are developed in
+    the background, one at a time (a development holds a few hundred
+    megabytes of float pixels while it runs), and kept in memory: about
+    120 MB each with their overlay marks.
+  - rawler's development is flat: no tone curve, so dull and dark next to
+    the camera's JPEG. Each channel's levels are mapped to match the
+    preview's histogram, so zooming in keeps the camera's brightness,
+    contrast and colour near enough, with the raw's own detail and noise.
+    Not exact, and not meant to be judged for colour.
+  - A full frame goes to the GPU in 512-pixel tiles as they come into
+    view, with nearest-neighbour filtering on whole pixels: 96 MB at once
+    would stutter, and some GPUs won't take a texture that big.
+  - The zoom is kept as a point of the frame (fractions of its width and
+    height), so it stays on the same spot from frame to frame.
 - **Focus location** is in the Sony makernotes (tag 0x2027: frame width,
   frame height, x, y) and reads correctly for 777 of the 787 frames,
   matching exiftool. The other ten were shot with tracking and record

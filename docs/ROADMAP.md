@@ -3,8 +3,8 @@
 What's planned, in the order we plan to do it. [DESIGN.md](DESIGN.md)
 covers the scope and architecture.
 
-Status: M0 done on 2026-10-04 (scoped the same day). M1 built the same
-day, waiting to be tried on a real shoot.
+Status: M0 done on 2026-10-04 (scoped the same day). M1 and M2 built the
+same day, waiting to be tried on a real shoot.
 
 Each milestone ends with something Michael can use on a real shoot. M1 is
 the point where Omacull replaces XnView MP for a basic cull; everything
@@ -60,7 +60,15 @@ stays until the cursor leaves it.
 - Decision log written from the first mark, with its schema settled here.
 - Status bar: position in folder, counts of picks, rejects and undecided.
 
-## M2. Inspection
+## M2. Inspection (built, to be tried on a real shoot)
+
+Everything below is in and tested headless and on a synthetic shoot, but
+the raw development has only been tested on files rawler can't decode:
+no real ARW could be fetched for testing. Still to check by hand: that
+`spike` develops a real shoot at full size and in what time, that the
+zoomed frame looks like the preview, the peaking and clipping thresholds,
+which frames are taken for manual focus, and the colours on a wide-gamut
+monitor. How it's built is in DESIGN.md.
 
 - Instant 100% zoom: hold for a temporary look, tap to toggle, at the
   pointer. Pan while zoomed. Zoom position kept when stepping, so the same

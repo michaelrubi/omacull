@@ -2,7 +2,7 @@
 
 Omacull is a fast, keyboard-first photo culler for Omarchy: a folder of raws in, XMP ratings out, then on to darktable. It is the first stage of the workflow Omapix (`~/dev/omapix`) finishes.
 
-**Status:** M1 built: open a folder, step through embedded previews with a filmstrip, mark, filter and undo, with sidecars and the decision log written as you go. Waiting on a hand test with a real shoot. Read [docs/DESIGN.md](docs/DESIGN.md) for scope and architecture and [docs/ROADMAP.md](docs/ROADMAP.md) for the milestones. M2 is next.
+**Status:** M2 built: on top of M1's culling (step, mark, filter, undo, sidecars, decision log), 100% zoom on a full development of the raw, histogram, clipping, focus peaking, the focus point, the shooting settings, and colour management through the monitor's profile. Waiting on a hand test with a real shoot. Read [docs/DESIGN.md](docs/DESIGN.md) for scope and architecture and [docs/ROADMAP.md](docs/ROADMAP.md) for the milestones. M3 is next.
 
 ## Principles
 
@@ -38,7 +38,8 @@ cargo run --release -- path/to/shoot
 # Drive the UI without a keyboard: comma-separated Command names
 OMACULL_SCRIPT="Next,Pick,Quit" cargo run --release
 
-# What a folder of raws embeds and how fast it decodes (the M0 spike)
+# What a folder of raws embeds, how fast it decodes, and how fast five
+# frames develop at full size for 100% zoom (written to /tmp as .ppm)
 cargo run --release -p omacull-engine --example spike -- path/to/shoot
 
 # Write a rating to a raw's sidecar the way the app will (-1 rejects)
