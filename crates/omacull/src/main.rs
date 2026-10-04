@@ -1,6 +1,8 @@
 mod app;
 mod commands;
 mod hotkeys;
+mod loupe;
+mod monitor;
 mod shoot;
 mod state;
 mod theme;

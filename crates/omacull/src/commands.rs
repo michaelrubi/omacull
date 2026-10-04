@@ -33,6 +33,13 @@ pub enum Command {
     ShowStars4,
     ShowStars5,
     ShowRejects,
+    Zoom,
+    ZoomToFocus,
+    Histogram,
+    Info,
+    Clipping,
+    Peaking,
+    FocusPoint,
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -72,6 +79,13 @@ impl Command {
         Command::ShowStars4,
         Command::ShowStars5,
         Command::ShowRejects,
+        Command::Zoom,
+        Command::ZoomToFocus,
+        Command::Histogram,
+        Command::Info,
+        Command::Clipping,
+        Command::Peaking,
+        Command::FocusPoint,
     ];
 
     /// Look a command up by its name in code, e.g. "Reject".
@@ -92,6 +106,7 @@ impl Command {
         Command::ShowStars5,
         Command::ShowRejects,
         Command::Redo,
+        Command::ZoomToFocus,
         Command::Quit,
         Command::Open,
         Command::Undo,
@@ -108,6 +123,12 @@ impl Command {
         Command::Star4,
         Command::Star5,
         Command::AutoAdvance,
+        Command::Zoom,
+        Command::Histogram,
+        Command::Info,
+        Command::Clipping,
+        Command::Peaking,
+        Command::FocusPoint,
     ];
 
     pub fn label(self) -> &'static str {
@@ -137,6 +158,13 @@ impl Command {
             Command::ShowStars4 => "Show 4 Stars and Up",
             Command::ShowStars5 => "Show 5 Stars",
             Command::ShowRejects => "Show Rejects",
+            Command::Zoom => "Zoom to 100% (Hold for a Look)",
+            Command::ZoomToFocus => "Zoom to the Focus Point",
+            Command::Histogram => "Histogram",
+            Command::Info => "Shooting Settings",
+            Command::Clipping => "Highlight and Shadow Clipping",
+            Command::Peaking => "Focus Peaking",
+            Command::FocusPoint => "Focus Point",
         }
     }
 
@@ -169,6 +197,14 @@ impl Command {
             Command::ShowStars4 => s(CMD_ALT, Key::Num4),
             Command::ShowStars5 => s(CMD_ALT, Key::Num5),
             Command::ShowRejects => s(CMD_ALT, Key::X),
+            // Lightroom's Z, I and J; the rest by their initials.
+            Command::Zoom => s(Modifiers::NONE, Key::Z),
+            Command::ZoomToFocus => s(Modifiers::SHIFT, Key::Z),
+            Command::Histogram => s(Modifiers::NONE, Key::H),
+            Command::Info => s(Modifiers::NONE, Key::I),
+            Command::Clipping => s(Modifiers::NONE, Key::J),
+            Command::Peaking => s(Modifiers::NONE, Key::S),
+            Command::FocusPoint => s(Modifiers::NONE, Key::F),
         }
     }
 
@@ -290,6 +326,9 @@ mod tests {
         assert_eq!(press(&ctx, none, Key::Home), [Command::First]);
         assert_eq!(press(&ctx, none, Key::A), [Command::AutoAdvance]);
         assert_eq!(press(&ctx, none, Key::B), []);
+        assert_eq!(press(&ctx, none, Key::Z), [Command::Zoom]);
+        assert_eq!(press(&ctx, Modifiers::SHIFT, Key::Z), [Command::ZoomToFocus]);
+        assert_eq!(press(&ctx, none, Key::J), [Command::Clipping]);
     }
 
     #[test]

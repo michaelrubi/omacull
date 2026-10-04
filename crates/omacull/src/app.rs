@@ -4,18 +4,21 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::SystemTime;
 
 use egui::{Align2, FontId, RichText, Sense, Ui, pos2, vec2};
+use omacull_engine::color::Display;
 use omacull_engine::cull::{Change, Cull, Filter, Step};
 use omacull_engine::disk::{self, Disk, How, Mark, Problem};
 use omacull_engine::thumbs;
 
 use crate::commands::Command;
 use crate::hotkeys::{self, format_shortcut};
+use crate::monitor;
 use crate::shoot::Shoot;
-use crate::state::State;
+use crate::state::{Show, State};
 use crate::theme::{self, Theme};
 
 /// Where Omacull keeps what it makes; somewhere else in tests.
@@ -53,6 +56,20 @@ pub struct App {
     /// The last thing to tell the user, and whether it's a problem.
     message: Option<(String, bool)>,
     title: String,
+    /// The monitor the window is on; none in tests.
+    monitor: Option<monitor::Watch>,
+    /// Converts frames to its colours.
+    display: Arc<Display>,
+}
+
+/// Converts to a monitor's colours, or shows sRGB as it is if its profile
+/// won't do.
+fn display_for(watch: &monitor::Watch) -> Arc<Display> {
+    let display = Display::new(watch.profile().cloned()).unwrap_or_else(|e| {
+        log::warn!("showing sRGB: can't use the monitor's profile: {e}");
+        Display::srgb()
+    });
+    Arc::new(display)
 }
 
 impl App {
@@ -82,6 +99,9 @@ impl App {
             .collect();
         let paths = Paths { cache: thumbs::default_dir(), log: disk::default_log() };
         let mut app = Self::build(theme, theme::watch(ctx.clone()), warnings, script, State::load(), paths, ctx);
+        let watch = monitor::Watch::new();
+        app.display = display_for(&watch);
+        app.monitor = Some(watch);
         if let Some(path) = open {
             app.open(path, ctx);
         }
@@ -113,6 +133,8 @@ impl App {
             disk,
             message: None,
             title: String::new(),
+            monitor: None,
+            display: Arc::new(Display::srgb()),
         }
     }
 
@@ -155,7 +177,7 @@ impl App {
                     };
                     (text, true)
                 });
-                self.shoot = Some(Shoot::new(cull, self.paths.cache.clone(), ctx));
+                self.shoot = Some(Shoot::new(cull, self.paths.cache.clone(), self.display.clone(), ctx));
             }
             Err(e) => {
                 if !dir.is_dir() {
@@ -207,9 +229,37 @@ impl App {
                 self.state.set_auto_advance(on);
                 self.message = Some((format!("Auto-advance {}", if on { "on" } else { "off" }), false));
             }
+            Command::Histogram | Command::Info | Command::Clipping | Command::Peaking | Command::FocusPoint => {
+                let mut show = self.state.show;
+                let (switch, name) = match command {
+                    Command::Histogram => (&mut show.histogram, "Histogram"),
+                    Command::Info => (&mut show.info, "Shooting settings"),
+                    Command::Clipping => (&mut show.clipping, "Clipping"),
+                    Command::Peaking => (&mut show.peaking, "Focus peaking"),
+                    _ => (&mut show.focus_point, "Focus point"),
+                };
+                *switch = !*switch;
+                self.message = Some((format!("{name} {}", if *switch { "on" } else { "off" }), false));
+                self.state.set_show(show);
+            }
             _ => {}
         }
         let Some(shoot) = &mut self.shoot else { return };
+        let ppp = ctx.pixels_per_point();
+        match command {
+            Command::Zoom => {
+                let (pointer, time) = ctx.input(|i| (i.pointer.hover_pos(), i.time));
+                let (fit, size) = (shoot.fit_rect(), shoot.full_size(ppp));
+                shoot.view.key_down(pointer, fit, size, time);
+            }
+            Command::ZoomToFocus => {
+                let focus = shoot.info().and_then(|i| i.focus);
+                if !shoot.view.zoom_to_focus(focus, shoot.full_size(ppp)) {
+                    self.message = Some(("No focus point recorded for this frame".into(), false));
+                }
+            }
+            _ => {}
+        }
         let cull = &mut shoot.cull;
         match command {
             Command::Undo => match cull.undo() {
@@ -285,8 +335,22 @@ impl App {
             }
         }
         self.run_script(ctx);
+        // Held for a look, the zoom ends when its key is let go.
+        let zoom_key = hotkeys::current().command(Command::Zoom).map(|s| s.logical_key);
+        if let Some(shoot) = &mut self.shoot
+            && let Some(key) = zoom_key
+            && let (false, time) = ctx.input(|i| (i.key_down(key), i.time))
+        {
+            shoot.view.key_up(time);
+        }
+        if self.monitor.as_mut().is_some_and(|m| m.check(ctx)) {
+            self.display = display_for(self.monitor.as_ref().unwrap());
+            if let Some(shoot) = &mut self.shoot {
+                shoot.set_display(self.display.clone());
+            }
+        }
         if let Some(shoot) = &mut self.shoot {
-            shoot.update(ctx);
+            shoot.update(ctx, self.state.show);
         }
         let title = match &self.shoot {
             Some(shoot) => format!("{} — Omacull", file_name(shoot.cull.dir())),
@@ -324,8 +388,9 @@ impl App {
         }
         let pasteboard = egui::Frame::new().fill(self.theme.pasteboard());
         let mut clicked = None;
-        egui::CentralPanel::no_frame().frame(pasteboard).show(ui, |ui| match &self.shoot {
-            Some(shoot) => shoot.loupe(ui, &theme),
+        let show = self.state.show;
+        egui::CentralPanel::no_frame().frame(pasteboard).show(ui, |ui| match &mut self.shoot {
+            Some(shoot) => shoot.loupe(ui, &theme, show),
             None => clicked = self.empty_state(ui),
         });
         match clicked {
@@ -360,6 +425,21 @@ impl App {
                     let auto = ui.selectable_label(self.state.auto_advance, "Auto-advance");
                     if auto.on_hover_text(shortcut(Command::AutoAdvance)).clicked() {
                         command = Some(Command::AutoAdvance);
+                    }
+                    ui.separator();
+                    let Show { histogram, info, clipping, peaking, focus_point } = self.state.show;
+                    for (on, label, toggle) in [
+                        (histogram, "Histogram", Command::Histogram),
+                        (info, "Info", Command::Info),
+                        (clipping, "Clipping", Command::Clipping),
+                        (peaking, "Peaking", Command::Peaking),
+                        (focus_point, "AF", Command::FocusPoint),
+                        (shoot.view.zoomed, "100%", Command::Zoom),
+                    ] {
+                        let tip = format!("{} ({})", toggle.label(), shortcut(toggle));
+                        if ui.selectable_label(on, label).on_hover_text(tip).clicked() {
+                            command = Some(toggle);
+                        }
                     }
                 }
                 let warnings = (!self.warnings.is_empty()).then(|| (self.warnings.join("; "), true));
@@ -565,17 +645,34 @@ mod tests {
             output
         }
 
+        /// A key pressed and let go in one frame.
         fn press(&mut self, modifiers: Modifiers, key: Key) -> egui::FullOutput {
-            self.frame(vec![
-                Event::ModifiersChanged(modifiers),
-                Event::Key {
-                    key,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers,
-                },
-            ])
+            let mut events = key_events(modifiers, key, true);
+            events.extend(key_events(modifiers, key, false));
+            self.frame(events)
+        }
+
+        fn key_down(&mut self, key: Key) {
+            self.frame(key_events(NONE, key, true));
+        }
+
+        fn key_up(&mut self, key: Key) {
+            self.frame(key_events(NONE, key, false));
+        }
+
+        /// Drag with the mouse from `from` to `to`, a frame at each end and
+        /// one between.
+        fn drag(&mut self, from: egui::Pos2, to: egui::Pos2) {
+            let button =
+                |at, pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: NONE };
+            self.frame(vec![Event::PointerMoved(from), button(from, true)]);
+            self.frame(vec![Event::PointerMoved(from + (to - from) / 2.0)]);
+            self.frame(vec![Event::PointerMoved(to)]);
+            self.frame(vec![button(to, false)]);
+        }
+
+        fn shoot(&self) -> &Shoot {
+            self.app.shoot.as_ref().unwrap()
         }
 
         fn click(&mut self, at: egui::Pos2) {
@@ -602,6 +699,13 @@ mod tests {
         fn ratings(&self) -> Vec<i32> {
             self.cull().frames().iter().map(|f| f.rating).collect()
         }
+    }
+
+    fn key_events(modifiers: Modifiers, key: Key, pressed: bool) -> Vec<Event> {
+        vec![
+            Event::ModifiersChanged(modifiers),
+            Event::Key { key, physical_key: None, pressed, repeat: false, modifiers },
+        ]
     }
 
     fn closes(output: &egui::FullOutput) -> bool {
@@ -779,5 +883,125 @@ mod tests {
         h.wait("the write to fail", |app| app.message.as_ref().is_some_and(|(m, _)| m.starts_with("Couldn't mark")));
         assert_eq!(h.ratings(), [0, 0]);
         assert_eq!(std::fs::read_to_string(sidecar::path_for(&folder.raw(1))).unwrap(), "not a sidecar");
+    }
+
+    #[test]
+    fn the_zoom_key_toggles_when_tapped_and_looks_when_held() {
+        let folder = Folder::with_raws("app-zoom-key", 2, &Arw::default());
+        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        h.press(NONE, Key::Z);
+        assert!(h.shoot().view.zoomed, "a tap zooms in");
+        h.press(NONE, Key::ArrowRight);
+        assert!(h.shoot().view.zoomed, "and stays zoomed from frame to frame");
+        h.press(NONE, Key::Z);
+        assert!(!h.shoot().view.zoomed, "the next tap zooms out");
+
+        h.key_down(Key::Z);
+        assert!(h.shoot().view.zoomed);
+        for _ in 0..8 {
+            h.frame(vec![]);
+        }
+        assert!(h.shoot().view.zoomed, "held");
+        h.key_up(Key::Z);
+        assert!(!h.shoot().view.zoomed, "let go after a look");
+    }
+
+    #[test]
+    fn the_mouse_zooms_at_the_pointer_and_pans() {
+        let folder = Folder::with_raws("app-zoom-mouse", 1, &Arw::default());
+        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let fit = h.shoot().fit_rect();
+        h.click(fit.center());
+        assert!(h.shoot().view.zoomed, "a click zooms in");
+        let before = h.shoot().view.center;
+        h.drag(pos2(400.0, 200.0), pos2(300.0, 150.0));
+        assert!(h.shoot().view.zoomed, "dragging pans, and stays zoomed");
+        let after = h.shoot().view.center;
+        assert!(after[0] > before[0] && after[1] > before[1], "dragged left and up shows more to the right and below");
+        h.click(fit.center());
+        assert!(!h.shoot().view.zoomed, "a click zooms out");
+        // Pressing from whole and dragging is a look.
+        h.drag(fit.center(), fit.center() + vec2(-60.0, 0.0));
+        assert!(!h.shoot().view.zoomed);
+    }
+
+    #[test]
+    fn full_size_frames_are_developed_ahead_and_shown_in_tiles() {
+        let folder = Folder::with_raws("app-full", 3, &Arw::default());
+        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        // The fake raws have no raw data: developing them fails, and the
+        // enlarged preview stands in.
+        h.wait("a development", |app| app.shoot.as_ref().unwrap().full_state(0).is_some());
+        h.wait("the next one", |app| app.shoot.as_ref().unwrap().full_state(1).is_some());
+        assert!(h.shoot().full_state(0).unwrap().is_err());
+        h.press(NONE, Key::Z);
+        assert!(h.shoot().view.zoomed);
+
+        // A real development, as the loader would hand it over.
+        let (w, h_) = (1500, 1000);
+        let image = omacull_engine::image::Image { width: w, height: h_, rgba: [90, 90, 90, 255].repeat(w * h_) };
+        let decoded = omacull_engine::loader::Decoded {
+            histogram: omacull_engine::image::Histogram::of(&image),
+            marks: vec![0; w * h_],
+            image,
+            info: Default::default(),
+        };
+        h.app.shoot.as_mut().unwrap().insert_full(0, decoded);
+        h.frame(vec![]);
+        let tiles = h.shoot().full_state(0).unwrap().unwrap();
+        // The loupe is 800 points wide: two or three tiles across, and as
+        // many as fit down, plus a tile's margin.
+        assert!((2..=9).contains(&tiles), "{tiles} tiles");
+        h.press(NONE, Key::Z);
+        h.press(NONE, Key::ArrowRight);
+        h.frame(vec![]);
+        let left = h.shoot().full_state(0);
+        assert!(left.is_none_or(|s| s.is_ok_and(|t| t == 0)), "only the frame on screen keeps tiles");
+    }
+
+    #[test]
+    fn zooming_to_the_focus_point_follows_it() {
+        let folder = Folder::new("app-focus");
+        Arw { focus: [6000, 4000, 1000, 1000], ..Arw::default() }.write(&folder.raw(1));
+        Arw { focus: [6000, 4000, 5000, 3000], ..Arw::default() }.write(&folder.raw(2));
+        Arw { focus_mode: 0, ..Arw::default() }.write(&folder.raw(3));
+        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        h.press(Modifiers::SHIFT, Key::Z);
+        let view = &h.shoot().view;
+        assert!(view.zoomed && view.follow_focus);
+        let first = view.center;
+        h.press(NONE, Key::ArrowRight);
+        h.wait("the next preview", |app| app.shoot.as_ref().unwrap().preview_ready());
+        h.frame(vec![]);
+        let second = h.shoot().view.center;
+        assert!(second[0] > first[0] && second[1] > first[1], "{first:?} then {second:?}");
+        // Manual focus: nothing to go to.
+        h.press(NONE, Key::ArrowRight);
+        h.wait("the last preview", |app| app.shoot.as_ref().unwrap().preview_ready());
+        h.press(NONE, Key::Z);
+        h.press(Modifiers::SHIFT, Key::Z);
+        assert!(!h.shoot().view.zoomed);
+        assert!(h.app.message.as_ref().is_some_and(|(m, _)| m.contains("No focus point")));
+    }
+
+    #[test]
+    fn overlays_are_switched_remembered_and_baked_in() {
+        let folder = Folder::with_raws("app-overlays", 2, &Arw::default());
+        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        assert_eq!(h.app.state.show, Show::default());
+        assert!(h.shoot().info().is_some_and(|i| i.exif.iso == Some(400)));
+        for key in [Key::H, Key::J, Key::S, Key::F, Key::I] {
+            h.press(NONE, key);
+        }
+        let show = h.app.state.show;
+        assert!(show.histogram && show.clipping && show.peaking && show.focus_point && !show.info);
+        assert_eq!(h.shoot().preview_bake(), Some(crate::loupe::Bake { clipping: true, peaking: true }));
+        h.press(NONE, Key::J);
+        assert_eq!(h.shoot().preview_bake(), Some(crate::loupe::Bake { clipping: false, peaking: true }));
+        // Stepping on, the next frame has them too.
+        h.press(NONE, Key::ArrowRight);
+        h.wait("the next preview", |app| app.shoot.as_ref().unwrap().preview_ready());
+        h.frame(vec![]);
+        assert_eq!(h.shoot().preview_bake(), Some(crate::loupe::Bake { clipping: false, peaking: true }));
     }
 }

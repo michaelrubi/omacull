@@ -2,8 +2,9 @@
 //!
 //!     cargo run --release -p omacull-engine --example spike -- ~/Pictures/shoot [frames]
 //!
-//! What the raws embed, whether the focus location is there, and how long a
-//! frame takes to get from disk to pixels. Run it twice for cold and warm
+//! What the raws embed, whether the focus location is there, how long a
+//! frame takes to get from disk to pixels, and how long a full-size
+//! development for 100% zoom takes. Run it twice for cold and warm
 //! numbers; to make it cold again without root, evict the files first:
 //!
 //!     for f in ~/Pictures/shoot/*.ARW; do dd if="$f" iflag=nocache count=0 status=none; done
@@ -12,6 +13,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use omacull_engine::develop;
+use omacull_engine::image::{self, Image};
 use omacull_engine::raw::RawFile;
 use rayon::prelude::*;
 use zune_jpeg::JpegDecoder;
@@ -112,5 +115,50 @@ fn main() {
     println!("focus location: {focused} of {} raws", raws.len());
     if let Some(raw) = raws.iter().filter_map(|p| RawFile::open(p).ok()).find(|r| r.focus.is_some()) {
         println!("  e.g. {:?}, orientation {}", raw.focus.unwrap(), raw.orientation);
+    }
+    let adobe = raws.iter().filter_map(|p| RawFile::open(p).ok()).filter(|r| r.adobe_rgb).count();
+    println!("Adobe RGB previews: {adobe} of {}", raws.len());
+    if let Some(raw) = raws.first().and_then(|p| RawFile::open(p).ok()) {
+        println!("readout: {}", raw.info().summary());
+        println!("  raw size {:?}", raw.size);
+    }
+
+    // Full-size developments for 100% zoom, a few, one at a time.
+    let mut times = Vec::new();
+    for path in raws.iter().take(5) {
+        let t = Instant::now();
+        match develop::full(path) {
+            Ok((full, _, _, _)) => {
+                times.push(t.elapsed());
+                let t = Instant::now();
+                let marks = image::marks(&full);
+                let sharp = marks.iter().filter(|&&m| m & image::mark::SHARP != 0).count();
+                println!(
+                    "full: {}×{} in {:.0} ms, marks {:.0} ms, {:.1}% sharp",
+                    full.width,
+                    full.height,
+                    ms(times[times.len() - 1]),
+                    ms(t.elapsed()),
+                    100.0 * sharp as f64 / marks.len() as f64
+                );
+                let name = path.file_stem().unwrap_or_default().to_string_lossy();
+                write_ppm(&full, &std::env::temp_dir().join(format!("{name}.full.ppm")));
+            }
+            Err(e) => println!("full: {}: {e}", path.display()),
+        }
+    }
+    if !times.is_empty() {
+        println!("full developments: {}", summary(times));
+        let dir = std::env::temp_dir();
+        println!("  (written to {} as .full.ppm, to compare with the camera's rendering)", dir.display());
+    }
+}
+
+/// For looking at a development in any image viewer.
+fn write_ppm(image: &Image, path: &std::path::Path) {
+    let mut out = format!("P6 {} {} 255\n", image.width, image.height).into_bytes();
+    out.extend(image.rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]));
+    if let Err(e) = std::fs::write(path, out) {
+        println!("couldn't write {}: {e}", path.display());
     }
 }
