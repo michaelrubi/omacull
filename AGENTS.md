@@ -29,7 +29,8 @@ cargo test
 # Build release binary
 cargo build --release
 
-# Build and install to ~/.local/bin (the copy Michael actually runs)
+# Build and install to ~/.local (the copy Michael actually runs), with
+# its launcher entry and icon
 make install
 
 # Run the app, with a folder of raws (or a raw, to start at it)

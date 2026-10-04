@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Omacull
+GenericName=Photo Culler
+Comment=Step through a folder of raws and mark picks, rejects and stars
+Exec=omacull %f
+Icon=omacull
+Terminal=false
+Categories=Graphics;Photography;Viewer;
+StartupWMClass=omacull
