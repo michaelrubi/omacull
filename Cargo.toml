@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/omacull-engine", "crates/omacull"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+
+# JPEG decoding is too slow unoptimised to test with real previews, so
+# optimise dependencies even in debug builds.
+[profile.dev.package."*"]
+opt-level = 3

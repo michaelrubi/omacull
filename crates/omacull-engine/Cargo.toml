@@ -1,0 +1,12 @@
+[package]
+name = "omacull-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+quick-xml = "0.42.0"
+zune-jpeg = "0.5.15"
+
+[dev-dependencies]
+rayon = "1.12.0"
