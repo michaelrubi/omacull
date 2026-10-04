@@ -131,7 +131,8 @@ In three steps, each useful alone.
 
 ## M8. Release
 
-- Arch package and AUR, desktop entry, icon.
+- Arch package and AUR. (The desktop entry and icon came early: `make
+  install` puts them in.)
 - Other raw formats (Canon CR3, Nikon NEF, Fuji RAF), driven by who shows
   up to test them.
 - README, CONTRIBUTING, screenshots.
