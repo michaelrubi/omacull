@@ -2,7 +2,10 @@
 //! or survey) and the filmstrip, and the decoded frames behind them, kept
 //! ahead of the cursor.
 
+use std::cmp::Reverse;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,9 +17,12 @@ use egui::{
 use omacull_engine::color::Display;
 use omacull_engine::faces::Face;
 use omacull_engine::cull::{Cull, PICK, Rating};
+use omacull_engine::learn::Model;
 use omacull_engine::loader::{Decoded, Job, Loaded, Loader, Output};
 use omacull_engine::raw::Info;
 use omacull_engine::sidecar::REJECT;
+use omacull_engine::signals::{self, By, Signals, Standing, Suggestion};
+use omacull_engine::stacks::{self, Stacking};
 
 use crate::faces::{Faces, Finder};
 use crate::loupe::{self, Bake, View};
@@ -38,6 +44,30 @@ const TILE: usize = 512;
 pub const FACES_WIDTH: f32 = 150.0;
 /// Close-ups from the full-size frame are this many pixels square.
 const CLOSE_UP: usize = 256;
+
+/// A frame less sharp than this share of the sharpest it was shot with is
+/// soft beside it.
+const SOFT: f32 = 0.8;
+/// This much of a frame blown out, or black, is worth a word.
+const BLOWN: f32 = 0.03;
+const BLACK: f32 = 0.1;
+
+/// What suggestions are made with.
+#[derive(Clone)]
+pub struct Assist {
+    /// Trained on the user's decisions, once there are enough.
+    pub model: Option<Arc<Model>>,
+    /// How sure the model has to be to suggest a mark.
+    pub confidence: f32,
+    /// The stars a pick is written as.
+    pub pick: Rating,
+}
+
+impl Default for Assist {
+    fn default() -> Self {
+        Self { model: None, confidence: 0.8, pick: PICK }
+    }
+}
 
 /// Something decoded and on the GPU, or why it isn't.
 enum Slot<T> {
@@ -115,6 +145,18 @@ pub struct Shoot {
     close_ups: Option<(usize, Vec<TextureHandle>)>,
     /// The close-ups where they were last drawn, for tests.
     pub close_up_cells: Vec<Rect>,
+    pub assist: Assist,
+    /// The bursts, by capture time however frames are stacked: what a
+    /// frame outside a stack is measured against.
+    bursts: Vec<Vec<usize>>,
+    burst_of: Vec<Option<usize>>,
+    /// The marks suggested, for undecided frames, while suggestions are
+    /// shown.
+    suggestions: HashMap<usize, Suggestion>,
+    /// What the suggestions were made from: see [`Self::stamp`].
+    suggested_from: u64,
+    /// Frames that have been on screen.
+    looked: HashSet<usize>,
 }
 
 /// How a filmstrip click was meant.
@@ -136,14 +178,22 @@ impl Shoot {
     pub fn new(
         cull: Cull,
         cache: Option<PathBuf>,
-        faces: (Option<PathBuf>, Finder),
+        faces: (Option<PathBuf>, Option<PathBuf>, Finder),
         display: Arc<Display>,
         ctx: &egui::Context,
     ) -> Self {
         let raws: Vec<PathBuf> = cull.frames().iter().map(|f| f.path.clone()).collect();
         let (wake, wake_faces) = (ctx.clone(), ctx.clone());
-        let faces = Faces::new(raws.clone(), faces.0, faces.1, move || wake_faces.request_repaint());
+        let faces = Faces::new(raws.clone(), faces.0, faces.1, faces.2, move || wake_faces.request_repaint());
         let seen = cull.current();
+        let times: Vec<_> = cull.frames().iter().map(|f| (f.captured, None)).collect();
+        let bursts = stacks::group(&times, Stacking::Time);
+        let mut burst_of = vec![None; times.len()];
+        for (b, burst) in bursts.iter().enumerate() {
+            for &frame in burst {
+                burst_of[frame] = Some(b);
+            }
+        }
         Self {
             cull,
             loader: Loader::new(raws, cache, display, move || wake.request_repaint()),
@@ -163,7 +213,132 @@ impl Shoot {
             eyes: None,
             close_ups: None,
             close_up_cells: Vec::new(),
+            assist: Assist::default(),
+            bursts,
+            burst_of,
+            suggestions: HashMap::new(),
+            suggested_from: 0,
+            looked: HashSet::new(),
         }
+    }
+
+    /// The frames a frame was shot with, itself among them: its stack, or
+    /// else its burst.
+    fn group(&self, frame: usize) -> &[usize] {
+        match (self.cull.stack(frame), self.burst_of[frame]) {
+            (Some(stack), _) => stack,
+            (None, Some(burst)) => &self.bursts[burst],
+            (None, None) => &[],
+        }
+    }
+
+    /// What was measured of a frame, and how it stands among the frames it
+    /// was shot with that have been measured too. None until it's been
+    /// looked at.
+    pub fn evidence(&self, frame: usize) -> Option<(Signals, Standing)> {
+        let signals = *self.faces.signals(frame)?;
+        let measured: Vec<(usize, &Signals)> =
+            self.group(frame).iter().filter_map(|&f| Some((f, self.faces.signals(f)?))).collect();
+        let Some(at) = measured.iter().position(|&(f, _)| f == frame) else {
+            return Some((signals, Standing::default()));
+        };
+        let group: Vec<&Signals> = measured.iter().map(|&(_, signals)| signals).collect();
+        Some((signals, signals::standings(&group)[at]))
+    }
+
+    /// The mark suggested for a frame, if there is one.
+    pub fn suggestion(&self, frame: usize) -> Option<Suggestion> {
+        self.suggestions.get(&frame).copied()
+    }
+
+    /// Changes when the suggestions might: with what's been measured, the
+    /// marks, the stacks and the model.
+    fn stamp(&self, on: bool) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        (on, self.faces.measured(), self.cull.stacks()).hash(&mut hasher);
+        for frame in self.cull.frames() {
+            frame.rating.hash(&mut hasher);
+        }
+        let model = self.assist.model.as_ref().map(|m| m.trained);
+        (model, self.assist.confidence.to_bits(), self.assist.pick).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Work out what to suggest, if suggestions are on: in each stack
+    /// with nothing kept yet, the best of its undecided frames by their
+    /// signals, and the rest to go; elsewhere, what the model is sure of.
+    fn suggest(&mut self, on: bool) {
+        let stamp = self.stamp(on);
+        if stamp == self.suggested_from {
+            return;
+        }
+        self.suggested_from = stamp;
+        let mut suggestions = HashMap::new();
+        let frames = self.cull.frames();
+        for stack in self.cull.stacks().iter().filter(|_| on) {
+            if stack.iter().any(|&f| frames[f].rating > 0) {
+                continue;
+            }
+            let undecided: Vec<usize> = stack.iter().copied().filter(|&f| frames[f].rating == 0).collect();
+            let measured: Vec<&Signals> = undecided.iter().filter_map(|&f| self.faces.signals(f)).collect();
+            // Not until every one of them has been measured.
+            if undecided.len() < 2 || measured.len() < undecided.len() {
+                continue;
+            }
+            if let Some((best, margin)) = signals::winner(&measured) {
+                for (k, &frame) in undecided.iter().enumerate() {
+                    let rating = if k == best { self.assist.pick } else { REJECT };
+                    suggestions.insert(frame, Suggestion { rating, by: By::Signals, confidence: margin });
+                }
+            }
+        }
+        if let Some(model) = self.assist.model.as_ref().filter(|_| on) {
+            for frame in (0..frames.len()).filter(|&f| frames[f].rating == 0) {
+                if !suggestions.contains_key(&frame)
+                    && let Some((signals, standing)) = self.evidence(frame)
+                    && let Some(suggestion) = model.suggest(&signals, &standing, self.assist.confidence)
+                {
+                    suggestions.insert(frame, suggestion);
+                }
+            }
+        }
+        if suggestions != self.suggestions {
+            self.cull.set_suggested(suggestions.iter().map(|(&frame, suggestion)| (frame, suggestion.rating)));
+            self.suggestions = suggestions;
+        }
+    }
+
+    /// Y: the marks the current frame's suggestion comes to. From the
+    /// model, the one mark; for a stack, its best frame kept (first) and
+    /// the rest rejected. Or why not.
+    pub fn accept(&self) -> Result<Vec<(usize, Rating)>, &'static str> {
+        let current = self.cull.current();
+        let suggestion = self.suggestions.get(&current).ok_or("Nothing is suggested for this frame")?;
+        Ok(match suggestion.by {
+            By::Model => vec![(current, suggestion.rating)],
+            By::Signals => {
+                let mut marks: Vec<(usize, Rating)> = self
+                    .group(current)
+                    .iter()
+                    .filter_map(|&f| Some((f, self.suggestions.get(&f).filter(|s| s.by == By::Signals)?.rating)))
+                    .collect();
+                marks.sort_by_key(|&(frame, rating)| (Reverse(rating), frame));
+                marks
+            }
+        })
+    }
+
+    /// The frames looked at and left unmarked, once any mark has been
+    /// made: a folder only looked through says nothing of what's passed
+    /// over.
+    pub fn passed(&self) -> Vec<usize> {
+        if !self.cull.can_undo() && !self.cull.can_redo() {
+            return Vec::new();
+        }
+        let mut passed: Vec<usize> =
+            self.looked.iter().copied().filter(|&f| self.cull.frames()[f].rating == 0).collect();
+        passed.sort();
+        passed
     }
 
     /// E: zoom to a face's eyes in the current frame. The first time, the
@@ -378,7 +553,10 @@ impl Shoot {
                 None => return Err("A winner is chosen in a survey or from a stack"),
             },
         };
-        let rating = self.cull.frames()[current].rating.max(PICK);
+        let rating = match self.cull.frames()[current].rating {
+            rated if rated > 0 => rated,
+            _ => self.assist.pick,
+        };
         Ok(std::iter::once((current, rating)).chain(others.into_iter().map(|f| (f, REJECT))).collect())
     }
 
@@ -522,6 +700,7 @@ impl Shoot {
     pub fn update(&mut self, ctx: &egui::Context, show: Show) {
         self.dwell();
         self.faces.update();
+        self.suggest(show.suggestions);
         let current = self.cull.current();
         // The loupe's pane shows the current frame; elsewhere, a frame
         // that isn't on screen (undo went to it) takes back to the loupe.
@@ -531,6 +710,7 @@ impl Shoot {
             _ => {}
         }
         let on_screen: Vec<usize> = self.panes.iter().map(|p| p.frame).collect();
+        self.looked.extend(&on_screen);
         let mut ring = vec![current];
         ring.extend(on_screen.iter().copied().filter(|&f| f != current));
         ring.extend(self.cull.neighbours(AHEAD, BEHIND).into_iter().filter(|f| !on_screen.contains(f)));
@@ -832,6 +1012,22 @@ impl Shoot {
         }
         let badge_at = if zoomed { area.left_top() } else { drawn.left_top() };
         badge(&painter, badge_at + vec2(8.0, 8.0), Align2::LEFT_TOP, frame.rating, 18.0, theme);
+        // What's suggested goes where the mark will.
+        if let Some(suggestion) = self.suggestions.get(&index).filter(|_| frame.rating == 0) {
+            let (text, colour) = suggested(suggestion, theme);
+            // Beside the frame's name, where there is one.
+            let room = if several { area.width() / 2.0 - 14.0 } else { area.width() - 28.0 };
+            loupe::plate(&painter, badge_at + vec2(14.0, 11.0), Align2::LEFT_TOP, text, colour, room);
+        }
+        if show.signals
+            && let Some((signals, standing)) = self.evidence(index)
+        {
+            let mut at = badge_at + vec2(14.0, 46.0);
+            for (text, colour) in chips(&signals, &standing, theme) {
+                let room = (area.right() - at.x).max(0.0);
+                at.x = loupe::plate(&painter, at, Align2::LEFT_TOP, text, colour, room).right() + 16.0;
+            }
+        }
         if let Some(Slot::Ready(shown)) = self.previews.get(&index) {
             if show.histogram {
                 loupe::histogram(&painter, area, &shown.decoded.histogram);
@@ -851,7 +1047,7 @@ impl Shoot {
 
     /// The shown frames in a strip, the current one in the middle. Returns
     /// the frame clicked, and how.
-    pub fn filmstrip(&mut self, ui: &mut Ui, theme: &Theme) -> Option<(usize, Click)> {
+    pub fn filmstrip(&mut self, ui: &mut Ui, theme: &Theme, show: Show) -> Option<(usize, Click)> {
         let (strip, response) = ui.allocate_exact_size(vec2(ui.available_width(), STRIP_HEIGHT), Sense::click());
         let painter = ui.painter_at(strip);
         let cell = vec2(STRIP_HEIGHT * 1.5, STRIP_HEIGHT);
@@ -892,6 +1088,21 @@ impl Shoot {
                 painter.image(texture.id(), image, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), tint);
             }
             badge(&painter, inner.center_bottom() - vec2(0.0, 3.0), Align2::CENTER_BOTTOM, rating, 13.0, theme);
+            if let Some(suggestion) = self.suggestions.get(&i).filter(|_| rating == 0) {
+                hint(&painter, inner.center_bottom() - vec2(0.0, 3.0), suggestion.rating, theme);
+            }
+            // A dot for shut eyes; a ring for a frame soft beside the ones
+            // it was shot with.
+            if show.signals
+                && let Some((signals, standing)) = self.evidence(i)
+            {
+                let at = inner.left_top() + vec2(8.0, 8.0);
+                if signals.shut() {
+                    painter.circle_filled(at, 4.0, theme.red);
+                } else if standing.sharp.is_some_and(|sharp| sharp < SOFT) {
+                    painter.circle_stroke(at, 3.5, Stroke::new(1.5, theme.red));
+                }
+            }
             match stack {
                 Some(n) if collapsed => {
                     let at = inner.right_top() + vec2(-3.0, 3.0);
@@ -960,6 +1171,50 @@ fn fit(size: egui::Vec2, area: Rect) -> Rect {
     Rect::from_center_size(area.center(), size * scale)
 }
 
+/// What the signals say of a frame, each with its colour: red for what's
+/// wrong with it. Its sharpness (at the eyes if it has any, else where
+/// the camera focused) and where that puts it among the frames it was
+/// shot with, then shut eyes and clipping, if there's any to speak of.
+pub fn chips(signals: &Signals, standing: &Standing, theme: &Theme) -> Vec<(String, Color32)> {
+    let mut chips = Vec::new();
+    let sharp = signals.eyes.map(|v| ("Eyes", v)).or(signals.focus.map(|v| ("Focus", v)));
+    if let Some((at, sharp)) = sharp {
+        let (among, colour) = match standing.sharp {
+            Some(share) if standing.of > 1 && share >= 0.995 => {
+                (format!(", sharpest of {}", standing.of), theme.accent)
+            }
+            Some(share) if standing.of > 1 => {
+                let colour = if share < SOFT { theme.red } else { theme.foreground };
+                (format!(", {:.0}% of the sharpest", share * 100.0), colour)
+            }
+            _ => (String::new(), theme.foreground),
+        };
+        chips.push((format!("{at} {sharp:.0}{among}"), colour));
+    }
+    if signals.shut() {
+        chips.push(("Eyes shut?".to_owned(), theme.red));
+    }
+    if signals.highlights >= BLOWN {
+        chips.push((format!("{:.0}% blown", signals.highlights * 100.0), theme.red));
+    }
+    if signals.shadows >= BLACK {
+        chips.push((format!("{:.0}% black", signals.shadows * 100.0), theme.red));
+    }
+    chips
+}
+
+/// A suggestion in words, the mark first so it's what's left where there's
+/// little room, and its colour.
+fn suggested(suggestion: &Suggestion, theme: &Theme) -> (String, Color32) {
+    let sure = format!("{:.0}% sure", suggestion.confidence * 100.0);
+    match (suggestion.by, suggestion.rating) {
+        (By::Signals, REJECT) => ("✕ suggested: not the best of its stack".to_owned(), theme.red),
+        (By::Signals, rating) => (format!("{} suggested: the best of its stack", stars(rating)), theme.accent),
+        (By::Model, REJECT) => (format!("✕ suggested ({sure})"), theme.red),
+        (By::Model, rating) => (format!("{} suggested ({sure})", stars(rating)), theme.accent),
+    }
+}
+
 /// A frame's mark, on a dark plate so it reads over any photo. Nothing for
 /// an undecided frame.
 fn badge(painter: &egui::Painter, at: Pos2, align: Align2, rating: Rating, size: f32, theme: &Theme) {
@@ -970,6 +1225,20 @@ fn badge(painter: &egui::Painter, at: Pos2, align: Align2, rating: Rating, size:
         PICK if size > 14.0 => ("★ Pick".to_owned(), theme.accent),
         stars_ => (stars(stars_), theme.accent),
     };
+    label(painter, at, align, text, colour, size);
+}
+
+/// A mark that's only suggested, in the filmstrip: as its badge would be,
+/// fainter, with a question mark.
+fn hint(painter: &egui::Painter, at: Pos2, rating: Rating, theme: &Theme) {
+    let (text, colour) = match rating {
+        REJECT => ("✕?".to_owned(), theme.red),
+        rating => (format!("{}?", stars(rating)), theme.accent),
+    };
+    label(painter, at, Align2::CENTER_BOTTOM, text, colour.gamma_multiply(0.75), 13.0);
+}
+
+fn label(painter: &egui::Painter, at: Pos2, align: Align2, text: String, colour: Color32, size: f32) {
     let galley = painter.layout_no_wrap(text, FontId::proportional(size), colour);
     let rect = align.anchor_size(at, galley.size()).expand2(vec2(size * 0.35, size * 0.15));
     painter.rect_filled(rect, size * 0.2, Color32::from_black_alpha(170));

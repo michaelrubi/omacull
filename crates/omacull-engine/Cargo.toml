@@ -18,3 +18,7 @@ zune-jpeg = "0.5.15"
 [features]
 # Fake raws for tests, for the app's tests too.
 testing = []
+
+[[example]]
+name = "shoot"
+required-features = ["testing"]

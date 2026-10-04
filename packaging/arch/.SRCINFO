@@ -1,0 +1,26 @@
+pkgbase = omacull-git
+	pkgdesc = Keyboard-first photo culler: a folder of raws in, XMP ratings for darktable out
+	pkgver = 0.1.0.r14.gbe2bb05
+	pkgrel = 1
+	url = https://github.com/michaelrubi/omacull
+	arch = x86_64
+	license = GPL-3.0-or-later
+	makedepends = cargo
+	makedepends = git
+	depends = gcc-libs
+	depends = glibc
+	depends = lcms2
+	depends = vulkan-icd-loader
+	depends = wayland
+	depends = libxkbcommon
+	depends = xdg-desktop-portal
+	depends = hicolor-icon-theme
+	optdepends = onnxruntime: finding faces, eyes and blinks
+	optdepends = curl: downloading the face models with omacull-fetch-models
+	optdepends = darktable: where a culled folder goes next
+	provides = omacull
+	conflicts = omacull
+	source = git+https://github.com/michaelrubi/omacull.git
+	sha256sums = SKIP
+
+pkgname = omacull-git

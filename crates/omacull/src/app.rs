@@ -6,22 +6,24 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use egui::{Align2, FontId, RichText, Sense, Ui, pos2, vec2};
 use omacull_engine::color::Display;
-use omacull_engine::cull::{Change, Cull, Filter, Step};
+use omacull_engine::cull::{Change, Cull, Filter, Rating, Step};
 use omacull_engine::stacks::Stacking;
 use omacull_engine::disk::{self, Disk, How, Mark, Problem};
-use omacull_engine::sidecar::REJECT;
-use omacull_engine::thumbs;
+use omacull_engine::learn::{self, Model};
+use omacull_engine::sidecar::{self, REJECT};
+use omacull_engine::{signals, thumbs};
 
 use crate::commands::Command;
+use crate::config::Config;
 use crate::faces::Finder;
 use crate::hotkeys::{self, format_shortcut};
 use crate::monitor;
 use crate::panes::Mode;
-use crate::shoot::Shoot;
+use crate::shoot::{Assist, Shoot};
 use crate::state::{Place, Show, State};
 use crate::tree::{self, Tree};
 use crate::theme::{self, Theme};
@@ -36,6 +38,10 @@ pub struct Paths {
     pub darktable: String,
     /// The faces found in each raw.
     pub faces: Option<PathBuf>,
+    /// What was measured of each raw.
+    pub signals: Option<PathBuf>,
+    /// The model trained on the decision log.
+    pub model: Option<PathBuf>,
 }
 
 /// A folder being read.
@@ -75,6 +81,12 @@ pub struct App {
     summary: bool,
     /// Finds faces; a stand-in in tests.
     finder: Finder,
+    config: Config,
+    /// What's been learned from the decision log, once there's enough of
+    /// it.
+    model: Option<Arc<Model>>,
+    /// The model being trained, and whether to say how it went.
+    learning: Option<(Receiver<Result<Model, String>>, bool)>,
 }
 
 /// Converts to a monitor's colours, or shows sRGB as it is if its profile
@@ -96,7 +108,10 @@ impl App {
         let theme = Theme::load();
         ctx.set_visuals(theme.visuals());
 
-        let warnings = crate::hotkeys::load();
+        let mut warnings = crate::hotkeys::load();
+        let (config, problems) = Config::load();
+        warnings.extend(problems);
+        sidecar::set_naming(config.sidecar);
         for w in &warnings {
             log::warn!("{w}");
         }
@@ -112,14 +127,24 @@ impl App {
                 parsed
             })
             .collect();
+        let log = disk::default_log();
         let paths = Paths {
             cache: thumbs::default_dir(),
-            log: disk::default_log(),
-            darktable: "darktable".into(),
+            model: log.as_ref().map(|log| log.with_file_name("model.json")),
+            log,
+            darktable: config.developer.clone(),
             faces: omacull_engine::faces::default_dir(),
+            signals: signals::default_dir(),
         };
         let mut app = Self::build(theme, theme::watch(ctx.clone()), warnings, script, State::load(), paths, ctx);
         app.finder = crate::faces::yunet();
+        app.config = config;
+        app.model = app.paths.model.as_deref().and_then(Model::load).map(Arc::new);
+        // Decisions made since it was trained are learned from too.
+        let logged = app.paths.log.as_deref().and_then(|log| std::fs::metadata(log).ok()).map_or(0, |m| m.len());
+        if logged > 0 && app.model.as_ref().is_none_or(|model| model.log_bytes != logged) {
+            app.learn(ctx, false);
+        }
         let watch = monitor::Watch::new();
         app.display = display_for(&watch);
         app.monitor = Some(watch);
@@ -159,6 +184,91 @@ impl App {
             tree: None,
             summary: false,
             finder: std::sync::Arc::new(|| Err("Faces aren't looked for".into())),
+            config: Config::default(),
+            model: None,
+            learning: None,
+        }
+    }
+
+    fn assist(&self) -> Assist {
+        Assist { model: self.model.clone(), confidence: self.config.confidence, pick: self.config.pick }
+    }
+
+    /// Train the model on the decision log, in the background. `announce`
+    /// to say how it went: asked for, not just keeping up.
+    fn learn(&mut self, ctx: &egui::Context, announce: bool) {
+        if self.learning.is_some() {
+            return;
+        }
+        let Some(log) = self.paths.log.clone() else {
+            self.message = announce.then(|| ("There's no decision log to learn from".into(), false));
+            return;
+        };
+        // What's just been marked counts.
+        self.disk.flush();
+        let (tx, rx) = channel();
+        let (ctx, confidence) = (ctx.clone(), self.config.confidence);
+        std::thread::spawn(move || {
+            let _ = tx.send(learn::learn(&log, confidence, disk::millis(SystemTime::now())));
+            ctx.request_repaint();
+        });
+        self.learning = Some((rx, announce));
+        if announce {
+            self.message = Some(("Learning from your decisions…".into(), false));
+        }
+    }
+
+    fn finish_learning(&mut self) {
+        let Some((learning, announce)) = &self.learning else { return };
+        let result = match learning.try_recv() {
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("Learning failed".to_owned()),
+            Ok(result) => result,
+        };
+        let announce = *announce;
+        self.learning = None;
+        match result {
+            Ok(model) => {
+                if let Some(path) = &self.paths.model
+                    && let Err(e) = model.save(path)
+                {
+                    log::warn!("couldn't save {}: {e}", path.display());
+                }
+                self.model = Some(Arc::new(model));
+                let assist = self.assist();
+                if let Some(shoot) = &mut self.shoot {
+                    shoot.assist = assist;
+                }
+                if announce {
+                    self.message = Some((self.learned().join(". "), false));
+                }
+            }
+            Err(why) if announce => self.message = Some((why, false)),
+            Err(why) => log::info!("{why}"),
+        }
+    }
+
+    /// What's been learned from the decision log, and how it did on the
+    /// frames held back to test it.
+    fn learned(&self) -> Vec<String> {
+        let Some(model) = &self.model else {
+            return vec![format!("Nothing learned yet: it takes {} decisions", learn::NEEDED)];
+        };
+        let [rejected, left, kept] = model.learned;
+        let mut lines = vec![format!("Learned from {rejected} rejected, {kept} kept and {left} left unmarked")];
+        if model.held > 0 {
+            let (held, sure, right) = (model.held, model.sure, model.right);
+            lines.push(format!("Of {held} held back, it was sure of {sure} and right about {right}"));
+        }
+        lines
+    }
+
+    /// The frames looked at and left unmarked go in the decision log when
+    /// their folder is left: passing a frame over is a choice too.
+    fn log_passes(&mut self) {
+        let Some(shoot) = &self.shoot else { return };
+        for frame in shoot.passed() {
+            self.disk.write(mark(shoot, frame, (0, 0), How::Pass, &[], Duration::ZERO));
         }
     }
 
@@ -188,10 +298,16 @@ impl App {
             Ok(mut child) => {
                 // Reaped when it's closed.
                 std::thread::spawn(move || child.wait());
-                (format!("Opened {} in darktable", file_name(&dir)), false)
+                (format!("Opened {} in {}", file_name(&dir), self.developer()), false)
             }
             Err(e) => (format!("Couldn't start {}: {e}", self.paths.darktable), true),
         });
+    }
+
+    /// The raw developer's name: darktable, unless the config says
+    /// otherwise.
+    fn developer(&self) -> String {
+        file_name(Path::new(&self.paths.darktable))
     }
 
     /// Open a folder of raws in the background, or the folder a raw is in,
@@ -222,6 +338,7 @@ impl App {
         let Opening { dir, select, .. } = self.opening.take().unwrap();
         match result {
             Ok((mut cull, problems)) => {
+                self.log_passes();
                 self.remember_place();
                 // Where it was left, unless a raw in it was opened.
                 let place = self.state.place(cull.dir()).cloned();
@@ -251,8 +368,10 @@ impl App {
                     };
                     (text, true)
                 });
-                let faces = (self.paths.faces.clone(), self.finder.clone());
-                self.shoot = Some(Shoot::new(cull, self.paths.cache.clone(), faces, self.display.clone(), ctx));
+                let faces = (self.paths.faces.clone(), self.paths.signals.clone(), self.finder.clone());
+                let mut shoot = Shoot::new(cull, self.paths.cache.clone(), faces, self.display.clone(), ctx);
+                shoot.assist = self.assist();
+                self.shoot = Some(shoot);
             }
             Err(e) => {
                 if !dir.is_dir() {
@@ -318,12 +437,15 @@ impl App {
                 return;
             }
             Command::Darktable => self.darktable(),
+            Command::Learn => self.learn(ctx, true),
             Command::Histogram
             | Command::Info
             | Command::Clipping
             | Command::Peaking
             | Command::FocusPoint
-            | Command::FaceStrip => {
+            | Command::FaceStrip
+            | Command::Signals
+            | Command::Suggestions => {
                 let mut show = self.state.show;
                 let (switch, name) = match command {
                     Command::Histogram => (&mut show.histogram, "Histogram"),
@@ -331,6 +453,8 @@ impl App {
                     Command::Clipping => (&mut show.clipping, "Clipping"),
                     Command::Peaking => (&mut show.peaking, "Focus peaking"),
                     Command::FaceStrip => (&mut show.faces, "Face close-ups"),
+                    Command::Signals => (&mut show.signals, "Signals"),
+                    Command::Suggestions => (&mut show.suggestions, "Suggestions"),
                     _ => (&mut show.focus_point, "Focus point"),
                 };
                 *switch = !*switch;
@@ -342,6 +466,9 @@ impl App {
         let Some(shoot) = &mut self.shoot else { return };
         let ppp = ctx.pixels_per_point();
         let say = |text: &str| Some((text.to_owned(), false));
+        // A mark to make on the current frame: a marking key's, or the
+        // one suggested.
+        let mut rating = if command == Command::Pick { Some(self.config.pick) } else { command.rating() };
         match command {
             Command::Zoom => {
                 let (pointer, time) = ctx.input(|i| (i.pointer.hover_pos(), i.time));
@@ -427,18 +554,17 @@ impl App {
                 let count = shoot.cull.stack_count();
                 self.message = Some((format!("Stacks: {} ({count})", stacking.label()), false));
             }
-            Command::Winner => match shoot.winner() {
+            Command::Accept => match shoot.accept() {
+                Ok(marks) if marks.len() == 1 => rating = Some(marks[0].1),
+                // A stack's: its best frame wins.
                 Ok(marks) => {
-                    let changes = shoot.cull.mark_many(&marks);
-                    let compared: Vec<usize> = marks.iter().map(|&(f, _)| f).collect();
-                    for change in changes {
-                        record(&self.disk, shoot, change, How::Mark, &compared);
-                    }
-                    shoot.back_to_loupe();
-                    if self.state.auto_advance {
-                        shoot.cull.step(Step::Next);
-                    }
+                    shoot.cull.go_to(marks[0].0);
+                    win(&self.disk, shoot, &marks, self.state.auto_advance);
                 }
+                Err(why) => self.message = say(why),
+            },
+            Command::Winner => match shoot.winner() {
+                Ok(marks) => win(&self.disk, shoot, &marks, self.state.auto_advance),
                 Err(why) => self.message = say(why),
             },
             // Away from the loupe, the arrows work on the panes.
@@ -451,7 +577,7 @@ impl App {
             Command::Last if shoot.mode == Mode::Loupe => _ = shoot.cull.step(Step::Last),
             _ => {}
         }
-        if let Some(rating) = command.rating() {
+        if let Some(rating) = rating {
             if let Some(change) = shoot.cull.mark(rating) {
                 let compared = shoot.others();
                 record(&self.disk, shoot, change, How::Mark, &compared);
@@ -510,6 +636,7 @@ impl App {
         }
         self.finish_picking(ctx);
         self.finish_opening(ctx);
+        self.finish_learning();
         self.disk_problems();
         // Nothing in Omacull takes typing, so no widget keeps the keyboard:
         // egui gives it to the next button on Tab, which is a key here.
@@ -574,12 +701,13 @@ impl App {
             self.state.set_stacking(stacking);
         }
         let theme = self.theme.clone();
+        let show = self.state.show;
         if let Some(shoot) = &mut self.shoot {
             let strip = egui::Frame::new().fill(theme.darker_background);
             let clicked = egui::Panel::bottom("filmstrip")
                 .frame(strip)
                 .resizable(false)
-                .show(ui, |ui| shoot.filmstrip(ui, &theme))
+                .show(ui, |ui| shoot.filmstrip(ui, &theme, show))
                 .inner;
             if let Some((index, click)) = clicked {
                 shoot.clicked(index, click);
@@ -616,7 +744,6 @@ impl App {
         }
         let pasteboard = egui::Frame::new().fill(self.theme.pasteboard());
         let mut clicked = None;
-        let show = self.state.show;
         egui::CentralPanel::no_frame().frame(pasteboard).show(ui, |ui| match &mut self.shoot {
             Some(shoot) => shoot.loupe(ui, &theme, show),
             None => clicked = self.empty_state(ui),
@@ -634,10 +761,6 @@ impl App {
     fn status_bar(&self, ui: &mut Ui) -> (Option<Command>, Option<Stacking>) {
         let (mut command, mut stack_to) = (None, None);
         ui.horizontal(|ui| {
-            match &self.shoot {
-                Some(shoot) => _ = ui.label(RichText::new(status_line(shoot)).color(self.theme.foreground)),
-                None => _ = ui.label(RichText::new("No folder open").color(self.theme.dark_foreground)),
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(shoot) = &self.shoot {
                     let filter = shoot.cull.filter();
@@ -668,7 +791,8 @@ impl App {
                         command = Some(Command::AutoAdvance);
                     }
                     ui.separator();
-                    let Show { histogram, info, clipping, peaking, focus_point, faces } = self.state.show;
+                    let Show { histogram, info, clipping, peaking, focus_point, faces, signals, suggestions } =
+                        self.state.show;
                     for (on, label, toggle) in [
                         (histogram, "Histogram", Command::Histogram),
                         (info, "Info", Command::Info),
@@ -676,6 +800,8 @@ impl App {
                         (peaking, "Peaking", Command::Peaking),
                         (focus_point, "AF", Command::FocusPoint),
                         (faces, "Faces", Command::FaceStrip),
+                        (signals, "Signals", Command::Signals),
+                        (suggestions, "Suggest", Command::Suggestions),
                         (shoot.view().zoomed, "100%", Command::Zoom),
                     ] {
                         let tip = format!("{} ({})", toggle.label(), shortcut(toggle));
@@ -689,6 +815,15 @@ impl App {
                     let colour = if problem { self.theme.red } else { self.theme.dark_foreground };
                     ui.add(egui::Label::new(RichText::new(text).color(colour)).truncate());
                 }
+                // The room that's left is the status line's, cut short in a
+                // narrow window.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let (text, colour) = match &self.shoot {
+                        Some(shoot) => (status_line(shoot), self.theme.foreground),
+                        None => ("No folder open".to_owned(), self.theme.dark_foreground),
+                    };
+                    ui.add(egui::Label::new(RichText::new(text).color(colour)).truncate());
+                });
             });
         });
         (command, stack_to)
@@ -731,10 +866,19 @@ impl App {
                     if first.on_hover_text(shortcut(Command::FirstUndecided)).clicked() {
                         command = Some(Command::FirstUndecided);
                     }
-                    if ui.button("Open in darktable").on_hover_text(shortcut(Command::Darktable)).clicked() {
+                    let open = format!("Open in {}", self.developer());
+                    if ui.button(open).on_hover_text(shortcut(Command::Darktable)).clicked() {
                         command = Some(Command::Darktable);
                     }
                 });
+                ui.add_space(8.0);
+                for line in self.learned() {
+                    ui.label(RichText::new(line).color(self.theme.dark_foreground));
+                }
+                let learn = ui.add_enabled(self.learning.is_none(), egui::Button::new("Learn from my decisions"));
+                if learn.on_hover_text(shortcut(Command::Learn)).clicked() {
+                    command = Some(Command::Learn);
+                }
             });
         if !open {
             self.summary = false;
@@ -794,24 +938,47 @@ impl App {
     }
 }
 
-/// Record a change in the sidecar and the decision log.
 /// Record a change in the sidecar and the decision log, with the frames
 /// it was weighed against.
 fn record(disk: &Disk, shoot: &mut Shoot, change: Change, how: How, compared: &[usize]) {
     let dwell = shoot.dwell();
+    disk.write(mark(shoot, change.index, (change.was, change.now), how, compared, dwell));
+}
+
+/// A frame's mark as it's logged: with what was measured of it and what
+/// was suggested for it, as they stood when it was made.
+fn mark(shoot: &Shoot, index: usize, (was, now): (Rating, Rating), how: How, compared: &[usize], dwell: Duration) -> Mark {
     let cull = &shoot.cull;
     let path = |i: usize| cull.frames()[i].path.clone();
-    disk.write(Mark {
-        path: path(change.index),
-        rating: change.now,
-        was: change.was,
+    let evidence = shoot.evidence(index);
+    Mark {
+        path: path(index),
+        rating: now,
+        was,
         how,
         view: shoot.mode.name(),
-        compared: compared.iter().copied().filter(|&f| f != change.index).map(path).collect(),
+        compared: compared.iter().copied().filter(|&f| f != index).map(path).collect(),
         filter: cull.filter(),
         dwell,
         at: SystemTime::now(),
-    });
+        signals: evidence.map(|(signals, _)| signals),
+        standing: evidence.map(|(_, standing)| standing),
+        suggested: shoot.suggestion(index),
+    }
+}
+
+/// A winner's marks: it's kept and the rest go, in one step, and it's
+/// back to the loupe.
+fn win(disk: &Disk, shoot: &mut Shoot, marks: &[(usize, Rating)], auto_advance: bool) {
+    let changes = shoot.cull.mark_many(marks);
+    let compared: Vec<usize> = marks.iter().map(|&(f, _)| f).collect();
+    for change in changes {
+        record(disk, shoot, change, How::Mark, &compared);
+    }
+    shoot.back_to_loupe();
+    if auto_advance {
+        shoot.cull.step(Step::Next);
+    }
 }
 
 fn file_name(path: &Path) -> String {
@@ -871,7 +1038,7 @@ fn status(cull: &Cull) -> String {
     let filter = cull.filter();
     let shown = match filter {
         Filter::All => String::new(),
-        _ => format!(" ({} shown)", cull.frames().iter().filter(|f| filter.matches(f.rating)).count()),
+        _ => format!(" ({} shown)", cull.frames().iter().filter(|f| filter.matches(f)).count()),
     };
     format!(
         "{}   {} / {}{shown}   {} picks   {} rejects   {} undecided",
@@ -894,6 +1061,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        self.log_passes();
         self.remember_place();
         // Don't lose the last marks.
         self.disk.finish();
@@ -1414,7 +1582,7 @@ mod tests {
     }
 
     fn quiet() -> Paths {
-        Paths { cache: None, log: None, darktable: "darktable".into(), faces: None }
+        Paths { cache: None, log: None, darktable: "darktable".into(), faces: None, signals: None, model: None }
     }
 
     #[test]
@@ -1645,5 +1813,218 @@ mod tests {
         assert_eq!(h.cull().manual_stacks(), [vec![3, 4]]);
         h.press(Modifiers::COMMAND | Modifiers::SHIFT, Key::G);
         assert!(h.cull().manual_stacks().is_empty(), "unstacked");
+    }
+
+    /// A preview with something to measure where the camera focused: crisp
+    /// stripes, or a soft ramp.
+    fn preview(crisp: bool) -> Vec<u8> {
+        let (w, h) = (480usize, 320);
+        let level = |x: usize| if !crisp { (x * 255 / w) as u8 } else if (x / 4).is_multiple_of(2) { 40 } else { 220 };
+        let rgba = (0..w * h).flat_map(|i| [level(i % w); 3].into_iter().chain([255])).collect();
+        omacull_engine::image::Image { width: w, height: h, rgba }.encode_jpeg(90).unwrap()
+    }
+
+    /// [`bursts`], the second frame of the burst the only sharp one.
+    fn a_burst_with_one_sharp_frame(name: &str) -> Folder {
+        let folder = bursts(name);
+        for i in 1..=3 {
+            let captured = ("2026:10:04 12:00:00", ["100", "300", "500"][i - 1]);
+            Arw { captured, preview: preview(i == 2), ..Arw::default() }.write(&folder.raw(i));
+        }
+        folder
+    }
+
+    fn rows(log: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    fn named(row: &serde_json::Value) -> &str {
+        row["file"]["path"].as_str().unwrap().rsplit('/').next().unwrap()
+    }
+
+    /// A row's frame, the mark made and the mark that was suggested.
+    fn made(row: &serde_json::Value) -> (&str, Option<i64>, Option<i64>) {
+        (named(row), row["rating"].as_i64(), row["suggested"]["rating"].as_i64())
+    }
+
+    #[test]
+    fn the_best_of_a_stack_is_suggested_and_taken_or_overridden() {
+        let folder = a_burst_with_one_sharp_frame("app-suggest");
+        let log = folder.0.join("decisions.jsonl");
+        let mut h = Harness::open(&folder, Paths { log: Some(log.clone()), ..quiet() });
+        h.press(Modifiers::SHIFT, Key::G);
+        h.press(Modifiers::SHIFT, Key::G);
+        h.wait("the suggestion", |app| app.shoot.as_ref().unwrap().suggestion(1).is_some());
+        let suggested: Vec<_> = (0..5).map(|f| h.shoot().suggestion(f).map(|s| (s.rating, s.by))).collect();
+        let by = omacull_engine::signals::By::Signals;
+        assert_eq!(suggested, [Some((REJECT, by)), Some((PICK, by)), Some((REJECT, by)), None, None]);
+        assert_eq!(h.cull().shown_indices(), [0, 1, 3, 4], "the sharp frame stands for the stack, beside the cursor's");
+
+        // Y takes it, from any frame of the stack.
+        h.press(NONE, Key::Y);
+        assert_eq!(h.ratings(), [REJECT, PICK, REJECT, 0, 0]);
+        assert_eq!((h.cull().current(), h.shoot().suggestion(1)), (1, None));
+        h.press(Modifiers::COMMAND, Key::Z);
+        assert_eq!(h.ratings(), [0; 5], "one undo takes it all back");
+        // Another frame chosen instead is an override, and logged as one.
+        h.press(NONE, Key::G);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::W);
+        assert_eq!(h.ratings(), [REJECT, REJECT, PICK, 0, 0]);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::Y);
+        assert!(h.app.message.as_ref().is_some_and(|(m, _)| m.contains("Nothing is suggested")));
+
+        h.app.disk.finish();
+        let rows = rows(&log);
+        let taken: Vec<_> = rows[..3].iter().map(made).collect();
+        let (pick, reject) = (Some(1), Some(-1));
+        assert_eq!(taken, [("DSC00002.ARW", pick, pick), ("DSC00001.ARW", reject, reject), ("DSC00003.ARW", reject, reject)]);
+        assert!(rows[..3].iter().all(|r| r["suggested"]["by"] == "signals" && r["standing"]["of"] == 3));
+        assert!(rows[0]["signals"]["focus"].as_f64().unwrap() > 100.0 && rows[0]["standing"]["sharp"] == 1.0);
+        assert!(rows[1]["standing"]["sharp"].as_f64().unwrap() < 0.1, "soft beside it");
+        let overridden = rows.iter().rfind(|r| named(r) == "DSC00002.ARW").unwrap();
+        assert_eq!((overridden["how"].as_str(), made(overridden)), (Some("mark"), ("DSC00002.ARW", reject, pick)));
+        assert!(rows.iter().filter(|r| r["how"] != "mark").all(|r| r["suggested"].is_null()), "undo has none");
+    }
+
+    #[test]
+    fn signals_are_shown_as_words_for_whats_wrong() {
+        use omacull_engine::signals::{Signals, Standing};
+        let folder = Folder::with_raws("app-signals", 2, &Arw { preview: preview(true), ..Arw::default() });
+        let mut h = Harness::open(&folder, quiet());
+        assert!(!h.app.state.show.signals && h.app.state.show.suggestions);
+        h.press(NONE, Key::Q);
+        assert!(h.app.state.show.signals);
+        // Taken in the same second, the two frames are measured against
+        // each other.
+        h.wait("the signals", |app| app.shoot.as_ref().unwrap().evidence(0).is_some_and(|(_, s)| s.of == 2));
+        let (signals, standing) = h.shoot().evidence(0).unwrap();
+        assert!(signals.focus.unwrap() > 100.0 && signals.eyes.is_none());
+        assert_eq!(standing.sharp, Some(1.0));
+        h.frame(vec![]);
+        let theme = Theme::default();
+        let words = |signals: &Signals, standing: &Standing| -> Vec<(String, bool)> {
+            let chips = crate::shoot::chips(signals, standing, &theme);
+            chips.into_iter().map(|(text, colour)| (text, colour == theme.red)).collect()
+        };
+        assert_eq!(words(&signals, &Standing::default()), [(format!("Focus {:.0}", signals.focus.unwrap()), false)], "alone");
+        let soft = Standing { of: 4, sharp: Some(0.62), open: Some(0.1) };
+        let bad = Signals { eyes: Some(31.4), open: Some(0.1), highlights: 0.08, shadows: 0.2, ..signals };
+        assert_eq!(
+            words(&bad, &soft),
+            [
+                ("Eyes 31, 62% of the sharpest".into(), true),
+                ("Eyes shut?".into(), true),
+                ("8% blown".into(), true),
+                ("20% black".into(), true),
+            ]
+        );
+        let best = Standing { sharp: Some(1.0), ..soft };
+        assert_eq!(words(&Signals { open: Some(0.9), ..signals }, &best)[0].0, format!("Focus {:.0}, sharpest of 4", signals.focus.unwrap()));
+        h.press(Modifiers::SHIFT, Key::Q);
+        assert!(!h.app.state.show.suggestions);
+    }
+
+    #[test]
+    fn frames_passed_over_are_logged_when_the_folder_is_left() {
+        let folder = Folder::with_raws("app-passes", 5, &Arw::default());
+        let other = Folder::with_raws("app-passes-other", 3, &Arw::default());
+        let log = folder.0.join("decisions.jsonl");
+        let mut h = Harness::open(&folder, Paths { log: Some(log.clone()), ..quiet() });
+        h.press(NONE, Key::P);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        h.app.open(other.0.clone(), &h.ctx.clone());
+        h.wait("the other folder", |app| app.opening.is_none());
+        // Only looked through, the other folder says nothing.
+        h.press(NONE, Key::ArrowRight);
+        eframe::App::on_exit(&mut h.app);
+        let passed: Vec<_> = rows(&log).iter().filter(|r| r["how"] == "pass").map(|r| named(r).to_owned()).collect();
+        assert_eq!(passed, ["DSC00002.ARW", "DSC00003.ARW"], "what was seen and left, not what was marked or never reached");
+        assert!(!sidecar::path_for(&folder.raw(2)).exists(), "nothing is written for a pass");
+    }
+
+    #[test]
+    fn the_model_learns_from_the_log_and_its_suggestions_are_reviewed() {
+        let folder = Folder::new("app-learn");
+        for (i, crisp) in [false, true, false].into_iter().enumerate() {
+            Arw { preview: preview(crisp), ..Arw::default() }.write(&folder.raw(i + 1));
+        }
+        // A cull so far: the soft rejected, the sharp kept.
+        let (log, model) = (folder.0.join("decisions.jsonl"), folder.0.join("model.json"));
+        let earlier: String = (0..120)
+            .map(|i| {
+                let (focus, rating) = if i % 2 == 0 { (2.0, -1) } else { (150.0, 1) };
+                let signals = serde_json::json!({"focus": focus, "eyes": null, "open": null, "highlights": 0.0, "shadows": 0.0, "faces": 0, "face": 0.0});
+                let file = serde_json::json!({"path": format!("/earlier/DSC{i:05}.ARW"), "captured": null});
+                format!("{}\n", serde_json::json!({"file": file, "rating": rating, "signals": signals}))
+            })
+            .collect();
+        std::fs::write(&log, earlier).unwrap();
+        let mut h = Harness::open(&folder, Paths { log: Some(log.clone()), model: Some(model.clone()), ..quiet() });
+        h.press(NONE, Key::M);
+        h.press(NONE, Key::Y);
+        assert!(h.app.message.as_ref().is_some_and(|(m, _)| m.contains("Nothing is suggested")));
+        h.press(Modifiers::COMMAND, Key::L);
+        h.wait("the model", |app| app.model.is_some());
+        assert!(model.exists(), "kept for next time");
+        let said = h.app.message.clone().unwrap().0;
+        assert!(said.starts_with("Learned from 60 rejected, 60 kept and 0 left unmarked. Of 2"), "{said}");
+        h.press(NONE, Key::Escape);
+
+        h.wait("its suggestions", |app| app.shoot.as_ref().unwrap().suggestion(2).is_some());
+        let suggested: Vec<_> = (0..3).map(|f| h.shoot().suggestion(f).map(|s| s.rating)).collect();
+        assert_eq!(suggested, [Some(REJECT), Some(PICK), Some(REJECT)]);
+        assert!(h.shoot().suggestion(0).unwrap().confidence >= 0.8);
+        h.press(NONE, Key::Num2);
+        h.press(CMD_ALT, Key::Y);
+        assert_eq!((h.cull().filter(), h.cull().current()), (Filter::Suggested, 1));
+        assert_eq!(h.cull().shown_indices(), [1, 2], "what there is to review");
+        h.press(NONE, Key::Y);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::Y);
+        assert_eq!(h.ratings(), [2, PICK, REJECT]);
+        // With suggestions off there are none, to see or to take.
+        h.press(Modifiers::COMMAND, Key::Z);
+        h.press(Modifiers::SHIFT, Key::Q);
+        assert_eq!(h.shoot().suggestion(2), None);
+
+        h.app.disk.finish();
+        let rows = rows(&log);
+        let marks: Vec<_> = rows[120..123].iter().map(made).collect();
+        let (pick, reject) = (Some(1), Some(-1));
+        assert_eq!(
+            marks,
+            [("DSC00001.ARW", Some(2), reject), ("DSC00002.ARW", pick, pick), ("DSC00003.ARW", reject, reject)],
+            "an override, and two taken"
+        );
+        assert!(rows[120..123].iter().all(|r| r["suggested"]["by"] == "model"));
+        assert_eq!(rows[122]["filter"], "suggested");
+
+        // Too little to learn from says so, and the model stays.
+        std::fs::write(&log, "").unwrap();
+        h.press(Modifiers::COMMAND, Key::L);
+        h.wait("learning", |app| app.learning.is_none());
+        assert!(h.app.message.as_ref().is_some_and(|(m, _)| m.contains("0 of the 100")));
+        assert!(h.app.model.is_some());
+    }
+
+    #[test]
+    fn a_pick_is_as_many_stars_as_the_config_says() {
+        let folder = bursts("app-pick");
+        let mut h = Harness::with(quiet(), &[]);
+        h.app.config.pick = 3;
+        h.app.open(folder.0.clone(), &h.ctx.clone());
+        h.wait("the folder", |app| app.shoot.as_ref().is_some_and(|s| s.preview_ready()));
+        h.press(Modifiers::SHIFT, Key::G);
+        h.press(Modifiers::SHIFT, Key::G);
+        h.press(NONE, Key::W);
+        assert_eq!(h.ratings(), [3, REJECT, REJECT, 0, 0], "a winner is a pick");
+        h.press(NONE, Key::End);
+        h.press(NONE, Key::P);
+        h.press(NONE, Key::ArrowLeft);
+        h.press(NONE, Key::Num1);
+        assert_eq!(h.ratings()[3..], [1, 3]);
     }
 }

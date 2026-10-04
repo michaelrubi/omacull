@@ -17,8 +17,8 @@ use crate::raw::RawFile;
 use crate::sidecar::{self, REJECT};
 use crate::stacks::{self, Signature, Stacking};
 
-/// The raws a folder is culled for. ARW only until other cameras are tried.
-const RAW_EXTENSIONS: &[&str] = &["arw"];
+/// The raws a folder is culled for: Sony's, Nikon's, Canon's and Fuji's.
+pub const RAW_EXTENSIONS: &[&str] = &["arw", "nef", "cr3", "raf"];
 
 /// A mark as darktable stores it in `xmp:Rating`: -1 rejected, 0 not yet
 /// decided, 1 a pick (one star), up to 5 stars.
@@ -34,11 +34,13 @@ pub struct Frame {
     pub captured: Option<f64>,
     /// What it looks like, roughly, for stacking by look.
     pub signature: Option<Signature>,
+    /// The mark Omacull suggests for it, while it has none.
+    pub suggested: Option<Rating>,
 }
 
 impl Frame {
     pub fn new(path: PathBuf, rating: Rating) -> Self {
-        Self { path, rating, captured: None, signature: None }
+        Self { path, rating, captured: None, signature: None, suggested: None }
     }
 }
 
@@ -52,15 +54,18 @@ pub enum Filter {
     Rejects,
     /// Rated this many stars or more: 1 is picks and up.
     AtLeast(Rating),
+    /// Undecided, with a mark suggested: what there is to review.
+    Suggested,
 }
 
 impl Filter {
-    pub fn matches(self, rating: Rating) -> bool {
+    pub fn matches(self, frame: &Frame) -> bool {
         match self {
             Filter::All => true,
-            Filter::Undecided => rating == 0,
-            Filter::Rejects => rating == REJECT,
-            Filter::AtLeast(stars) => rating >= stars,
+            Filter::Undecided => frame.rating == 0,
+            Filter::Rejects => frame.rating == REJECT,
+            Filter::AtLeast(stars) => frame.rating >= stars,
+            Filter::Suggested => frame.rating == 0 && frame.suggested.is_some(),
         }
     }
 
@@ -71,10 +76,11 @@ impl Filter {
             Filter::Rejects => "Rejects".into(),
             Filter::AtLeast(PICK) => "Picks and up".into(),
             Filter::AtLeast(stars) => format!("{stars} stars and up"),
+            Filter::Suggested => "Suggested".into(),
         }
     }
 
-    pub const ALL: [Filter; 8] = [
+    pub const ALL: [Filter; 9] = [
         Filter::All,
         Filter::Undecided,
         Filter::AtLeast(1),
@@ -83,6 +89,7 @@ impl Filter {
         Filter::AtLeast(4),
         Filter::AtLeast(5),
         Filter::Rejects,
+        Filter::Suggested,
     ];
 }
 
@@ -169,11 +176,13 @@ impl Cull {
                 };
                 let raw = RawFile::open(&path).ok();
                 let captured = raw.as_ref().and_then(|r| r.captured.as_deref()).and_then(stacks::seconds);
+                // Only from a thumbnail: where a raw embeds nothing small,
+                // a look at every frame would hold the folder up.
                 let signature = raw.as_ref().and_then(|r| {
-                    let jpeg = r.read(r.thumbnail()?).ok()?;
+                    let jpeg = r.read(r.thumbnail().filter(|j| j.len < 1 << 20)?).ok()?;
                     Some(Signature::of(&Image::decode_jpeg(&jpeg).ok()?))
                 });
-                (Frame { path, rating, captured, signature }, problem)
+                (Frame { path, rating, captured, signature, suggested: None }, problem)
             })
             .collect();
         let (frames, problems): (Vec<Frame>, Vec<Option<String>>) = read.into_iter().unzip();
@@ -242,15 +251,31 @@ impl Cull {
     }
 
     /// The frame a collapsed stack shows: its best-rated frame the filter
-    /// lets through, the first of equals; none if it lets none through.
+    /// lets through; of equals, the one suggested for keeping, else the
+    /// first. None if the filter lets none through.
     pub fn representative(&self, stack: usize) -> Option<usize> {
         let members = self.stacks.get(stack)?;
-        members.iter().copied().filter(|&i| self.matches(i)).max_by_key(|&i| (self.frames[i].rating, Reverse(i)))
+        let key = |&i: &usize| {
+            let frame = &self.frames[i];
+            (frame.rating, frame.suggested.is_some_and(|rating| rating > 0), Reverse(i))
+        };
+        members.iter().copied().filter(|&i| self.matches(i)).max_by_key(key)
     }
 
     /// Whether the filter lets a frame through.
     fn matches(&self, index: usize) -> bool {
-        self.filter.matches(self.frames[index].rating)
+        self.filter.matches(&self.frames[index])
+    }
+
+    /// The marks Omacull suggests, for undecided frames: these and no
+    /// others.
+    pub fn set_suggested(&mut self, suggested: impl IntoIterator<Item = (usize, Rating)>) {
+        for frame in &mut self.frames {
+            frame.suggested = None;
+        }
+        for (index, rating) in suggested {
+            self.frames[index].suggested = Some(rating);
+        }
     }
 
     pub fn shown_indices(&self) -> Vec<usize> {
@@ -350,7 +375,7 @@ impl Cull {
     /// frame, the cursor moves to the nearest frame that's in, next first.
     pub fn set_filter(&mut self, filter: Filter) {
         self.filter = filter;
-        if !filter.matches(self.frame().rating) {
+        if !filter.matches(self.frame()) {
             let to = self.onward(self.current, 1).next().or_else(|| self.onward(self.current, -1).next());
             if let Some(to) = to {
                 self.current = to;
@@ -516,6 +541,11 @@ impl Cull {
         self.stacks.len()
     }
 
+    /// Every stack, in order.
+    pub fn stacks(&self) -> &[Vec<usize>] {
+        &self.stacks
+    }
+
     /// Whether the stack a frame is in shows all its frames.
     pub fn expanded(&self, index: usize) -> bool {
         self.stack_of.get(index).copied().flatten().is_some_and(|s| self.expanded.contains(&s))
@@ -594,6 +624,27 @@ mod tests {
     }
 
     #[test]
+    fn other_cameras_raws_are_culled_too() {
+        use crate::testing::{cr3, jpeg, raf};
+        let folder = Folder::new("cull-formats");
+        let preview = jpeg(48, 32, [200, 120, 40]);
+        let settings = Arw { preview: Vec::new(), thumbnail: Vec::new(), ..Arw::default() };
+        Arw::default().write(&folder.0.join("DSC_0001.NEF"));
+        fs::write(folder.0.join("IMG_0002.CR3"), cr3(&settings.bytes(), &jpeg(16, 12, [9; 3]), &preview)).unwrap();
+        fs::write(folder.0.join("DSCF0003.RAF"), raf(&preview)).unwrap();
+        fs::write(folder.0.join("IMG_0004.JPG"), &preview).unwrap();
+        let (cull, problems) = Cull::open(&folder.0).unwrap();
+        assert_eq!((cull.frames().len(), problems.len()), (3, 0));
+        for frame in cull.frames() {
+            let image = crate::image::preview(&frame.path).unwrap();
+            assert_eq!((image.width, image.height), (48, 32), "{}", frame.path.display());
+        }
+        // The RAF's JPEG has no Exif: no capture time, and no harm.
+        let captured: Vec<bool> = cull.frames().iter().map(|f| f.captured.is_some()).collect();
+        assert_eq!(captured, [false, true, true], "by name: the RAF, the NEF, the CR3");
+    }
+
+    #[test]
     fn stepping_stops_at_the_ends() {
         let mut c = cull(&[0, 0, 0]);
         assert!(!c.step(Step::Previous));
@@ -647,7 +698,7 @@ mod tests {
             (Filter::Rejects, vec![2]),
         ] {
             c.set_filter(filter);
-            assert!(filter.matches(c.frame().rating), "{filter:?} moved the cursor onto a shown frame");
+            assert!(filter.matches(c.frame()), "{filter:?} moved the cursor onto a shown frame");
             c.step(Step::First);
             let mut visited = vec![c.current()];
             while c.step(Step::Next) {
@@ -768,6 +819,31 @@ mod tests {
         assert!(!c.toggle_stack(), "not in a stack");
         c.set_stacking(Stacking::Off);
         assert_eq!(c.shown_indices().len(), 6);
+    }
+
+    #[test]
+    fn suggestions_are_what_there_is_to_review_and_stand_for_their_stack() {
+        let mut c = burst(&[0.0, 0.1, 0.2, 10.0, 20.0]);
+        c.set_stacking(Stacking::Time);
+        c.set_suggested([(0, REJECT), (1, PICK), (2, REJECT), (4, 3)]);
+        assert_eq!(c.shown_indices(), [0, 1, 3, 4], "the cursor's frame, and the one suggested for keeping");
+        c.go_to(3);
+        assert_eq!(c.shown_indices(), [1, 3, 4]);
+        c.set_filter(Filter::Suggested);
+        assert_eq!(c.current(), 4, "moved onto a frame with a suggestion");
+        assert_eq!(c.shown_indices(), [1, 4]);
+        // Marked, a frame has nothing left to review.
+        c.mark(3);
+        c.step(Step::Previous);
+        assert_eq!(c.shown_indices(), [1]);
+        // A rating still counts for more than a suggestion.
+        c.set_filter(Filter::All);
+        c.go_to(2);
+        c.mark(PICK);
+        c.go_to(3);
+        assert_eq!(c.shown_indices(), [2, 3, 4]);
+        c.set_suggested([]);
+        assert!(c.frames().iter().all(|f| f.suggested.is_none()));
     }
 
     #[test]

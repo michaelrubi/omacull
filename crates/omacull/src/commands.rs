@@ -61,6 +61,11 @@ pub enum Command {
     ToggleStack,
     Stacking,
     Winner,
+    Signals,
+    Suggestions,
+    Accept,
+    ShowSuggested,
+    Learn,
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -128,6 +133,11 @@ impl Command {
         Command::ToggleStack,
         Command::Stacking,
         Command::Winner,
+        Command::Signals,
+        Command::Suggestions,
+        Command::Accept,
+        Command::ShowSuggested,
+        Command::Learn,
     ];
 
     /// Look a command up by its name in code, e.g. "Reject".
@@ -148,6 +158,7 @@ impl Command {
         Command::ShowStars4,
         Command::ShowStars5,
         Command::ShowRejects,
+        Command::ShowSuggested,
         Command::Redo,
         Command::ZoomToFocus,
         Command::SelectPrevious,
@@ -159,6 +170,8 @@ impl Command {
         Command::FaceStrip,
         Command::StackSelection,
         Command::Stacking,
+        Command::Suggestions,
+        Command::Learn,
         Command::Quit,
         Command::Open,
         Command::Undo,
@@ -192,6 +205,8 @@ impl Command {
         Command::Eyes,
         Command::ToggleStack,
         Command::Winner,
+        Command::Signals,
+        Command::Accept,
     ];
 
     pub fn label(self) -> &'static str {
@@ -241,7 +256,7 @@ impl Command {
             Command::Folders => "Folder Tree",
             Command::Summary => "Cull Summary",
             Command::FirstUndecided => "First Undecided Frame",
-            Command::Darktable => "Open in darktable",
+            Command::Darktable => "Open in the Raw Developer",
             Command::Eyes => "Zoom to the Eyes (Again: the Next Face)",
             Command::FaceStrip => "Face Close-Ups",
             Command::StackSelection => "Stack the Selection",
@@ -249,6 +264,11 @@ impl Command {
             Command::ToggleStack => "Open Out or Close Up the Stack",
             Command::Stacking => "How Frames Are Stacked",
             Command::Winner => "Winner: Pick It, Reject the Rest",
+            Command::Signals => "Signals: Sharpness, Shut Eyes, Clipping",
+            Command::Suggestions => "Suggestions",
+            Command::Accept => "Take the Suggestion",
+            Command::ShowSuggested => "Show Suggested",
+            Command::Learn => "Learn from My Decisions",
         }
     }
 
@@ -313,6 +333,12 @@ impl Command {
             Command::ToggleStack => s(Modifiers::NONE, Key::G),
             Command::Stacking => s(Modifiers::SHIFT, Key::G),
             Command::Winner => s(Modifiers::NONE, Key::W),
+            // Q for the quality of a frame; Y to say yes to a suggestion.
+            Command::Signals => s(Modifiers::NONE, Key::Q),
+            Command::Suggestions => s(Modifiers::SHIFT, Key::Q),
+            Command::Accept => s(Modifiers::NONE, Key::Y),
+            Command::ShowSuggested => s(CMD_ALT, Key::Y),
+            Command::Learn => s(CMD, Key::L),
         }
     }
 
@@ -342,6 +368,7 @@ impl Command {
             Command::ShowStars4 => Filter::AtLeast(4),
             Command::ShowStars5 => Filter::AtLeast(5),
             Command::ShowRejects => Filter::Rejects,
+            Command::ShowSuggested => Filter::Suggested,
             _ => return None,
         })
     }
@@ -446,6 +473,7 @@ mod tests {
         assert_eq!(press(&ctx, CMD_ALT, Key::Num3), [Command::ShowStars3]);
         assert_eq!(press(&ctx, CMD_ALT, Key::X), [Command::ShowRejects]);
         assert_eq!(press(&ctx, CMD_ALT, Key::A), [Command::ShowAll]);
+        assert_eq!(press(&ctx, CMD_ALT, Key::Y), [Command::ShowSuggested]);
         for filter in Filter::ALL {
             assert_eq!(Command::show(filter).filter(), Some(filter));
         }
@@ -458,5 +486,11 @@ mod tests {
         assert_eq!(press(&ctx, CMD_SHIFT, Key::Z), [Command::Redo]);
         // Nor Ctrl+X for a reject.
         assert_eq!(press(&ctx, CMD, Key::X), []);
+        // Nor learning for locking the zoom, nor suggestions for signals.
+        assert_eq!(press(&ctx, CMD, Key::L), [Command::Learn]);
+        assert_eq!(press(&ctx, Modifiers::NONE, Key::L), [Command::Lock]);
+        assert_eq!(press(&ctx, Modifiers::SHIFT, Key::Q), [Command::Suggestions]);
+        assert_eq!(press(&ctx, Modifiers::NONE, Key::Q), [Command::Signals]);
+        assert_eq!(press(&ctx, Modifiers::NONE, Key::Y), [Command::Accept]);
     }
 }

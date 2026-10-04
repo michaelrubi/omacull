@@ -2,8 +2,12 @@
 //! JPEGs the camera embedded, the orientation, where it focused and the
 //! shooting settings.
 //!
-//! An ARW is a TIFF. Only the directories are read, a few hundred bytes
-//! each, so opening a 50 MB raw costs a handful of small reads.
+//! An ARW is a TIFF, and so is Nikon's NEF. Only the directories are read,
+//! a few hundred bytes each, so opening a 50 MB raw costs a handful of
+//! small reads. Canon's CR3 is boxes, as in an MP4, with small TIFFs
+//! inside for the settings; Fuji's RAF is a header pointing at a whole
+//! JPEG file, with the settings in that JPEG's own Exif. The focus point
+//! is only read from Sony's.
 
 use std::fs::File;
 use std::io::{self, ErrorKind};
@@ -145,6 +149,10 @@ pub(crate) const INTEROP_IFD: u16 = 0xa005;
 pub(crate) const INTEROP_INDEX: u16 = 0x0001;
 /// In Sony's makernote: 0 for manual focus (ExifTool's FocusMode, 0x201b).
 pub(crate) const SONY_FOCUS_MODE: u16 = 0x201b;
+/// In Nikon's makernote: a directory holding a small JPEG.
+pub(crate) const NIKON_PREVIEW_IFD: u16 = 0x0011;
+/// A preview at least this many pixels on its long edge fills the loupe.
+const PREVIEW_EDGE: u32 = 1400;
 
 fn invalid(what: &str) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, what)
@@ -159,12 +167,115 @@ struct Entry {
     value: [u8; 4],
 }
 
+/// A TIFF somewhere in a file: the whole of an ARW, or the Exif of a JPEG
+/// inside a raw. Its offsets count from `base`.
 struct Tiff<'a> {
     file: &'a File,
     big_endian: bool,
+    base: u64,
+    /// The offset of its first directory.
+    first: u64,
 }
 
-impl Tiff<'_> {
+/// What's been found in a raw so far.
+#[derive(Default)]
+struct Found {
+    jpegs: Vec<Embedded>,
+    orientation: Option<u16>,
+    focus: Option<Focus>,
+    date: Option<String>,
+    fraction: Option<String>,
+    exif: Exif,
+    color_space: Option<u32>,
+    interop: Option<String>,
+    size: Option<(u32, u32)>,
+    make: String,
+}
+
+impl<'a> Tiff<'a> {
+    /// The TIFF whose header is at `base`.
+    fn at(file: &'a File, base: u64) -> io::Result<Self> {
+        let mut header = [0; 8];
+        file.read_exact_at(&mut header, base)?;
+        let big_endian = match &header[..2] {
+            b"II" => false,
+            b"MM" => true,
+            _ => return Err(invalid("not a TIFF-based raw")),
+        };
+        let mut tiff = Self { file, big_endian, base, first: 0 };
+        if tiff.u16(&header[2..]) != 42 {
+            return Err(invalid("not a TIFF-based raw"));
+        }
+        tiff.first = u64::from(tiff.u32(&header[4..]));
+        Ok(tiff)
+    }
+
+    fn read(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+        self.file.read_exact_at(bytes, self.base + offset)
+    }
+
+    /// Every directory, and what a culler wants from each.
+    fn walk(&self, found: &mut Found) -> io::Result<()> {
+        // The main chain of directories, and the sub-directories hanging off
+        // them. A corrupt file could chain in a loop, so stop after a few.
+        let mut pending = vec![self.first];
+        let mut seen = 0;
+        while let Some(offset) = pending.pop() {
+            seen += 1;
+            if offset == 0 || seen > 32 {
+                continue;
+            }
+            let (entries, next) = self.directory(offset)?;
+            // Sub-directories and the next in the chain go on a stack, so
+            // push the next first to visit the sub-directories before it.
+            pending.push(next);
+            let (mut at, mut len, mut width, mut height) = (None, None, None, None);
+            let ratio = |e: &Entry| self.rational(e).ok().filter(|&(_, d)| d > 0).map(|(n, d)| n as f32 / d as f32);
+            let exif = &mut found.exif;
+            for e in &entries {
+                match e.tag {
+                    JPEG_OFFSET => at = Some(self.number(e)),
+                    JPEG_LENGTH => len = Some(self.number(e)),
+                    ORIENTATION if found.orientation.is_none() => found.orientation = Some(self.number(e) as u16),
+                    SUB_IFDS => pending.extend(self.offsets(e)?),
+                    EXIF_IFD => pending.push(u64::from(self.u32(&e.value))),
+                    MAKE => found.make = self.text(e).unwrap_or_default().to_ascii_uppercase(),
+                    MAKER_NOTE if found.make.starts_with("SONY") => {
+                        found.focus = sony_focus(self, u64::from(self.u32(&e.value)));
+                    }
+                    MAKER_NOTE if found.make.starts_with("NIKON") => {
+                        found.jpegs.extend(nikon_preview(self.file, self.base + u64::from(self.u32(&e.value))));
+                    }
+                    DATE_TIME_ORIGINAL if found.date.is_none() => found.date = self.text(e).ok(),
+                    SUB_SEC_TIME_ORIGINAL if found.fraction.is_none() => found.fraction = self.text(e).ok(),
+                    MODEL if exif.model.is_none() => exif.model = self.text(e).ok().filter(|m| !m.is_empty()),
+                    LENS_MODEL => exif.lens = self.text(e).ok().filter(|l| !l.is_empty()),
+                    EXPOSURE_TIME => exif.exposure = self.rational(e).ok(),
+                    F_NUMBER => exif.f_number = ratio(e),
+                    FOCAL_LENGTH => exif.focal_length = ratio(e),
+                    ISO => exif.iso = Some(self.number(e)),
+                    COLOR_SPACE => found.color_space = Some(self.number(e)),
+                    INTEROP_IFD => pending.push(u64::from(self.u32(&e.value))),
+                    INTEROP_INDEX if e.kind == 2 => found.interop = self.text(e).ok(),
+                    IMAGE_WIDTH => width = Some(self.number(e)),
+                    IMAGE_LENGTH => height = Some(self.number(e)),
+                    _ => {}
+                }
+            }
+            if let (Some(at), Some(len)) = (at, len)
+                && len > 0
+            {
+                found.jpegs.push(Embedded { offset: self.base + u64::from(at), len: u64::from(len) });
+            }
+            if let (Some(w), Some(h)) = (width, height)
+                && found.size.is_none_or(|(sw, sh)| u64::from(w) * u64::from(h) > u64::from(sw) * u64::from(sh))
+            {
+                found.size = Some((w, h));
+            }
+        }
+        Ok(())
+    }
+
     fn u16(&self, b: &[u8]) -> u16 {
         let b = [b[0], b[1]];
         if self.big_endian { u16::from_be_bytes(b) } else { u16::from_le_bytes(b) }
@@ -179,10 +290,10 @@ impl Tiff<'_> {
     /// directory chained after it (0 if none).
     fn directory(&self, offset: u64) -> io::Result<(Vec<Entry>, u64)> {
         let mut count = [0; 2];
-        self.file.read_exact_at(&mut count, offset)?;
+        self.read(&mut count, offset)?;
         let count = usize::from(self.u16(&count));
         let mut bytes = vec![0; count * 12 + 4];
-        self.file.read_exact_at(&mut bytes, offset + 2)?;
+        self.read(&mut bytes, offset + 2)?;
         let entries = bytes[..count * 12]
             .as_chunks::<12>()
             .0
@@ -209,7 +320,7 @@ impl Tiff<'_> {
             let len = bytes.len();
             bytes.copy_from_slice(&e.value[..len]);
         } else {
-            self.file.read_exact_at(&mut bytes, u64::from(self.u32(&e.value)))?;
+            self.read(&mut bytes, u64::from(self.u32(&e.value)))?;
         }
         Ok(String::from_utf8_lossy(&bytes).trim_end_matches('\0').trim().to_owned())
     }
@@ -217,7 +328,7 @@ impl Tiff<'_> {
     /// An entry's value as a fraction (a RATIONAL).
     fn rational(&self, e: &Entry) -> io::Result<(u32, u32)> {
         let mut bytes = [0; 8];
-        self.file.read_exact_at(&mut bytes, u64::from(self.u32(&e.value)))?;
+        self.read(&mut bytes, u64::from(self.u32(&e.value)))?;
         Ok((self.u32(&bytes), self.u32(&bytes[4..])))
     }
 
@@ -228,7 +339,7 @@ impl Tiff<'_> {
         }
         // No raw has more than a few sub-directories.
         let mut bytes = vec![0; e.count.min(16) as usize * 4];
-        self.file.read_exact_at(&mut bytes, u64::from(self.u32(&e.value)))?;
+        self.read(&mut bytes, u64::from(self.u32(&e.value)))?;
         Ok(bytes.as_chunks::<4>().0.iter().map(|b| u64::from(self.u32(b))).collect())
     }
 }
@@ -236,77 +347,17 @@ impl Tiff<'_> {
 impl RawFile {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
-        let mut header = [0; 8];
+        let mut header = [0; 16];
         file.read_exact_at(&mut header, 0)?;
-        let big_endian = match &header[..2] {
-            b"II" => false,
-            b"MM" => true,
-            _ => return Err(invalid("not a TIFF-based raw")),
-        };
-        let tiff = Tiff { file: &file, big_endian };
-        if tiff.u16(&header[2..]) != 42 {
-            return Err(invalid("not a TIFF-based raw"));
+        let mut found = Found::default();
+        if header.starts_with(b"FUJIFILMCCD-RAW") {
+            raf(&file, &mut found)?;
+        } else if &header[4..8] == b"ftyp" {
+            cr3(&file, &mut found)?;
+        } else {
+            Tiff::at(&file, 0)?.walk(&mut found)?;
         }
-
-        let (mut jpegs, mut orientation, mut focus) = (Vec::new(), None, None);
-        let (mut date, mut fraction) = (None, None);
-        let (mut exif, mut color_space, mut interop) = (Exif::default(), None, None);
-        let mut size: Option<(u32, u32)> = None;
-        let mut sony = false;
-        // The main chain of directories, and the sub-directories hanging off
-        // them. A corrupt file could chain in a loop, so stop after a few.
-        let mut pending = vec![u64::from(tiff.u32(&header[4..]))];
-        let mut seen = 0;
-        while let Some(offset) = pending.pop() {
-            seen += 1;
-            if offset == 0 || seen > 32 {
-                continue;
-            }
-            let (entries, next) = tiff.directory(offset)?;
-            // Sub-directories and the next in the chain go on a stack, so
-            // push the next first to visit the sub-directories before it.
-            pending.push(next);
-            let (mut at, mut len, mut width, mut height) = (None, None, None, None);
-            let ratio = |e: &Entry| tiff.rational(e).ok().filter(|&(_, d)| d > 0).map(|(n, d)| n as f32 / d as f32);
-            for e in &entries {
-                match e.tag {
-                    JPEG_OFFSET => at = Some(tiff.number(e)),
-                    JPEG_LENGTH => len = Some(tiff.number(e)),
-                    ORIENTATION if orientation.is_none() => orientation = Some(tiff.number(e) as u16),
-                    SUB_IFDS => pending.extend(tiff.offsets(e)?),
-                    EXIF_IFD => pending.push(u64::from(tiff.u32(&e.value))),
-                    MAKE => {
-                        let mut make = [0; 4];
-                        sony = file.read_exact_at(&mut make, u64::from(tiff.u32(&e.value))).is_ok() && &make == b"SONY";
-                    }
-                    MAKER_NOTE if sony => focus = sony_focus(&tiff, u64::from(tiff.u32(&e.value))),
-                    DATE_TIME_ORIGINAL if date.is_none() => date = tiff.text(e).ok(),
-                    SUB_SEC_TIME_ORIGINAL if fraction.is_none() => fraction = tiff.text(e).ok(),
-                    MODEL if exif.model.is_none() => exif.model = tiff.text(e).ok().filter(|m| !m.is_empty()),
-                    LENS_MODEL => exif.lens = tiff.text(e).ok().filter(|l| !l.is_empty()),
-                    EXPOSURE_TIME => exif.exposure = tiff.rational(e).ok(),
-                    F_NUMBER => exif.f_number = ratio(e),
-                    FOCAL_LENGTH => exif.focal_length = ratio(e),
-                    ISO => exif.iso = Some(tiff.number(e)),
-                    COLOR_SPACE => color_space = Some(tiff.number(e)),
-                    INTEROP_IFD => pending.push(u64::from(tiff.u32(&e.value))),
-                    INTEROP_INDEX if e.kind == 2 => interop = tiff.text(e).ok(),
-                    IMAGE_WIDTH => width = Some(tiff.number(e)),
-                    IMAGE_LENGTH => height = Some(tiff.number(e)),
-                    _ => {}
-                }
-            }
-            if let (Some(at), Some(len)) = (at, len)
-                && len > 0
-            {
-                jpegs.push(Embedded { offset: u64::from(at), len: u64::from(len) });
-            }
-            if let (Some(w), Some(h)) = (width, height)
-                && size.is_none_or(|(sw, sh)| u64::from(w) * u64::from(h) > u64::from(sw) * u64::from(sh))
-            {
-                size = Some((w, h));
-            }
-        }
+        let Found { jpegs, orientation, focus, date, fraction, exif, color_space, interop, size, .. } = found;
         // Adobe RGB is "uncalibrated" in Exif, with R03 for its interop index.
         let adobe_rgb = color_space == Some(0xffff) && interop.as_deref() != Some("R98");
         // Cameras without a clock set write blanks.
@@ -332,9 +383,17 @@ impl RawFile {
         }
     }
 
-    /// The biggest embedded JPEG: the one to show.
+    /// The embedded JPEG to step through: the smallest that fills the
+    /// loupe, or failing that the biggest. Sony embeds one of 1616×1080;
+    /// other cameras a full-size one as well, too slow to step through.
     pub fn preview(&self) -> Option<Embedded> {
-        self.jpegs.iter().copied().max_by_key(|j| j.len)
+        if self.jpegs.len() < 2 {
+            return self.jpegs.first().copied();
+        }
+        let sized = self.jpegs.iter().map(|&j| (jpeg_size(&self.file, j.offset).map_or(0, |(w, h)| w.max(h)), j));
+        let sized: Vec<(u32, Embedded)> = sized.collect();
+        let big_enough = sized.iter().filter(|(edge, _)| *edge >= PREVIEW_EDGE).min_by_key(|(edge, j)| (*edge, j.len));
+        big_enough.or_else(|| sized.iter().max_by_key(|(edge, j)| (*edge, j.len))).map(|&(_, j)| j)
     }
 
     /// The smallest embedded JPEG: the camera's own thumbnail.
@@ -355,7 +414,7 @@ impl RawFile {
 /// no location.
 fn sony_focus(tiff: &Tiff, offset: u64) -> Option<Focus> {
     let mut header = [0; 12];
-    tiff.file.read_exact_at(&mut header, offset).ok()?;
+    tiff.read(&mut header, offset).ok()?;
     let skip = if header.starts_with(b"SONY") { 12 } else { 0 };
     let (entries, _) = tiff.directory(offset + skip).ok()?;
     // Manual focus records the middle of the frame, which means nothing.
@@ -364,9 +423,150 @@ fn sony_focus(tiff: &Tiff, offset: u64) -> Option<Focus> {
     }
     let e = entries.iter().find(|e| e.tag == SONY_FOCUS_LOCATION && e.kind == 3 && e.count == 4)?;
     let mut bytes = [0; 8];
-    tiff.file.read_exact_at(&mut bytes, u64::from(tiff.u32(&e.value))).ok()?;
+    tiff.read(&mut bytes, u64::from(tiff.u32(&e.value))).ok()?;
     let [width, height, x, y] = [0, 2, 4, 6].map(|i| tiff.u16(&bytes[i..]));
     (width > 0 && height > 0).then_some(Focus { width, height, x, y })
+}
+
+/// Nikon's makernote is a TIFF of its own behind a 10-byte "Nikon" header.
+/// Its preview directory holds a small JPEG: the only small one in a NEF.
+fn nikon_preview(file: &File, offset: u64) -> Option<Embedded> {
+    let mut header = [0; 6];
+    file.read_exact_at(&mut header, offset).ok()?;
+    if &header != b"Nikon\0" {
+        return None;
+    }
+    let tiff = Tiff::at(file, offset + 10).ok()?;
+    let (entries, _) = tiff.directory(tiff.first).ok()?;
+    let preview = entries.iter().find(|e| e.tag == NIKON_PREVIEW_IFD)?;
+    let (entries, _) = tiff.directory(u64::from(tiff.u32(&preview.value))).ok()?;
+    let number = |tag: u16| entries.iter().find(|e| e.tag == tag).map(|e| u64::from(tiff.number(e)));
+    let (at, len) = (number(JPEG_OFFSET)?, number(JPEG_LENGTH)?);
+    (len > 0).then_some(Embedded { offset: tiff.base + at, len })
+}
+
+/// A JPEG's segments from the one at `offset` (its first, after the start
+/// marker) on, up to the picture itself: each one's marker, where what it
+/// holds starts, and how long that is.
+fn jpeg_segments(file: &File, offset: u64) -> impl Iterator<Item = (u8, u64, u64)> + '_ {
+    let mut at = offset + 2;
+    // A corrupt file could go on for ever.
+    (0..64).map_while(move |_| {
+        let mut head = [0; 4];
+        file.read_exact_at(&mut head, at).ok()?;
+        let len = u64::from(u16::from_be_bytes([head[2], head[3]]));
+        // The picture starts at 0xda; anything else out of place isn't a
+        // JPEG.
+        if head[0] != 0xff || head[1] == 0xda || len < 2 {
+            return None;
+        }
+        let segment = (head[1], at + 4, len - 2);
+        at += 2 + len;
+        Some(segment)
+    })
+}
+
+/// A JPEG's size in pixels, from its frame header.
+fn jpeg_size(file: &File, offset: u64) -> Option<(u32, u32)> {
+    let (_, at, _) = jpeg_segments(file, offset).find(|&(marker, _, _)| matches!(marker, 0xc0..=0xc2))?;
+    let mut frame = [0; 5];
+    file.read_exact_at(&mut frame, at).ok()?;
+    let side = |i: usize| u32::from(u16::from_be_bytes([frame[i], frame[i + 1]]));
+    Some((side(3), side(1)))
+}
+
+/// Where the Exif of the JPEG at `offset` is: a TIFF, after "Exif" and
+/// two zeros.
+fn jpeg_exif(file: &File, offset: u64) -> Option<u64> {
+    jpeg_segments(file, offset).filter(|&(marker, _, len)| marker == 0xe1 && len > 6).find_map(|(_, at, _)| {
+        let mut name = [0; 6];
+        file.read_exact_at(&mut name, at).ok()?;
+        (&name == b"Exif\0\0").then_some(at + 6)
+    })
+}
+
+/// Fuji's RAF: a header saying where its JPEG is, a whole JPEG file with
+/// the shooting settings and a thumbnail in its own Exif, then the raw.
+fn raf(file: &File, found: &mut Found) -> io::Result<()> {
+    let mut place = [0; 8];
+    file.read_exact_at(&mut place, 84)?;
+    let number = |b: &[u8]| u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let (offset, len) = (number(&place), number(&place[4..]));
+    if len == 0 {
+        return Err(invalid("no preview in the RAF"));
+    }
+    found.jpegs.push(Embedded { offset, len });
+    if let Some(exif) = jpeg_exif(file, offset) {
+        Tiff::at(file, exif)?.walk(found)?;
+    }
+    Ok(())
+}
+
+/// The boxes in a part of a CR3 (as in an MP4), each with its kind, where
+/// what it holds starts and where it ends.
+fn boxes(file: &File, from: u64, to: u64) -> Vec<([u8; 4], u64, u64)> {
+    let mut found = Vec::new();
+    let mut at = from;
+    // A corrupt file could go on for ever.
+    while at + 8 <= to && found.len() < 64 {
+        let mut head = [0; 16];
+        if file.read_exact_at(&mut head[..8], at).is_err() {
+            break;
+        }
+        let kind = [head[4], head[5], head[6], head[7]];
+        let (start, len) = match u32::from_be_bytes([head[0], head[1], head[2], head[3]]) {
+            // To the end of what it's in.
+            0 => (at + 8, to - at),
+            // Too long for four bytes: in the next eight.
+            1 if file.read_exact_at(&mut head[8..], at + 8).is_ok() => {
+                (at + 16, u64::from_be_bytes(head[8..].try_into().unwrap_or_default()))
+            }
+            len => (at + 8, u64::from(len)),
+        };
+        if len < start - at || at + len > to {
+            break;
+        }
+        found.push((kind, start, at + len));
+        at += len;
+    }
+    found
+}
+
+/// The JPEG in a box, a few bytes into it.
+fn jpeg_in(file: &File, start: u64, end: u64) -> Option<Embedded> {
+    let mut head = vec![0; (end - start).min(96) as usize];
+    file.read_exact_at(&mut head, start).ok()?;
+    let at = start + head.windows(3).position(|w| w == [0xff, 0xd8, 0xff])? as u64;
+    Some(Embedded { offset: at, len: end - at })
+}
+
+/// Canon's CR3. Under `moov`, Canon's own box holds the shooting settings
+/// as small TIFFs (CMT1 the first directory's, CMT2 Exif's) and the
+/// thumbnail (THMB); the preview (PRVW) is in a box of its own beside
+/// `moov`.
+fn cr3(file: &File, found: &mut Found) -> io::Result<()> {
+    let len = file.metadata()?.len();
+    for (kind, start, end) in boxes(file, 0, len) {
+        match &kind {
+            b"moov" => {
+                // Canon's box is named by 16 bytes before what's in it.
+                let canon = boxes(file, start, end).into_iter().filter(|(kind, _, _)| kind == b"uuid");
+                for (kind, start, end) in canon.flat_map(|(_, start, end)| boxes(file, start + 16, end)) {
+                    match &kind {
+                        b"CMT1" | b"CMT2" => Tiff::at(file, start)?.walk(found)?,
+                        b"THMB" => found.jpegs.extend(jpeg_in(file, start, end)),
+                        _ => {}
+                    }
+                }
+            }
+            b"uuid" => found.jpegs.extend(jpeg_in(file, start, end)),
+            _ => {}
+        }
+    }
+    if found.jpegs.is_empty() {
+        return Err(invalid("no preview in the CR3"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -483,6 +683,80 @@ mod tests {
 
     #[test]
     fn rejects_files_that_arent_tiff() {
-        assert!(open_bytes(b"\xff\xd8\xff\xe1 not a raw").is_err());
+        assert!(open_bytes(b"\xff\xd8\xff\xe1 not a raw, whatever it is").is_err());
+        assert!(open_bytes(b"too short").is_err());
+    }
+
+    #[test]
+    fn the_preview_is_the_smallest_jpeg_that_fills_the_loupe() {
+        use crate::testing::{jpeg, nikon_makernote};
+        let (full, middling, small) = (jpeg(3000, 2000, [9; 3]), jpeg(1620, 1080, [9; 3]), jpeg(160, 120, [9; 3]));
+        // A Nikon's: full size, with a small one in its makernote.
+        let nef = Arw {
+            make: "NIKON CORPORATION",
+            makernote: Some(nikon_makernote(&small)),
+            preview: full.clone(),
+            thumbnail: Vec::new(),
+            ..Arw::default()
+        };
+        let raw = open(&nef).unwrap();
+        assert_eq!(raw.jpegs.len(), 2);
+        assert_eq!(raw.read(raw.thumbnail().unwrap()).unwrap(), small, "found in Nikon's makernote");
+        assert_eq!(raw.read(raw.preview().unwrap()).unwrap(), full, "all there is to look at");
+        assert_eq!((raw.focus, raw.exif.iso), (None, Some(400)), "the focus point is only read from Sony's");
+        // With one of a size for the loupe as well, that's the preview.
+        let three = Arw { makernote: Some(nikon_makernote(&middling)), thumbnail: small.clone(), ..nef };
+        let raw = open(&three).unwrap();
+        assert_eq!(raw.jpegs.len(), 3);
+        assert_eq!(raw.read(raw.preview().unwrap()).unwrap(), middling);
+        assert_eq!(raw.read(raw.thumbnail().unwrap()).unwrap(), small);
+    }
+
+    #[test]
+    fn reads_a_fuji_raf_through_its_jpegs_exif() {
+        use crate::testing::{jpeg, raf, with_exif};
+        let thumbnail = jpeg(160, 120, [9; 3]);
+        let settings = Arw {
+            make: "FUJIFILM",
+            model: "X-T3",
+            orientation: 6,
+            preview: Vec::new(),
+            thumbnail: thumbnail.clone(),
+            ..Arw::default()
+        };
+        let preview = with_exif(&jpeg(1920, 1280, [200, 120, 40]), &settings.bytes());
+        let raw = open_bytes(&raf(&preview)).unwrap();
+        assert_eq!(raw.read(raw.preview().unwrap()).unwrap(), preview);
+        assert_eq!(raw.read(raw.thumbnail().unwrap()).unwrap(), thumbnail, "at its place in the Exif, in the file");
+        assert_eq!((raw.orientation, raw.exif.model.as_deref()), (6, Some("X-T3")));
+        assert_eq!(raw.captured.as_deref(), Some("2026:10:04 12:00:00.123"));
+        assert_eq!((raw.exif.exposure, raw.exif.iso, raw.focus), (Some((1, 250)), Some(400), None));
+        let decoded = crate::image::Image::decode_jpeg(&raw.read(raw.preview().unwrap()).unwrap()).unwrap();
+        assert_eq!((decoded.width, decoded.height), (1920, 1280), "and it's still a JPEG");
+        assert!(open_bytes(&raf(&[])).is_err());
+    }
+
+    #[test]
+    fn reads_a_canon_cr3_through_its_boxes() {
+        use crate::testing::{cr3, jpeg};
+        let (thumbnail, preview) = (jpeg(160, 120, [9; 3]), jpeg(1620, 1080, [200, 120, 40]));
+        let settings = Arw {
+            make: "Canon",
+            model: "Canon EOS R6",
+            orientation: 8,
+            preview: Vec::new(),
+            thumbnail: Vec::new(),
+            ..Arw::default()
+        };
+        let raw = open_bytes(&cr3(&settings.bytes(), &thumbnail, &preview)).unwrap();
+        assert_eq!(raw.jpegs.len(), 2);
+        assert_eq!(raw.read(raw.preview().unwrap()).unwrap(), preview);
+        assert_eq!(raw.read(raw.thumbnail().unwrap()).unwrap(), thumbnail);
+        assert_eq!((raw.orientation, raw.exif.model.as_deref()), (8, Some("Canon EOS R6")));
+        assert_eq!((raw.exif.f_number, raw.exif.lens.as_deref()), (Some(2.8), Some("FE 85mm F1.8")));
+        assert_eq!((raw.size, raw.focus), (Some((6048, 4024)), None));
+        // Cut short, there's no preview to find.
+        let whole = cr3(&settings.bytes(), &thumbnail, &preview);
+        assert!(open_bytes(&whole[..60]).is_err());
     }
 }

@@ -49,9 +49,10 @@ Decided in the 2026-10-04 scoping interview.
 - **Handoff:** sidecars darktable reads, a cull summary (picks, rejects,
   undecided, with a jump to what's undecided), and a key that opens the
   folder in darktable.
-- **Auto-cull, later:** a model each user trains on their own decisions.
-  Every decision is logged from the first usable build so the data exists
-  when that work starts.
+- **Auto-cull:** signals measured of every frame, the best of a stack
+  suggested from them, and a model each user trains on their own
+  decisions. It suggests; it never marks. Every decision is logged from
+  the first usable build so the data exists to train on.
 
 ### Out
 
@@ -181,6 +182,82 @@ chooses a winner.
   as the raws' names. Making one switches stacking to by hand.
 - **Undo** now takes back a step at a time, a winner's marks together.
 
+M7's keys: Q shows the signals, Shift+Q turns suggestions off and on (on
+to begin with), Y takes the suggestion for the current frame, Ctrl+Alt+Y
+shows only the frames with one, and Ctrl+L learns from the decision log
+now. The status bar has a switch for signals and one for suggestions.
+
+- **Signals** are what's measured of a frame with no training: how crisp
+  it is where the camera focused and at the eyes of its largest face,
+  whether eyes are shut, and how much of it is blown out or black.
+  Sharpness is the step, in levels from one pixel to the next, that the
+  crispest tenth of the edges in a window average (Sobel, as focus
+  peaking measures it): a square an eighth of the frame across at the
+  focus point, a box twice as wide as the eyes are apart at the eyes.
+  They're measured on the preview, on the faces thread, straight after
+  the faces are found, and cached in `~/.cache/omacull/signals/`. On the
+  1616-pixel preview a frame only slightly out of focus won't show; how
+  far out one has to be wants trying on real bursts.
+- **Eyes open or shut** comes from MediaPipe's face landmarker (Apache-2.0,
+  the copy Omapix uses, or `scripts/fetch-models.sh`), run on each face
+  YuNet finds: how far apart the eyelids are, against the eye's width,
+  both eyes together so a wink isn't a blink. On the test shoot shut eyes
+  read 0.07 to 0.17 and open ones 0.26 and up, under heavy eye makeup
+  too; measuring how dark the eye is, which was tried first, couldn't
+  tell them apart there. A face in profile is where it goes wrong: the
+  far eye reads as anything. It sees no face in the carved pumpkins YuNet
+  took for some, so says nothing of their eyes. A frame's
+  eyes are its least open pair, among faces at least a quarter the size
+  of its largest: a bystander's blink doesn't count. Without the model,
+  faces are found and nothing is said of their eyes.
+- **Standing:** a frame's sharpness and its eyes are also taken as a share
+  of the best among the frames it was shot with: its stack, or else its
+  burst (frames less than 2 s apart, however stacking is set).
+- **Shown** (Q) as words on the frame: "Eyes 64, sharpest of 5", "Focus
+  41, 63% of the sharpest" (red under 80%), "Eyes shut?", "4% blown" (from
+  3%), "12% black" (from 10%). In the filmstrip a red dot is shut eyes and
+  a red ring a frame soft beside its neighbours.
+- **The best of a stack** is suggested once every undecided frame in it
+  is measured, unless one is kept already: the sharpest, marked down for
+  eyes less open than the others' and for what's blown out. It stands
+  for its stack in the filmstrip, so W on it confirms and W on another
+  overrides; Y takes it from any frame of the stack.
+- **The personal model** (`learn.rs`) is trained on the decision log: what
+  each frame ended as (rejected, left unmarked, or kept, and with how
+  many stars), against its signals and standing as they were logged. It's
+  a weight for each thing measured and no more (softmax regression, a
+  fifth of the frames held back to test it), so it trains in a moment
+  and can only learn what the signals can say: that soft,
+  shut-eyed and second-best frames go. It takes 100 decisions, with at
+  least ten each of two kinds. It's trained when Omacull starts, if the
+  log has grown, and kept in `~/.local/share/omacull/model.json`.
+- **Its suggestions** are for undecided frames outside a stack's, and only
+  where it's at least 80% sure (`confidence` in `config.toml`): a mark
+  where the frame's mark would be, with how sure it is, and a fainter one
+  in the filmstrip. Y takes one; any other mark overrides it. The cull
+  summary says what it was learned from and how it did on the frames held
+  back.
+- **Nothing is marked on a suggestion's word.** Every suggestion taken or
+  overridden is in the decision log (`suggested`), which is how to tell
+  whether they're any good.
+
+### Other raw developers
+
+`~/.config/omacull/config.toml` (M8; written with every setting commented
+out the first time Omacull runs) is for people whose raw developer isn't
+darktable. There are three settings and one for suggestions:
+
+| Setting | Default | |
+|---------|---------|---|
+| `pick` | `1` | The stars a pick (P, and a winner) is written as. |
+| `sidecar` | `"darktable"` | `"adobe"` names sidecars `DSC01234.xmp`, as Lightroom, Bridge, Capture One and most others read them. |
+| `developer` | `"darktable"` | The program Ctrl+E hands the folder to. |
+| `confidence` | `0.8` | How sure the model has to be to suggest a mark. |
+
+A reject is always a rating of -1, as Bridge writes it too.
+
+### The sidecar
+
 - Sidecars are named the way darktable names them: `DSC01234.ARW.xmp`.
 - No sidecar yet: write a minimal one holding just the rating.
 - Sidecar exists: change the rating field and nothing else. darktable's
@@ -205,6 +282,13 @@ writes its own rating back over ours the next time it saves the sidecar.
 The normal flow, cull then import, is unaffected. Still to be looked at by
 eye in the darktable window.
 
+And another, found in M7: darktable gives every frame it imports a rating
+of its own (one star, by default), so a folder it has already imported
+opens in Omacull with every frame a pick: all 787 of the test shoot.
+Nothing there is undecided, so nothing is suggested, and the filters for
+picks say nothing. Culling before importing avoids it; so does setting
+darktable's rating on import to none.
+
 ## Architecture
 
 Same stack and layout as Omapix: Rust, egui on wgpu, Little CMS 2, GPL-3.
@@ -214,10 +298,10 @@ Omapix, not shared as crates (revisit if the copies start to drift).
 ```
 crates/
   omacull-engine   folder scan, raw preview extraction, EXIF and makernotes,
-                   XMP read/write, thumbnail cache, stacking, decision log
+                   XMP read/write, thumbnail cache, stacking, signals,
+                   decision log and the model trained on it
                    (no UI or GPU dependencies; testable headless)
-  omacull-ai       ONNX Runtime, face/eye detection, later scoring models
-                   (added when the face milestone starts)
+  omacull-ai       ONNX Runtime, face and eye detection, eyelids
   omacull          the app: egui UI on wgpu, views, input, theme
 ```
 
@@ -261,14 +345,23 @@ Settled in M1. JSON Lines, one object per mark, version 1:
 | `session` | When Omacull was started, the same for a sitting. |
 | `file` | The raw: canonical `path`, `size` in bytes, `modified` (seconds since 1970), and `captured`, the Exif capture time with sub-seconds. Name, size and capture time find the raw again after a folder moves. |
 | `rating`, `was` | The mark made and the mark it replaced, as `xmp:Rating` (-1 to 5). |
-| `how` | `mark` for a mark key, `undo` or `redo` when those changed it. An undone mark stays in the log; the last row for a file is what it ended as. |
+| `how` | `mark` for a mark key, `undo` or `redo` when those changed it, `pass` for a frame looked at and left unmarked. An undone mark stays in the log; the last row for a file is what it ended as. |
 | `view` | `loupe` (later `compare` and `survey`). |
 | `compared` | The other frames on screen, as `file` objects. Empty in the loupe. |
-| `filter` | The filter in use: `all`, `undecided`, `rejects`, or `{"at_least":N}`. |
+| `filter` | The filter in use: `all`, `undecided`, `rejects`, `suggested`, or `{"at_least":N}`. |
 | `dwell_ms` | How long the frame had been on screen when it was marked. Undo and redo go to the frame they change, so theirs is usually 0. |
+| `signals` | What was measured of the frame, or null if it hadn't been yet: `focus` and `eyes` (sharpness), `open` (0 shut to 1), `highlights` and `shadows` (shares of the frame), `faces` (how many) and `face` (the largest's share of the frame). Added in M7. |
+| `standing` | How it stood among the frames it was shot with: `of` how many, and its `sharp` and `open` as shares of the best. Added in M7. |
+| `suggested` | The mark Omacull was suggesting for it, or null: its `rating`, `by` (`signals` for the best of a stack, `model`) and `confidence`. A row whose `rating` differs is an override. Added in M7. |
 
 A mark that repeats the frame's mark isn't logged, nor is one whose
 sidecar couldn't be written.
+
+Frames looked at and left unmarked are logged as `pass` rows (rating 0)
+when their folder is left, if any mark was made in it that sitting: for
+someone who only picks, what's passed over is the other half of every
+decision, and the model can't learn to tell keepers without it. A folder
+only looked through logs nothing.
 - **Colour:** embedded previews are sRGB or Adobe RGB per the camera
   setting (Exif ColorSpace "uncalibrated" with interop index R03 is Adobe
   RGB); developed raws are sRGB. Both are converted to the monitor's
@@ -331,9 +424,30 @@ nothing larger. So:
   zeros. Manual-focus frames record the frame centre, which means nothing,
   so the overlay should be hidden for those.
 
-Other bodies may embed a full-size JPEG; the reader lists every embedded
-JPEG, so those would get instant zoom for free. Rerun the spike on a new
-camera's files:
+### Other cameras
+
+Built in M8 from descriptions of the formats, and tested on made-up files
+shaped like each (`testing.rs`): no real NEF, CR3 or RAF has been opened
+yet.
+
+- **Nikon NEF** is a TIFF like an ARW, read by the same code. Its small
+  JPEG is in the makernote, a TIFF of its own.
+- **Canon CR3** is boxes, as in an MP4: the settings are small TIFFs in
+  Canon's box under `moov` (CMT1, CMT2), the thumbnail is beside them
+  (THMB) and the 1620×1080 preview in a box of its own (PRVW).
+- **Fuji RAF** is a header pointing at a whole JPEG file, whose own Exif
+  holds the settings and a thumbnail.
+- **The preview** is the smallest embedded JPEG at least 1400 pixels on
+  its long edge, or the biggest there is. Where a camera embeds only a
+  full-size one, it's shrunk to 2048 pixels once decoded: slower to step
+  through than Sony's, but no more to hold or upload. 100% zoom still
+  comes from developing the raw (rawler reads all four); using a
+  full-size embedded JPEG for it instead is left for later.
+- **The focus point** is only read from Sony's makernotes.
+- A raw that rawler panics on, rather than refusing, no longer takes the
+  thread developing it with it.
+
+Rerun the spike on a new camera's files:
 
     cargo run --release -p omacull-engine --example spike -- <folder>
 
@@ -367,6 +481,9 @@ Building blocks, settled in M0:
   sidecar is never serialised back out.
 - **Raw decode for 100% zoom:** `rawler`, added when M2 needs it.
 - **Faces:** ONNX Runtime via the Omapix `omapix-ai` approach, in M5.
+- **Shut eyes:** MediaPipe's face landmarker, as Omapix runs it, in M7.
+- **The personal model:** our own few lines of softmax regression. With a
+  dozen numbers a frame there's nothing for a library to do.
 
 What doesn't exist on Linux, and is the reason for the project: a culler
 with Photo Mechanic's speed, compare and survey views, face-aware zoom,

@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::thumbs;
 
 /// Bumped when faces are found differently, so old findings aren't used.
-const VERSION: u64 = 1;
+/// The signals are measured from them: bump theirs too.
+const VERSION: u64 = 2;
 
 /// A face in a frame, in fractions of the upright frame's width and height.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -22,6 +23,10 @@ pub struct Face {
     pub bounds: [f32; 4],
     /// The eye on the left of the picture, then the other.
     pub eyes: [[f32; 2]; 2],
+    /// How open the eyes are, 0 (shut) to 1, the two together. None if it
+    /// couldn't be told.
+    #[serde(default)]
+    pub open: Option<f32>,
 }
 
 impl Face {
@@ -71,7 +76,7 @@ mod tests {
     fn faces_are_cached_by_raw() {
         let folder = Folder::with_raws("faces", 2, &Arw::default());
         let cache = folder.0.join("cache");
-        let face = Face { score: 0.9, bounds: [0.2, 0.1, 0.4, 0.5], eyes: [[0.25, 0.2], [0.35, 0.22]] };
+        let face = Face { score: 0.9, bounds: [0.2, 0.1, 0.4, 0.5], eyes: [[0.25, 0.2], [0.35, 0.22]], open: Some(0.8) };
         assert_eq!(load(&folder.raw(1), &cache), None);
         store(&folder.raw(1), &cache, &[face]).unwrap();
         store(&folder.raw(2), &cache, &[]).unwrap();

@@ -3,8 +3,9 @@
 What's planned, in the order we plan to do it. [DESIGN.md](DESIGN.md)
 covers the scope and architecture.
 
-Status: M0 done on 2026-10-04 (scoped the same day). M1 to M6 built the
-same day, waiting to be tried on a real shoot.
+Status: M0 done on 2026-10-04 (scoped the same day). M1 to M8 built the
+same day, waiting to be tried on a real shoot. What each still wants
+trying is under its heading; what was left out is under "Later".
 
 Each milestone ends with something Michael can use on a real shoot. M1 is
 the point where Omacull replaces XnView MP for a basic cull; everything
@@ -128,29 +129,67 @@ look want trying on real bursts.
   gap, by time and visual similarity.
 - Stacks collapse in the filmstrip, showing the winner once chosen.
 
-## M7. Assisted and trained auto-cull
+## M7. Assisted and trained auto-cull (built, to be tried on a real shoot)
+
+In and tested headless. The signals were run over a real shoot (787
+frames, 532 faces): the first way of telling shut eyes, by how dark the
+eye is, failed there under eye makeup and was replaced with MediaPipe's
+face landmarker. Of two dozen faces looked at by hand, it got all right
+but one in profile, whose shut eye it took for open, and two that could
+be called either way. The rest is untried on real culling: there is no
+log to learn from yet.
+Still to check by hand: whether the sharpness numbers follow what the
+eye sees in a burst, the thresholds for soft, shut and blown, whether the
+stack suggestions are the frames one would pick, and, after a few
+hundred decisions, whether the model's are worth having. How it works is
+in DESIGN.md.
 
 In three steps, each useful alone.
 
 1. **Signals.** Per-frame measurements with no training: sharpness at the
    AF point and at the eyes, eyes open or closed, exposure clipping.
-   Shown as small indicators, never applied on their own.
-2. **Suggestions.** Within a stack, propose a winner from the signals. The
-   user confirms or overrides; overrides are logged.
-3. **Personal model.** Train on the decision log, locally, to predict this
-   user's reject / keep / star choices. Suggestions shown for review, with
-   a confidence threshold below which nothing is suggested. No cloud, no
-   account.
+   Shown as small indicators (Q), never applied on their own.
+2. **Suggestions.** Within a stack, a winner is proposed from the signals
+   and stands for the stack. The user confirms (W on it, or Y) or
+   overrides (W on another); both are logged with what was suggested.
+3. **Personal model.** Trained on the decision log, locally, to predict
+   this user's reject / keep / star choices. Suggestions are shown for
+   review (Ctrl+Alt+Y) and taken one at a time (Y), with a confidence
+   threshold below which nothing is suggested. No cloud, no account.
+   Frames looked at and left unmarked are logged too, so it has both
+   halves of a pick-only cull to learn from.
 
-## M8. Release
+Later:
 
-- Arch package and AUR. (The desktop entry and icon came early: `make
-  install` puts them in.)
-- Other raw formats (Canon CR3, Nikon NEF, Fuji RAF), driven by who shows
-  up to test them.
-- README, CONTRIBUTING, screenshots.
-- Config for the pick mapping, for people whose raw developer isn't
-  darktable.
+- Sharpness from the raw's own pixels at the focus point and the eyes.
+  The preview is 1616 pixels wide: on the test shoot the eyes were under
+  40 pixels apart in four faces of five, and slight misfocus can't show.
+- A model that sees the picture, not just a dozen measurements of it.
+  This one can learn what's soft, shut-eyed or second-best; not taste.
+- The model's say in which frame of a stack is best, once it has one.
+- Taking every suggestion in a selection at once.
+
+## M8. Release (built; the AUR and other cameras' real files still to do)
+
+- **Arch package:** `packaging/arch/PKGBUILD` builds `omacull-git`, with
+  its `.SRCINFO`. Putting it on the AUR is Michael's to do: it needs his
+  account.
+- **Other raw formats:** Nikon NEF, Canon CR3 and Fuji RAF are read,
+  written from descriptions of the formats and tested on made-up files
+  only. Nobody has shown up with real ones yet: the spike is what to run
+  on them.
+- **README, CONTRIBUTING, screenshots.** The screenshots are of a made-up
+  shoot (the `shoot` example), taken by `scripts/screenshots.sh`; run it
+  on a real folder for real ones.
+- **Config:** `~/.config/omacull/config.toml` sets the stars a pick is
+  written as, how sidecars are named and the program Ctrl+E starts, for
+  people whose raw developer isn't darktable.
+
+Later:
+
+- 100% zoom straight from a full-size embedded JPEG, on cameras that have
+  one.
+- The focus point from Nikon's, Canon's and Fuji's makernotes.
 
 ## Not planned
 

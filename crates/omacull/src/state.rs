@@ -37,12 +37,27 @@ pub struct Show {
     pub focus_point: bool,
     /// The face close-ups beside the loupe.
     pub faces: bool,
+    /// What was measured of the frame: sharpness, shut eyes, clipping.
+    pub signals: bool,
+    /// The marks Omacull would make.
+    pub suggestions: bool,
 }
 
 impl Default for Show {
-    /// Only the shooting settings, a line under the frame.
+    /// Only the shooting settings, a line under the frame, and
+    /// suggestions where there are any: none until frames are stacked or a
+    /// model is trained.
     fn default() -> Self {
-        Self { histogram: false, info: true, clipping: false, peaking: false, focus_point: false, faces: false }
+        Self {
+            histogram: false,
+            info: true,
+            clipping: false,
+            peaking: false,
+            focus_point: false,
+            faces: false,
+            signals: false,
+            suggestions: true,
+        }
     }
 }
 

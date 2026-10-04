@@ -5,7 +5,8 @@
 //! The decision log (`~/.local/share/omacull/decisions.jsonl`) is the
 //! training set for auto-cull: one JSON object a line, appended for every
 //! mark that reached its sidecar. See "Decision log" in docs/DESIGN.md for
-//! what each field means.
+//! what each field means. Frames looked at and left unmarked are logged
+//! too, when a folder is left: what's passed over is a choice as well.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -19,6 +20,7 @@ use serde::Serialize;
 use crate::cull::{Filter, Rating};
 use crate::raw::RawFile;
 use crate::sidecar;
+use crate::signals::{Signals, Standing, Suggestion};
 
 /// The decision log's schema version, the `v` of every row.
 pub const LOG_VERSION: u32 = 1;
@@ -41,6 +43,9 @@ pub enum How {
     /// Undo put back the mark before.
     Undo,
     Redo,
+    /// No mark: the frame was looked at and left as it was. Logged when
+    /// the folder is left; nothing is written to its sidecar.
+    Pass,
 }
 
 /// A mark made, to be written.
@@ -58,6 +63,12 @@ pub struct Mark {
     /// How long the frame had been on screen.
     pub dwell: Duration,
     pub at: SystemTime,
+    /// What was measured of the frame, and how it stood among the frames
+    /// it was shot with, if that was known by then.
+    pub signals: Option<Signals>,
+    pub standing: Option<Standing>,
+    /// The mark Omacull was suggesting for it, if any.
+    pub suggested: Option<Suggestion>,
 }
 
 /// A raw, identified well enough to find it again after the folder moves:
@@ -97,6 +108,9 @@ pub struct Decision {
     pub compared: Vec<FileId>,
     pub filter: Filter,
     pub dwell_ms: u64,
+    pub signals: Option<Signals>,
+    pub standing: Option<Standing>,
+    pub suggested: Option<Suggestion>,
 }
 
 pub fn millis(time: SystemTime) -> u64 {
@@ -117,6 +131,9 @@ impl Decision {
             compared: mark.compared.iter().map(|p| FileId::of(p)).collect::<io::Result<_>>()?,
             filter: mark.filter,
             dwell_ms: mark.dwell.as_millis() as u64,
+            signals: mark.signals,
+            standing: mark.standing,
+            suggested: mark.suggested,
         })
     }
 }
@@ -169,7 +186,9 @@ impl Disk {
                             continue;
                         }
                     };
-                    let problem = match sidecar::write(&mark.path, mark.rating) {
+                    // A frame passed over has nothing to write but its row.
+                    let written = if mark.how == How::Pass { Ok(()) } else { sidecar::write(&mark.path, mark.rating) };
+                    let problem = match written {
                         Err(e) => Some(Problem::Sidecar {
                             path: mark.path.clone(),
                             error: e.to_string(),
@@ -247,6 +266,9 @@ mod tests {
             filter: Filter::Undecided,
             dwell: Duration::from_millis(1500),
             at: UNIX_EPOCH + Duration::from_millis(1_791_000_000_123),
+            signals: None,
+            standing: None,
+            suggested: None,
         }
     }
 
@@ -288,6 +310,9 @@ mod tests {
                 "compared": [],
                 "filter": "undecided",
                 "dwell_ms": 1500,
+                "signals": null,
+                "standing": null,
+                "suggested": null,
             })
         );
         assert_eq!((&rows[1]["how"], &rows[1]["rating"], &rows[1]["was"]), (&"undo".into(), &0.into(), &3.into()));
@@ -295,6 +320,32 @@ mod tests {
         let picks = Mark { filter: Filter::AtLeast(1), ..mark(folder.raw(1), 1, 0) };
         let row = serde_json::to_value(Decision::new(&picks, 0).unwrap()).unwrap();
         assert_eq!(row["filter"], serde_json::json!({"at_least": 1}));
+    }
+
+    #[test]
+    fn a_frame_passed_over_is_logged_and_its_sidecar_left_alone() {
+        use crate::signals::By;
+        let folder = Folder::with_raws("disk-pass", 1, &Arw::default());
+        let log = folder.0.join("decisions.jsonl");
+        let mut disk = Disk::new(Some(log.clone()), 0, || {});
+        let signals = Signals { focus: Some(40.0), open: Some(0.5), faces: 1, ..Signals::default() };
+        let standing = Standing { of: 3, sharp: Some(0.5), open: None };
+        let suggested = Suggestion { rating: REJECT, by: By::Model, confidence: 0.9 };
+        disk.write(Mark {
+            how: How::Pass,
+            signals: Some(signals),
+            standing: Some(standing),
+            suggested: Some(suggested),
+            ..mark(folder.raw(1), 0, 0)
+        });
+        disk.finish();
+        assert!(!sidecar::path_for(&folder.raw(1)).exists());
+        let row: serde_json::Value = serde_json::from_str(fs::read_to_string(&log).unwrap().trim()).unwrap();
+        assert_eq!((&row["how"], &row["rating"]), (&"pass".into(), &0.into()));
+        assert_eq!(row["signals"]["focus"], 40.0);
+        assert_eq!(row["standing"], serde_json::json!({"of": 3, "sharp": 0.5, "open": null}));
+        assert_eq!(row["suggested"]["rating"], REJECT);
+        assert_eq!(row["suggested"]["by"], "model");
     }
 
     #[test]
