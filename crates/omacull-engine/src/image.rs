@@ -80,6 +80,17 @@ impl Image {
         Self { width: ow, height: oh, rgba }
     }
 
+    /// The part `width` × `height` from (`x`, `y`), kept inside the image.
+    pub fn crop(&self, x: usize, y: usize, width: usize, height: usize) -> Self {
+        let (x, y) = (x.min(self.width), y.min(self.height));
+        let (w, h) = (width.min(self.width - x), height.min(self.height - y));
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for row in y..y + h {
+            rgba.extend_from_slice(&self.rgba[(row * self.width + x) * 4..(row * self.width + x + w) * 4]);
+        }
+        Self { width: w, height: h, rgba }
+    }
+
     /// Shrunk so its long edge is at most `long_edge`, each pixel the
     /// average of the ones it covers.
     pub fn shrunk(&self, long_edge: usize) -> Self {
@@ -258,6 +269,17 @@ mod tests {
         assert_eq!(small.pixel(7, 7)[0], 100);
         // Never enlarged.
         assert_eq!(numbered(10, 5).shrunk(30), numbered(10, 5));
+    }
+
+    #[test]
+    fn crops_stay_inside() {
+        let image = numbered(10, 8);
+        let part = image.crop(3, 2, 4, 3);
+        assert_eq!((part.width, part.height, part.pixel(0, 0)[..2].to_vec()), (4, 3, vec![3, 2]));
+        assert_eq!(part.pixel(3, 2)[..2], [6, 4]);
+        let edge = image.crop(8, 6, 5, 5);
+        assert_eq!((edge.width, edge.height), (2, 2));
+        assert_eq!(image.crop(20, 20, 5, 5).rgba.len(), 0);
     }
 
     #[test]

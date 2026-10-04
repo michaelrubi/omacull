@@ -9,6 +9,7 @@ eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "wa
 egui = "0.36.2"
 env_logger = "0.11.11"
 log = "0.4.34"
+omacull-ai = { version = "0.1.0", path = "../omacull-ai" }
 omacull-engine = { version = "0.1.0", path = "../omacull-engine" }
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }

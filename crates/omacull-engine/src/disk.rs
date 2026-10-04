@@ -130,8 +130,15 @@ pub enum Problem {
     Log(String),
 }
 
+/// What the disk thread is asked to do.
+enum Work {
+    Mark(Box<Mark>),
+    /// Say when everything before has been written.
+    Flush(Sender<()>),
+}
+
 pub struct Disk {
-    marks: Option<Sender<Mark>>,
+    marks: Option<Sender<Work>>,
     problems: Receiver<Problem>,
     thread: Option<JoinHandle<()>>,
 }
@@ -149,12 +156,19 @@ impl Disk {
     /// Writes to sidecars, and logs to `log` if there is one. `wake` is
     /// called when there's a problem to collect.
     pub fn new(log: Option<PathBuf>, session: u64, wake: impl Fn() + Send + 'static) -> Self {
-        let (marks, rx) = channel::<Mark>();
+        let (marks, rx) = channel::<Work>();
         let (tx, problems) = channel();
         let thread = std::thread::Builder::new()
             .name("disk".into())
             .spawn(move || {
-                for mark in rx {
+                for work in rx {
+                    let mark = match work {
+                        Work::Mark(mark) => mark,
+                        Work::Flush(done) => {
+                            let _ = done.send(());
+                            continue;
+                        }
+                    };
                     let problem = match sidecar::write(&mark.path, mark.rating) {
                         Err(e) => Some(Problem::Sidecar {
                             path: mark.path.clone(),
@@ -181,7 +195,18 @@ impl Disk {
 
     pub fn write(&self, mark: Mark) {
         if let Some(marks) = &self.marks {
-            let _ = marks.send(mark);
+            let _ = marks.send(Work::Mark(Box::new(mark)));
+        }
+    }
+
+    /// Wait for every mark sent so far to be written, as before handing
+    /// the folder to darktable.
+    pub fn flush(&self) {
+        let (done, wait) = channel();
+        if let Some(marks) = &self.marks
+            && marks.send(Work::Flush(done)).is_ok()
+        {
+            let _ = wait.recv();
         }
     }
 
@@ -233,6 +258,8 @@ mod tests {
         disk.write(mark(folder.raw(1), 3, 0));
         disk.write(Mark { how: How::Undo, ..mark(folder.raw(1), 0, 3) });
         disk.write(mark(folder.raw(2), REJECT, 0));
+        disk.flush();
+        assert_eq!(sidecar::read(&folder.raw(2)).unwrap(), Some(REJECT), "written by the time flush returns");
         disk.finish();
         assert_eq!(disk.problems().count(), 0);
         assert_eq!(sidecar::read(&folder.raw(1)).unwrap(), Some(0));

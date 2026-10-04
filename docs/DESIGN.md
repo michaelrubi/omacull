@@ -91,6 +91,96 @@ The mouse does the same as Z on the loupe: click to toggle, press and hold
 for a look, drag to pan; the wheel pans. Which overlays are on is
 remembered. The status bar has a switch for each, its key in the tooltip.
 
+M3's keys: C compares two frames, N surveys several, Escape goes back to
+the loupe (and then clears the selection). Ctrl+click and Shift+click in
+the filmstrip select, as do Shift+arrows, Ctrl+A and Ctrl+D. In both views
+the current frame is the active pane, outlined, which marks and the zoom
+keys go to; Tab or a click makes another active.
+
+- **Compare** takes the first two selected frames, or the current one and
+  the next. Rejecting a side (or / to dismiss it unmarked) brings in the
+  next candidate after both; the arrows change the active side's frame; a
+  plain click in the filmstrip puts that frame on the active side.
+- **Survey** takes the selection, or the current frame and the next three.
+  / knocks the active frame out, without marking it, until one is left,
+  which opens in the loupe; the arrows move between panes.
+- **Layout:** frames go in rows, each row's frames the same height and
+  filling its width, with as many rows as leave the smallest frame
+  largest, so landscape frames stay big and portraits sit side by side.
+- **Zoom** works in every pane, locked together by default (L unlocks):
+  the same spot in each frame, or with Shift+Z each frame's own focus
+  point. Every M2 overlay works in every pane. Full developments are made
+  for every frame on screen, one at a time.
+- **The decision log** records the view (`compare`, `survey`) and the
+  other frames on screen in `compared`.
+
+M4's keys: T shows the folder tree, M the cull summary, Shift+U goes to
+the first undecided frame, and Ctrl+E (Lightroom's Edit In) opens the
+folder in darktable.
+
+- **Folder tree:** beside the loupe, rooted at the folder above the open
+  one (↑ goes higher), opened out to it, each folder with how many raws
+  it holds. Folders are read in the background as they're opened out,
+  and again each time the tree is shown. A click opens a folder; on the
+  arrow, or on a folder with no raws, it opens out instead.
+- **Cull summary:** picks and up, each star, rejects and undecided, with
+  their share, and buttons for the first undecided frame and darktable.
+- **darktable:** every mark still queued is written first, then
+  `darktable <folder>` is started, which imports the folder and reads the
+  sidecars.
+- **Places:** each folder's frame (by name) and filter are remembered in
+  `state.toml` when another folder is opened and when Omacull closes, for
+  the 200 most recent folders, and come back when it's opened again
+  (unless a raw in it was opened, which wins).
+
+M5's keys: E zooms to the eyes of the face nearest the pointer (or the
+largest, with the pointer off the frame), and again to the next face, left
+to right; Shift+E shows the face close-ups beside the loupe, where a click
+zooms to that face.
+
+- **Detection:** YuNet (OpenCV's model zoo, MIT) in `omacull-ai`, on the
+  system's ONNX Runtime opened at run time (`/usr/lib/libonnxruntime.so`,
+  or `OMACULL_ORT_LIBRARY`), on the CPU: it's small, and a folder is a few
+  milliseconds a frame. It finds each face's box and both eyes. The model
+  comes from `scripts/fetch-models.sh` into `~/.local/share/omacull/models`,
+  or is Omapix's copy, which is the same file; both are checked by size and
+  SHA-256. Omacull downloads nothing itself. Without ONNX Runtime or the
+  model, everything else works and E says why there are no faces.
+- **In the background:** one thread works through the whole folder from
+  the time it's opened, what's on screen and near it first, finding faces
+  on the preview, upright. What it finds is cached in
+  `~/.cache/omacull/faces/`, keyed like the thumbnails, so a folder is
+  looked through once. Faces are kept as fractions of the frame, so they
+  hold for the preview and the full development alike.
+- **Close-ups:** a square round the eyes, twice as wide as the face, cut
+  from the full development once it's there, from the preview until then.
+
+M6's keys: Shift+G goes round how frames are stacked (also in the status
+bar), G opens out the current stack or closes it up, Ctrl+G stacks the
+selection by hand, Ctrl+Shift+G takes a hand-made stack apart, and W
+chooses a winner.
+
+- **Stacking** is a setting, remembered: off (the default), by hand, by
+  time (frames taken less than 2 s apart), or by time and look (less than
+  30 s apart and alike). How alike two frames look is measured on the
+  camera's own 160×120 thumbnail, as a 16×12 grid of brightness with the
+  overall brightness evened out, so a burst whose exposure wanders still
+  counts as one. Capture times and these signatures are read when a folder
+  opens, on every core: a few small reads a raw.
+- **Collapsed**, a stack is one frame in the filmstrip and to the arrows:
+  its best-rated frame the filter lets through (the first, when they're
+  equal), so once a winner is chosen it's the one shown. It has cards
+  behind it and a count. Opened out, its frames are underlined together.
+- **Surveying a stack:** N with nothing selected, on a frame in a stack,
+  surveys the whole stack.
+- **The winner** (W): the current frame is picked, unless it has stars
+  already, and the rest of the survey, or in the loupe the rest of its
+  stack, are rejected. One step to undo. Each mark is in the decision log
+  with the others in `compared`.
+- **Stacks by hand** are kept per folder, with its place in `state.toml`,
+  as the raws' names. Making one switches stacking to by hand.
+- **Undo** now takes back a step at a time, a winner's marks together.
+
 - Sidecars are named the way darktable names them: `DSC01234.ARW.xmp`.
 - No sidecar yet: write a minimal one holding just the rating.
 - Sidecar exists: change the rating field and nothing else. darktable's

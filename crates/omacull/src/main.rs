@@ -1,11 +1,14 @@
 mod app;
 mod commands;
+mod faces;
 mod hotkeys;
 mod loupe;
 mod monitor;
+mod panes;
 mod shoot;
 mod state;
 mod theme;
+mod tree;
 
 use std::path::PathBuf;
 

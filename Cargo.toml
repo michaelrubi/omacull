@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/omacull-engine", "crates/omacull"]
+members = ["crates/omacull-engine", "crates/omacull-ai", "crates/omacull"]
 
 [workspace.package]
 version = "0.1.0"

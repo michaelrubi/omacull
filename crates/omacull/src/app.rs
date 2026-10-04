@@ -11,14 +11,19 @@ use std::time::SystemTime;
 use egui::{Align2, FontId, RichText, Sense, Ui, pos2, vec2};
 use omacull_engine::color::Display;
 use omacull_engine::cull::{Change, Cull, Filter, Step};
+use omacull_engine::stacks::Stacking;
 use omacull_engine::disk::{self, Disk, How, Mark, Problem};
+use omacull_engine::sidecar::REJECT;
 use omacull_engine::thumbs;
 
 use crate::commands::Command;
+use crate::faces::Finder;
 use crate::hotkeys::{self, format_shortcut};
 use crate::monitor;
+use crate::panes::Mode;
 use crate::shoot::Shoot;
-use crate::state::{Show, State};
+use crate::state::{Place, Show, State};
+use crate::tree::{self, Tree};
 use crate::theme::{self, Theme};
 
 /// Where Omacull keeps what it makes; somewhere else in tests.
@@ -27,6 +32,10 @@ pub struct Paths {
     pub cache: Option<PathBuf>,
     /// The decision log.
     pub log: Option<PathBuf>,
+    /// The program that opens a folder in darktable.
+    pub darktable: String,
+    /// The faces found in each raw.
+    pub faces: Option<PathBuf>,
 }
 
 /// A folder being read.
@@ -60,6 +69,12 @@ pub struct App {
     monitor: Option<monitor::Watch>,
     /// Converts frames to its colours.
     display: Arc<Display>,
+    /// The folder tree, once it's been shown.
+    tree: Option<Tree>,
+    /// The cull summary is open.
+    summary: bool,
+    /// Finds faces; a stand-in in tests.
+    finder: Finder,
 }
 
 /// Converts to a monitor's colours, or shows sRGB as it is if its profile
@@ -97,8 +112,14 @@ impl App {
                 parsed
             })
             .collect();
-        let paths = Paths { cache: thumbs::default_dir(), log: disk::default_log() };
+        let paths = Paths {
+            cache: thumbs::default_dir(),
+            log: disk::default_log(),
+            darktable: "darktable".into(),
+            faces: omacull_engine::faces::default_dir(),
+        };
         let mut app = Self::build(theme, theme::watch(ctx.clone()), warnings, script, State::load(), paths, ctx);
+        app.finder = crate::faces::yunet();
         let watch = monitor::Watch::new();
         app.display = display_for(&watch);
         app.monitor = Some(watch);
@@ -135,7 +156,42 @@ impl App {
             title: String::new(),
             monitor: None,
             display: Arc::new(Display::srgb()),
+            tree: None,
+            summary: false,
+            finder: std::sync::Arc::new(|| Err("Faces aren't looked for".into())),
         }
+    }
+
+    /// Remember where the open folder was left, to come back to it.
+    fn remember_place(&mut self) {
+        if let Some(shoot) = &self.shoot {
+            let cull = &shoot.cull;
+            let frame = file_name(&cull.frame().path);
+            let name = |i: &usize| file_name(&cull.frames()[*i].path);
+            let stacks = cull.manual_stacks().iter().map(|s| s.iter().map(name).collect()).collect();
+            self.state.remember(Place { dir: cull.dir().to_path_buf(), frame, filter: cull.filter(), stacks });
+        }
+    }
+
+    /// Hand the open folder to darktable, once every mark is in its sidecar.
+    fn darktable(&mut self) {
+        let Some(shoot) = &self.shoot else { return };
+        self.disk.flush();
+        let dir = shoot.cull.dir().to_path_buf();
+        let started = std::process::Command::new(&self.paths.darktable)
+            .arg(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        self.message = Some(match started {
+            Ok(mut child) => {
+                // Reaped when it's closed.
+                std::thread::spawn(move || child.wait());
+                (format!("Opened {} in darktable", file_name(&dir)), false)
+            }
+            Err(e) => (format!("Couldn't start {}: {e}", self.paths.darktable), true),
+        });
     }
 
     /// Open a folder of raws in the background, or the folder a raw is in,
@@ -166,8 +222,26 @@ impl App {
         let Opening { dir, select, .. } = self.opening.take().unwrap();
         match result {
             Ok((mut cull, problems)) => {
-                if let Some(at) = select.and_then(|s| cull.frames().iter().position(|f| f.path == s)) {
+                self.remember_place();
+                // Where it was left, unless a raw in it was opened.
+                let place = self.state.place(cull.dir()).cloned();
+                let at = |name: &str| cull.frames().iter().position(|f| file_name(&f.path) == name);
+                let start = match select {
+                    Some(raw) => cull.frames().iter().position(|f| f.path == raw),
+                    None => place.as_ref().and_then(|p| at(&p.frame)),
+                };
+                let stacks: &[Vec<String>] = place.as_ref().map_or(&[], |p| &p.stacks);
+                let manual = stacks.iter().map(|s| s.iter().filter_map(|n| at(n)).collect()).collect();
+                cull.set_manual_stacks(manual);
+                cull.set_stacking(self.state.stacking);
+                if let Some(at) = start {
                     cull.go_to(at);
+                }
+                if let Some(place) = place {
+                    cull.set_filter(place.filter);
+                }
+                if let Some(tree) = &mut self.tree {
+                    tree.show(cull.dir());
                 }
                 self.state.add_recent(cull.dir());
                 self.message = problems.first().map(|first| {
@@ -177,7 +251,8 @@ impl App {
                     };
                     (text, true)
                 });
-                self.shoot = Some(Shoot::new(cull, self.paths.cache.clone(), self.display.clone(), ctx));
+                let faces = (self.paths.faces.clone(), self.finder.clone());
+                self.shoot = Some(Shoot::new(cull, self.paths.cache.clone(), faces, self.display.clone(), ctx));
             }
             Err(e) => {
                 if !dir.is_dir() {
@@ -229,13 +304,33 @@ impl App {
                 self.state.set_auto_advance(on);
                 self.message = Some((format!("Auto-advance {}", if on { "on" } else { "off" }), false));
             }
-            Command::Histogram | Command::Info | Command::Clipping | Command::Peaking | Command::FocusPoint => {
+            Command::Folders => {
+                let on = !self.state.folders;
+                self.state.set_folders(on);
+                // Shown again, it's read again: raws come and go.
+                if let Some(tree) = &mut self.tree {
+                    tree.refresh();
+                }
+            }
+            Command::Summary => self.summary = !self.summary,
+            Command::Back if self.summary => {
+                self.summary = false;
+                return;
+            }
+            Command::Darktable => self.darktable(),
+            Command::Histogram
+            | Command::Info
+            | Command::Clipping
+            | Command::Peaking
+            | Command::FocusPoint
+            | Command::FaceStrip => {
                 let mut show = self.state.show;
                 let (switch, name) = match command {
                     Command::Histogram => (&mut show.histogram, "Histogram"),
                     Command::Info => (&mut show.info, "Shooting settings"),
                     Command::Clipping => (&mut show.clipping, "Clipping"),
                     Command::Peaking => (&mut show.peaking, "Focus peaking"),
+                    Command::FaceStrip => (&mut show.faces, "Face close-ups"),
                     _ => (&mut show.focus_point, "Focus point"),
                 };
                 *switch = !*switch;
@@ -246,42 +341,129 @@ impl App {
         }
         let Some(shoot) = &mut self.shoot else { return };
         let ppp = ctx.pixels_per_point();
+        let say = |text: &str| Some((text.to_owned(), false));
         match command {
             Command::Zoom => {
                 let (pointer, time) = ctx.input(|i| (i.pointer.hover_pos(), i.time));
                 let (fit, size) = (shoot.fit_rect(), shoot.full_size(ppp));
-                shoot.view.key_down(pointer, fit, size, time);
+                shoot.view_mut().key_down(pointer, fit, size, time);
+                shoot.sync(shoot.active());
             }
-            Command::ZoomToFocus => {
-                let focus = shoot.info().and_then(|i| i.focus);
-                if !shoot.view.zoom_to_focus(focus, shoot.full_size(ppp)) {
-                    self.message = Some(("No focus point recorded for this frame".into(), false));
+            Command::Eyes => {
+                let pointer = ctx.input(|i| i.pointer.hover_pos());
+                if let Err(why) = shoot.zoom_to_eyes(pointer, ppp) {
+                    self.message = Some((why, false));
                 }
             }
-            _ => {}
-        }
-        let cull = &mut shoot.cull;
-        match command {
-            Command::Undo => match cull.undo() {
-                Some(change) => record(&self.disk, shoot, change, How::Undo),
-                None => self.message = Some(("Nothing to undo".into(), false)),
+            Command::ZoomToFocus => {
+                let (focus, size) = (shoot.info().and_then(|i| i.focus), shoot.full_size(ppp));
+                if shoot.view_mut().zoom_to_focus(focus, size) {
+                    shoot.sync(shoot.active());
+                } else {
+                    self.message = say("No focus point recorded for this frame");
+                }
+            }
+            Command::Compare => {
+                if let Err(why) = shoot.compare() {
+                    self.message = say(why);
+                }
+            }
+            Command::Survey => {
+                if let Err(why) = shoot.survey() {
+                    self.message = say(why);
+                }
+            }
+            Command::Back if shoot.mode != Mode::Loupe => shoot.back_to_loupe(),
+            Command::Back | Command::SelectNone => shoot.cull.clear_selection(),
+            Command::Lock => {
+                shoot.locked = !shoot.locked;
+                shoot.sync(shoot.active());
+                self.message = say(if shoot.locked { "Zoom locked together" } else { "Zoom unlocked" });
+            }
+            Command::NextPane => shoot.next_pane(),
+            Command::KnockOut => shoot.knock_out(),
+            Command::SelectPrevious if shoot.mode == Mode::Loupe => _ = shoot.cull.extend(Step::Previous),
+            Command::SelectNext if shoot.mode == Mode::Loupe => _ = shoot.cull.extend(Step::Next),
+            Command::SelectAll => shoot.cull.select_all(),
+            Command::FirstUndecided => match shoot.cull.first_undecided() {
+                Some(first) => shoot.cull.go_to(first),
+                None => self.message = say("Every frame is decided"),
             },
-            Command::Redo => match cull.redo() {
-                Some(change) => record(&self.disk, shoot, change, How::Redo),
-                None => self.message = Some(("Nothing to redo".into(), false)),
+            Command::Undo | Command::Redo => {
+                let (changes, how) = match command {
+                    Command::Undo => (shoot.cull.undo(), How::Undo),
+                    _ => (shoot.cull.redo(), How::Redo),
+                };
+                if changes.is_empty() {
+                    self.message = say(if how == How::Undo { "Nothing to undo" } else { "Nothing to redo" });
+                }
+                let compared: Vec<usize> = changes.iter().map(|c| c.index).collect();
+                for change in changes {
+                    record(&self.disk, shoot, change, how, &compared);
+                }
+            }
+            Command::StackSelection => {
+                if shoot.cull.stack_selection() {
+                    self.state.set_stacking(Stacking::Manual);
+                    self.message = say("Stacked by hand");
+                } else {
+                    self.message = say("Select two or more frames to stack");
+                }
+            }
+            Command::Unstack => {
+                if !shoot.cull.unstack() {
+                    self.message = say("Only stacks made by hand come apart");
+                }
+            }
+            Command::ToggleStack => {
+                if !shoot.cull.toggle_stack() {
+                    self.message = say("Not in a stack");
+                }
+            }
+            Command::Stacking => {
+                let stacking = shoot.cull.stacking().next();
+                shoot.cull.set_stacking(stacking);
+                self.state.set_stacking(stacking);
+                let count = shoot.cull.stack_count();
+                self.message = Some((format!("Stacks: {} ({count})", stacking.label()), false));
+            }
+            Command::Winner => match shoot.winner() {
+                Ok(marks) => {
+                    let changes = shoot.cull.mark_many(&marks);
+                    let compared: Vec<usize> = marks.iter().map(|&(f, _)| f).collect();
+                    for change in changes {
+                        record(&self.disk, shoot, change, How::Mark, &compared);
+                    }
+                    shoot.back_to_loupe();
+                    if self.state.auto_advance {
+                        shoot.cull.step(Step::Next);
+                    }
+                }
+                Err(why) => self.message = say(why),
             },
-            Command::Previous => _ = cull.step(Step::Previous),
-            Command::Next => _ = cull.step(Step::Next),
-            Command::First => _ = cull.step(Step::First),
-            Command::Last => _ = cull.step(Step::Last),
+            // Away from the loupe, the arrows work on the panes.
+            Command::Previous | Command::Next if shoot.mode != Mode::Loupe => {
+                shoot.step_panes(if command == Command::Next { 1 } else { -1 });
+            }
+            Command::Previous => _ = shoot.cull.step(Step::Previous),
+            Command::Next => _ = shoot.cull.step(Step::Next),
+            Command::First if shoot.mode == Mode::Loupe => _ = shoot.cull.step(Step::First),
+            Command::Last if shoot.mode == Mode::Loupe => _ = shoot.cull.step(Step::Last),
             _ => {}
         }
         if let Some(rating) = command.rating() {
             if let Some(change) = shoot.cull.mark(rating) {
-                record(&self.disk, shoot, change, How::Mark);
+                let compared = shoot.others();
+                record(&self.disk, shoot, change, How::Mark, &compared);
             }
-            if self.state.auto_advance {
-                shoot.cull.step(Step::Next);
+            match shoot.mode {
+                // Marked down in compare, the next candidate comes in.
+                Mode::Compare if rating == REJECT => shoot.knock_out(),
+                Mode::Compare => {}
+                Mode::Survey if self.state.auto_advance => shoot.step_panes(1),
+                Mode::Survey => {}
+                Mode::Loupe if self.state.auto_advance => _ = shoot.cull.step(Step::Next),
+                Mode::Loupe => {}
             }
         }
         if let Some(filter) = command.filter() {
@@ -329,6 +511,13 @@ impl App {
         self.finish_picking(ctx);
         self.finish_opening(ctx);
         self.disk_problems();
+        // Nothing in Omacull takes typing, so no widget keeps the keyboard:
+        // egui gives it to the next button on Tab, which is a key here.
+        ctx.memory_mut(|m| {
+            if let Some(focused) = m.focused() {
+                m.surrender_focus(focused);
+            }
+        });
         if !ctx.egui_wants_keyboard_input() {
             for command in Command::pressed(ctx) {
                 self.run(command, ctx);
@@ -341,7 +530,13 @@ impl App {
             && let Some(key) = zoom_key
             && let (false, time) = ctx.input(|i| (i.key_down(key), i.time))
         {
-            shoot.view.key_up(time);
+            let before = shoot.view().zoomed;
+            for pane in &mut shoot.panes {
+                pane.view.key_up(time);
+            }
+            if shoot.view().zoomed != before {
+                shoot.sync(shoot.active());
+            }
         }
         if self.monitor.as_mut().is_some_and(|m| m.check(ctx)) {
             self.display = display_for(self.monitor.as_ref().unwrap());
@@ -367,12 +562,16 @@ impl App {
         let bar = egui::Frame::new()
             .fill(self.theme.dark_background)
             .inner_margin(egui::Margin::symmetric(8, 4));
-        let command = egui::Panel::bottom("status")
+        let (command, stack_to) = egui::Panel::bottom("status")
             .frame(bar)
             .show(ui, |ui| self.status_bar(ui))
             .inner;
         if let Some(command) = command {
             self.run(command, &ctx);
+        }
+        if let (Some(stacking), Some(shoot)) = (stack_to, &mut self.shoot) {
+            shoot.cull.set_stacking(stacking);
+            self.state.set_stacking(stacking);
         }
         let theme = self.theme.clone();
         if let Some(shoot) = &mut self.shoot {
@@ -382,9 +581,38 @@ impl App {
                 .resizable(false)
                 .show(ui, |ui| shoot.filmstrip(ui, &theme))
                 .inner;
-            if let Some(index) = clicked {
-                shoot.cull.go_to(index);
+            if let Some((index, click)) = clicked {
+                shoot.clicked(index, click);
             }
+        }
+        if self.state.show.faces
+            && let Some(shoot) = &mut self.shoot
+        {
+            let side = egui::Frame::new().fill(theme.dark_background).inner_margin(egui::Margin::same(6));
+            egui::Panel::right("faces")
+                .frame(side)
+                .resizable(false)
+                .exact_size(crate::shoot::FACES_WIDTH)
+                .show(ui, |ui| shoot.face_strip(ui, &theme));
+        }
+        if self.state.folders {
+            let open = self.shoot.as_ref().map(|s| s.cull.dir().to_path_buf());
+            let tree = self.tree.get_or_insert_with(|| Tree::new(open.as_deref(), &ctx));
+            let side = egui::Frame::new().fill(theme.dark_background).inner_margin(egui::Margin::same(6));
+            let clicked = egui::Panel::left("folders")
+                .frame(side)
+                .resizable(false)
+                .exact_size(tree::WIDTH)
+                .show(ui, |ui| tree.ui(ui, &theme, open.as_deref()))
+                .inner;
+            if let Some(dir) = clicked {
+                self.open(dir, &ctx);
+            }
+        }
+        if self.summary
+            && let Some(command) = self.summary_window(&ctx)
+        {
+            self.run(command, &ctx);
         }
         let pasteboard = egui::Frame::new().fill(self.theme.pasteboard());
         let mut clicked = None;
@@ -400,13 +628,14 @@ impl App {
         }
     }
 
-    /// Where the cull stands, and the filter and auto-advance switches.
-    /// Returns the command for a switch clicked.
-    fn status_bar(&self, ui: &mut Ui) -> Option<Command> {
-        let mut command = None;
+    /// Where the cull stands, and the filter, stacking and auto-advance
+    /// switches. Returns the command for a switch clicked, or the stacking
+    /// chosen.
+    fn status_bar(&self, ui: &mut Ui) -> (Option<Command>, Option<Stacking>) {
+        let (mut command, mut stack_to) = (None, None);
         ui.horizontal(|ui| {
             match &self.shoot {
-                Some(shoot) => _ = ui.label(RichText::new(status(&shoot.cull)).color(self.theme.foreground)),
+                Some(shoot) => _ = ui.label(RichText::new(status_line(shoot)).color(self.theme.foreground)),
                 None => _ = ui.label(RichText::new("No folder open").color(self.theme.dark_foreground)),
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -422,19 +651,32 @@ impl App {
                                 }
                             }
                         });
+                    let stacking = shoot.cull.stacking();
+                    egui::ComboBox::from_id_salt("stacking")
+                        .selected_text(format!("Stacks: {}", stacking.label()))
+                        .show_ui(ui, |ui| {
+                            for s in Stacking::ALL {
+                                if ui.selectable_label(s == stacking, s.label()).clicked() {
+                                    stack_to = Some(s);
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(shortcut(Command::Stacking));
                     let auto = ui.selectable_label(self.state.auto_advance, "Auto-advance");
                     if auto.on_hover_text(shortcut(Command::AutoAdvance)).clicked() {
                         command = Some(Command::AutoAdvance);
                     }
                     ui.separator();
-                    let Show { histogram, info, clipping, peaking, focus_point } = self.state.show;
+                    let Show { histogram, info, clipping, peaking, focus_point, faces } = self.state.show;
                     for (on, label, toggle) in [
                         (histogram, "Histogram", Command::Histogram),
                         (info, "Info", Command::Info),
                         (clipping, "Clipping", Command::Clipping),
                         (peaking, "Peaking", Command::Peaking),
                         (focus_point, "AF", Command::FocusPoint),
-                        (shoot.view.zoomed, "100%", Command::Zoom),
+                        (faces, "Faces", Command::FaceStrip),
+                        (shoot.view().zoomed, "100%", Command::Zoom),
                     ] {
                         let tip = format!("{} ({})", toggle.label(), shortcut(toggle));
                         if ui.selectable_label(on, label).on_hover_text(tip).clicked() {
@@ -449,6 +691,54 @@ impl App {
                 }
             });
         });
+        (command, stack_to)
+    }
+
+    /// Where the cull stands: picks, rejects, undecided and each star, with
+    /// the way to what's left and on to darktable. Returns a command for a
+    /// button clicked.
+    fn summary_window(&mut self, ctx: &egui::Context) -> Option<Command> {
+        let shoot = self.shoot.as_ref()?;
+        let counts = shoot.cull.counts();
+        let total = shoot.cull.frames().len();
+        let mut command = None;
+        let mut open = true;
+        egui::Window::new("Cull summary")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let share = |n: usize| format!("{:.0}%", 100.0 * n as f64 / total.max(1) as f64);
+                egui::Grid::new("summary").num_columns(3).spacing(vec2(24.0, 6.0)).show(ui, |ui| {
+                    let mut row = |label: String, n: usize, colour| {
+                        ui.label(RichText::new(label).color(colour));
+                        ui.label(n.to_string());
+                        ui.label(RichText::new(share(n)).color(self.theme.dark_foreground));
+                        ui.end_row();
+                    };
+                    row("Picks and up".into(), counts.picks, self.theme.accent);
+                    for (i, &n) in counts.stars.iter().enumerate().rev() {
+                        row(format!("  {}", crate::shoot::stars(i as i32 + 1)), n, self.theme.foreground);
+                    }
+                    row("Rejects".into(), counts.rejects, self.theme.red);
+                    row("Undecided".into(), counts.undecided, self.theme.foreground);
+                    row("All".into(), total, self.theme.dark_foreground);
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let first = ui.add_enabled(counts.undecided > 0, egui::Button::new("First undecided"));
+                    if first.on_hover_text(shortcut(Command::FirstUndecided)).clicked() {
+                        command = Some(Command::FirstUndecided);
+                    }
+                    if ui.button("Open in darktable").on_hover_text(shortcut(Command::Darktable)).clicked() {
+                        command = Some(Command::Darktable);
+                    }
+                });
+            });
+        if !open {
+            self.summary = false;
+        }
         command
     }
 
@@ -505,16 +795,19 @@ impl App {
 }
 
 /// Record a change in the sidecar and the decision log.
-fn record(disk: &Disk, shoot: &mut Shoot, change: Change, how: How) {
+/// Record a change in the sidecar and the decision log, with the frames
+/// it was weighed against.
+fn record(disk: &Disk, shoot: &mut Shoot, change: Change, how: How, compared: &[usize]) {
     let dwell = shoot.dwell();
     let cull = &shoot.cull;
+    let path = |i: usize| cull.frames()[i].path.clone();
     disk.write(Mark {
-        path: cull.frames()[change.index].path.clone(),
+        path: path(change.index),
         rating: change.now,
         was: change.was,
         how,
-        view: "loupe",
-        compared: Vec::new(),
+        view: shoot.mode.name(),
+        compared: compared.iter().copied().filter(|&f| f != change.index).map(path).collect(),
         filter: cull.filter(),
         dwell,
         at: SystemTime::now(),
@@ -553,6 +846,26 @@ fn shortcut(command: Command) -> String {
 }
 
 /// The current frame, its place in the folder, and the cull so far.
+/// The status line: the view, the selection, and the cull.
+fn status_line(shoot: &Shoot) -> String {
+    let view = match shoot.mode {
+        Mode::Loupe => String::new(),
+        mode => {
+            let lock = if shoot.locked { "" } else { ", unlocked" };
+            let name = match mode {
+                Mode::Compare => "Compare".to_owned(),
+                _ => format!("Survey of {}", shoot.panes.len()),
+            };
+            format!("{name}{lock}   ")
+        }
+    };
+    let selected = match shoot.cull.selection().len() {
+        0 => String::new(),
+        n => format!("   {n} selected"),
+    };
+    format!("{view}{}{selected}", status(&shoot.cull))
+}
+
 fn status(cull: &Cull) -> String {
     let counts = cull.counts();
     let filter = cull.filter();
@@ -581,6 +894,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        self.remember_place();
         // Don't lose the last marks.
         self.disk.finish();
     }
@@ -593,7 +907,8 @@ mod tests {
 
     use egui::{Event, Key, Modifiers, PointerButton};
     use omacull_engine::cull::PICK;
-    use omacull_engine::sidecar::{self, REJECT};
+    use omacull_engine::cull::Filter;
+    use omacull_engine::sidecar;
     use omacull_engine::testing::{Arw, Folder};
 
     const NONE: Modifiers = Modifiers::NONE;
@@ -609,7 +924,7 @@ mod tests {
 
     impl Harness {
         fn new(script: &[Command]) -> Self {
-            Self::with(Paths { cache: None, log: None }, script)
+            Self::with(quiet(), script)
         }
 
         fn with(paths: Paths, script: &[Command]) -> Self {
@@ -664,7 +979,7 @@ mod tests {
         /// one between.
         fn drag(&mut self, from: egui::Pos2, to: egui::Pos2) {
             let button =
-                |at, pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: NONE };
+                |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: NONE };
             self.frame(vec![Event::PointerMoved(from), button(from, true)]);
             self.frame(vec![Event::PointerMoved(from + (to - from) / 2.0)]);
             self.frame(vec![Event::PointerMoved(to)]);
@@ -738,7 +1053,7 @@ mod tests {
         let folder = Folder::with_raws("app-marks", 5, &Arw::default());
         sidecar::write(&folder.raw(3), 4).unwrap();
         let log = folder.0.join("decisions.jsonl");
-        let mut h = Harness::open(&folder, Paths { cache: None, log: Some(log.clone()) });
+        let mut h = Harness::open(&folder, Paths { log: Some(log.clone()), ..quiet() });
         assert_eq!(h.ratings(), [0, 0, 4, 0, 0], "existing ratings are read on open");
         assert_eq!(h.app.title, format!("omacull-{}-app-marks — Omacull", std::process::id()));
 
@@ -787,7 +1102,7 @@ mod tests {
     #[test]
     fn auto_advance_and_filters() {
         let folder = Folder::with_raws("app-filters", 6, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         h.press(NONE, Key::A);
         assert!(h.app.state.auto_advance);
         h.press(NONE, Key::P);
@@ -823,7 +1138,7 @@ mod tests {
     fn neighbours_are_decoded_ahead_and_thumbnails_cached() {
         let folder = Folder::with_raws("app-prefetch", 12, &Arw::default());
         let cache = folder.0.join("cache");
-        let mut h = Harness::open(&folder, Paths { cache: Some(cache.clone()), log: None });
+        let mut h = Harness::open(&folder, Paths { cache: Some(cache.clone()), ..quiet() });
         let previews = |app: &App, range: std::ops::RangeInclusive<usize>| {
             range.into_iter().all(|i| app.shoot.as_ref().unwrap().has_preview(i))
         };
@@ -848,7 +1163,7 @@ mod tests {
     #[test]
     fn clicking_a_thumbnail_goes_to_it() {
         let folder = Folder::with_raws("app-click", 4, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         let cells = h.app.shoot.as_ref().unwrap().cells.clone();
         let (index, rect) = cells.iter().copied().find(|&(i, _)| i == 2).unwrap();
         assert!(rect.bottom() <= 600.0 && rect.top() > 300.0, "the strip is at the bottom: {rect:?}");
@@ -859,7 +1174,7 @@ mod tests {
     #[test]
     fn opening_a_raw_starts_at_it() {
         let folder = Folder::with_raws("app-open-raw", 4, &Arw::default());
-        let mut h = Harness::with(Paths { cache: None, log: None }, &[]);
+        let mut h = Harness::with(quiet(), &[]);
         h.app.open(folder.raw(3), &h.ctx.clone());
         h.wait("the folder", |app| app.shoot.is_some());
         assert_eq!(h.cull().current(), 2);
@@ -876,7 +1191,7 @@ mod tests {
     fn a_mark_that_cant_be_written_is_taken_back() {
         let folder = Folder::with_raws("app-unwritable", 2, &Arw::default());
         std::fs::write(sidecar::path_for(&folder.raw(1)), "not a sidecar").unwrap();
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         assert!(h.app.message.as_ref().is_some_and(|(m, problem)| *problem && m.contains("DSC00001.ARW.xmp")));
         h.press(NONE, Key::Num4);
         assert_eq!(h.ratings(), [4, 0]);
@@ -888,54 +1203,54 @@ mod tests {
     #[test]
     fn the_zoom_key_toggles_when_tapped_and_looks_when_held() {
         let folder = Folder::with_raws("app-zoom-key", 2, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         h.press(NONE, Key::Z);
-        assert!(h.shoot().view.zoomed, "a tap zooms in");
+        assert!(h.shoot().view().zoomed, "a tap zooms in");
         h.press(NONE, Key::ArrowRight);
-        assert!(h.shoot().view.zoomed, "and stays zoomed from frame to frame");
+        assert!(h.shoot().view().zoomed, "and stays zoomed from frame to frame");
         h.press(NONE, Key::Z);
-        assert!(!h.shoot().view.zoomed, "the next tap zooms out");
+        assert!(!h.shoot().view().zoomed, "the next tap zooms out");
 
         h.key_down(Key::Z);
-        assert!(h.shoot().view.zoomed);
+        assert!(h.shoot().view().zoomed);
         for _ in 0..8 {
             h.frame(vec![]);
         }
-        assert!(h.shoot().view.zoomed, "held");
+        assert!(h.shoot().view().zoomed, "held");
         h.key_up(Key::Z);
-        assert!(!h.shoot().view.zoomed, "let go after a look");
+        assert!(!h.shoot().view().zoomed, "let go after a look");
     }
 
     #[test]
     fn the_mouse_zooms_at_the_pointer_and_pans() {
         let folder = Folder::with_raws("app-zoom-mouse", 1, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         let fit = h.shoot().fit_rect();
         h.click(fit.center());
-        assert!(h.shoot().view.zoomed, "a click zooms in");
-        let before = h.shoot().view.center;
+        assert!(h.shoot().view().zoomed, "a click zooms in");
+        let before = h.shoot().view().center;
         h.drag(pos2(400.0, 200.0), pos2(300.0, 150.0));
-        assert!(h.shoot().view.zoomed, "dragging pans, and stays zoomed");
-        let after = h.shoot().view.center;
+        assert!(h.shoot().view().zoomed, "dragging pans, and stays zoomed");
+        let after = h.shoot().view().center;
         assert!(after[0] > before[0] && after[1] > before[1], "dragged left and up shows more to the right and below");
         h.click(fit.center());
-        assert!(!h.shoot().view.zoomed, "a click zooms out");
+        assert!(!h.shoot().view().zoomed, "a click zooms out");
         // Pressing from whole and dragging is a look.
         h.drag(fit.center(), fit.center() + vec2(-60.0, 0.0));
-        assert!(!h.shoot().view.zoomed);
+        assert!(!h.shoot().view().zoomed);
     }
 
     #[test]
     fn full_size_frames_are_developed_ahead_and_shown_in_tiles() {
         let folder = Folder::with_raws("app-full", 3, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         // The fake raws have no raw data: developing them fails, and the
         // enlarged preview stands in.
         h.wait("a development", |app| app.shoot.as_ref().unwrap().full_state(0).is_some());
         h.wait("the next one", |app| app.shoot.as_ref().unwrap().full_state(1).is_some());
         assert!(h.shoot().full_state(0).unwrap().is_err());
         h.press(NONE, Key::Z);
-        assert!(h.shoot().view.zoomed);
+        assert!(h.shoot().view().zoomed);
 
         // A real development, as the loader would hand it over.
         let (w, h_) = (1500, 1000);
@@ -965,29 +1280,29 @@ mod tests {
         Arw { focus: [6000, 4000, 1000, 1000], ..Arw::default() }.write(&folder.raw(1));
         Arw { focus: [6000, 4000, 5000, 3000], ..Arw::default() }.write(&folder.raw(2));
         Arw { focus_mode: 0, ..Arw::default() }.write(&folder.raw(3));
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         h.press(Modifiers::SHIFT, Key::Z);
-        let view = &h.shoot().view;
+        let view = h.shoot().view();
         assert!(view.zoomed && view.follow_focus);
         let first = view.center;
         h.press(NONE, Key::ArrowRight);
         h.wait("the next preview", |app| app.shoot.as_ref().unwrap().preview_ready());
         h.frame(vec![]);
-        let second = h.shoot().view.center;
+        let second = h.shoot().view().center;
         assert!(second[0] > first[0] && second[1] > first[1], "{first:?} then {second:?}");
         // Manual focus: nothing to go to.
         h.press(NONE, Key::ArrowRight);
         h.wait("the last preview", |app| app.shoot.as_ref().unwrap().preview_ready());
         h.press(NONE, Key::Z);
         h.press(Modifiers::SHIFT, Key::Z);
-        assert!(!h.shoot().view.zoomed);
+        assert!(!h.shoot().view().zoomed);
         assert!(h.app.message.as_ref().is_some_and(|(m, _)| m.contains("No focus point")));
     }
 
     #[test]
     fn overlays_are_switched_remembered_and_baked_in() {
         let folder = Folder::with_raws("app-overlays", 2, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         assert_eq!(h.app.state.show, Show::default());
         assert!(h.shoot().info().is_some_and(|i| i.exif.iso == Some(400)));
         for key in [Key::H, Key::J, Key::S, Key::F, Key::I] {
@@ -1003,5 +1318,332 @@ mod tests {
         h.wait("the next preview", |app| app.shoot.as_ref().unwrap().preview_ready());
         h.frame(vec![]);
         assert_eq!(h.shoot().preview_bake(), Some(crate::loupe::Bake { clipping: false, peaking: true }));
+    }
+
+    fn panes(h: &Harness) -> Vec<usize> {
+        h.shoot().panes.iter().map(|p| p.frame).collect()
+    }
+
+    #[test]
+    fn compare_brings_in_the_next_candidate_when_a_side_is_rejected() {
+        let folder = Folder::with_raws("app-compare", 6, &Arw::default());
+        let log = folder.0.join("decisions.jsonl");
+        let mut h = Harness::open(&folder, Paths { log: Some(log.clone()), ..quiet() });
+        h.press(NONE, Key::C);
+        assert_eq!((h.shoot().mode, panes(&h), h.cull().current()), (Mode::Compare, vec![0, 1], 0));
+        h.press(NONE, Key::X);
+        assert_eq!(h.ratings()[0], REJECT);
+        assert_eq!((panes(&h), h.cull().current()), (vec![2, 1], 2), "the rejected side is replaced");
+        h.press(NONE, Key::ArrowRight);
+        assert_eq!(panes(&h), [3, 1], "the arrows change the active side's frame");
+        h.press(NONE, Key::Tab);
+        assert_eq!(h.cull().current(), 1);
+        h.press(NONE, Key::P);
+        assert_eq!(panes(&h), [3, 1], "a pick stays");
+
+        // Zoom is locked together, until unlocked.
+        h.press(NONE, Key::Z);
+        assert!(h.shoot().panes.iter().all(|p| p.view.zoomed));
+        h.press(NONE, Key::L);
+        h.press(NONE, Key::Z);
+        let zoomed: Vec<bool> = h.shoot().panes.iter().map(|p| p.view.zoomed).collect();
+        assert_eq!(zoomed, [true, false]);
+        h.press(NONE, Key::Escape);
+        assert_eq!((h.shoot().mode, h.cull().current()), (Mode::Loupe, 1));
+
+        h.app.disk.finish();
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(&log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows[0]["view"], "compare");
+        let compared = rows[0]["compared"][0]["path"].as_str().unwrap();
+        assert!(compared.ends_with("DSC00002.ARW"), "{compared}");
+    }
+
+    #[test]
+    fn survey_knocks_frames_out_until_one_is_left() {
+        let folder = Folder::with_raws("app-survey", 6, &Arw::default());
+        let mut h = Harness::open(&folder, quiet());
+        h.press(NONE, Key::N);
+        assert_eq!((h.shoot().mode, panes(&h)), (Mode::Survey, vec![0, 1, 2, 3]));
+        h.frame(vec![]);
+        // Laid out in two rows, none overlapping.
+        let areas: Vec<_> = h.shoot().panes.iter().map(|p| p.view.area).collect();
+        for (i, a) in areas.iter().enumerate() {
+            assert!(areas[i + 1..].iter().all(|b| !a.intersects(*b)), "{areas:?}");
+        }
+        h.press(NONE, Key::Slash);
+        assert_eq!((panes(&h), h.cull().current()), (vec![1, 2, 3], 1));
+        h.press(NONE, Key::ArrowRight);
+        assert_eq!(h.cull().current(), 2, "the arrows move between panes");
+        h.press(NONE, Key::Num3);
+        assert_eq!(h.ratings()[2], 3);
+        h.press(NONE, Key::Slash);
+        h.press(NONE, Key::Slash);
+        assert_eq!((h.shoot().mode, h.cull().current()), (Mode::Loupe, 1), "one left: the loupe");
+        assert_eq!(h.ratings(), [0, 0, 3, 0, 0, 0], "knocking out doesn't mark");
+    }
+
+    #[test]
+    fn the_selection_is_what_gets_surveyed() {
+        let folder = Folder::with_raws("app-select", 6, &Arw::default());
+        let mut h = Harness::open(&folder, quiet());
+        h.press(Modifiers::SHIFT, Key::ArrowRight);
+        h.press(Modifiers::SHIFT, Key::ArrowRight);
+        assert_eq!(h.cull().selection(), [0, 1, 2]);
+        // Ctrl+click adds a frame from the filmstrip.
+        let cells = h.shoot().cells.clone();
+        let (_, rect) = cells.iter().copied().find(|&(i, _)| i == 4).unwrap();
+        let at = rect.center();
+        let (primary, modifiers) = (PointerButton::Primary, Modifiers::COMMAND);
+        let button = |pressed| Event::PointerButton { pos: at, button: primary, pressed, modifiers };
+        h.frame(vec![Event::ModifiersChanged(Modifiers::COMMAND), Event::PointerMoved(at), button(true)]);
+        h.frame(vec![button(false)]);
+        h.frame(vec![Event::ModifiersChanged(NONE)]);
+        assert_eq!(h.cull().selection(), [0, 1, 2, 4]);
+        h.press(NONE, Key::N);
+        assert_eq!(panes(&h), [0, 1, 2, 4]);
+        // A click on another pane makes it the active one.
+        h.frame(vec![]);
+        let second = h.shoot().panes[1].view.area.center();
+        h.click(second);
+        assert_eq!(h.cull().current(), 1);
+        assert!(!h.shoot().view().zoomed, "and doesn't zoom it");
+        h.press(NONE, Key::Escape);
+        h.press(NONE, Key::Escape);
+        assert!(h.cull().selection().is_empty(), "Escape leaves the survey, then the selection");
+    }
+
+    fn quiet() -> Paths {
+        Paths { cache: None, log: None, darktable: "darktable".into(), faces: None }
+    }
+
+    #[test]
+    fn the_folder_tree_counts_raws_and_opens_folders() {
+        let root = Folder::new("app-tree");
+        let (a, b) = (root.0.join("a shoot"), root.0.join("b shoot"));
+        for (dir, count) in [(&a, 3), (&b, 2), (&b.join("selects"), 1)] {
+            std::fs::create_dir_all(dir).unwrap();
+            for i in 1..=count {
+                Arw::default().write(&dir.join(format!("DSC{i:05}.ARW")));
+            }
+        }
+        let mut h = Harness::with(quiet(), &[]);
+        h.app.open(a.clone(), &h.ctx.clone());
+        h.wait("the folder", |app| app.shoot.is_some());
+        h.press(NONE, Key::T);
+        assert!(h.app.state.folders);
+        h.wait("the tree", |app| app.tree.as_ref().is_some_and(|t| !t.reading() && t.rows.len() == 2));
+        let tree = h.app.tree.as_ref().unwrap();
+        assert_eq!(tree.root, std::fs::canonicalize(&root.0).unwrap());
+        let (_, row) = tree.rows.iter().find(|(p, _)| p.ends_with("b shoot")).unwrap().clone();
+        h.click(row.center());
+        h.wait("the other folder", |app| app.shoot.as_ref().is_some_and(|s| s.cull.dir().ends_with("b shoot")));
+        assert_eq!(h.cull().frames().len(), 2);
+        // The loupe is beside the tree.
+        h.frame(vec![]);
+        assert!(h.shoot().view().area.left() >= tree::WIDTH);
+    }
+
+    #[test]
+    fn folders_are_reopened_where_they_were_left() {
+        let root = Folder::new("app-places");
+        let (a, b) = (root.0.join("a"), root.0.join("b"));
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+            for i in 1..=5 {
+                Arw::default().write(&dir.join(format!("DSC{i:05}.ARW")));
+            }
+        }
+        let mut h = Harness::with(quiet(), &[]);
+        let open = |h: &mut Harness, dir: &Path| {
+            h.app.open(dir.to_path_buf(), &h.ctx.clone());
+            h.wait("the folder", |app| app.opening.is_none() && app.shoot.is_some());
+        };
+        open(&mut h, &a);
+        h.press(NONE, Key::P);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        h.press(CMD_ALT, Key::Num0);
+        open(&mut h, &b);
+        assert_eq!(h.cull().current(), 0);
+        open(&mut h, &a);
+        assert_eq!((h.cull().current(), h.cull().filter()), (3, Filter::Undecided));
+    }
+
+    #[test]
+    fn the_summary_counts_and_leads_to_whats_left() {
+        let folder = Folder::with_raws("app-summary", 5, &Arw::default());
+        let mut h = Harness::open(&folder, quiet());
+        h.press(NONE, Key::Num3);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::X);
+        h.press(NONE, Key::End);
+        h.press(NONE, Key::M);
+        assert!(h.app.summary);
+        assert_eq!(h.cull().counts().stars, [0, 0, 1, 0, 0]);
+        h.press(Modifiers::SHIFT, Key::U);
+        assert_eq!(h.cull().current(), 2, "the first undecided");
+        h.press(NONE, Key::Escape);
+        assert!(!h.app.summary);
+        assert_eq!(h.shoot().mode, Mode::Loupe);
+    }
+
+    #[test]
+    fn darktable_is_handed_the_folder_once_the_marks_are_written() {
+        let folder = Folder::with_raws("app-darktable", 2, &Arw::default());
+        // A stand-in for darktable that says what it was given, and whether
+        // the sidecar was there yet.
+        let script = folder.0.join("darktable.sh");
+        let said = folder.0.join("said");
+        let sidecar = sidecar::path_for(&folder.raw(1));
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntest -e '{}' && echo \"$1\" > '{}'\n", sidecar.display(), said.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let paths = Paths { darktable: script.display().to_string(), ..quiet() };
+        let mut h = Harness::open(&folder, paths);
+        h.press(NONE, Key::P);
+        h.press(Modifiers::COMMAND, Key::E);
+        let started = Instant::now();
+        while !said.exists() {
+            assert!(started.elapsed() < Duration::from_secs(10), "darktable wasn't started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let given = std::fs::read_to_string(&said).unwrap();
+        assert_eq!(given.trim(), std::fs::canonicalize(&folder.0).unwrap().display().to_string());
+
+        let mut h = Harness::open(&folder, Paths { darktable: "/nowhere/darktable".into(), ..quiet() });
+        h.press(Modifiers::COMMAND, Key::E);
+        assert!(h.app.message.as_ref().is_some_and(|(m, problem)| *problem && m.contains("Couldn't start")));
+    }
+
+    #[test]
+    fn e_zooms_to_the_eyes_and_cycles_the_faces() {
+        let folder = Folder::with_raws("app-eyes", 3, &Arw::default());
+        let mut h = Harness::with(quiet(), &[]);
+        h.app.finder = crate::faces::tests::two_faces();
+        h.app.open(folder.0.clone(), &h.ctx.clone());
+        h.wait("the faces", |app| {
+            app.shoot.as_ref().is_some_and(|s| s.preview_ready() && s.faces.of(s.cull.current()).is_some())
+        });
+        h.frame(vec![]);
+        h.press(NONE, Key::E);
+        let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4;
+        let faces = h.shoot().faces.of(0).unwrap();
+        assert!(h.shoot().view().zoomed);
+        let first = h.shoot().view().center;
+        assert!(near(first, faces[1].between_eyes()), "the largest face first: {first:?}");
+        h.press(NONE, Key::E);
+        assert!(near(h.shoot().view().center, faces[0].between_eyes()), "again: the next face, round to the left");
+        h.press(NONE, Key::E);
+        assert_eq!(h.shoot().view().center, first, "and round again");
+
+        // The close-ups, and a click on one.
+        h.press(Modifiers::SHIFT, Key::E);
+        assert!(h.app.state.show.faces);
+        h.frame(vec![]);
+        let cells = h.shoot().close_up_cells.clone();
+        assert_eq!(cells.len(), 2);
+        assert!(cells[0].left() > h.shoot().view().area.right(), "beside the loupe");
+        h.press(NONE, Key::Z);
+        assert!(!h.shoot().view().zoomed);
+        h.click(cells[1].center());
+        assert!(h.shoot().view().zoomed, "a close-up zooms to its face");
+        assert_eq!(h.shoot().view().center, first);
+    }
+
+    #[test]
+    fn without_face_detection_e_says_why() {
+        let folder = Folder::with_raws("app-no-faces", 1, &Arw::default());
+        let mut h = Harness::with(quiet(), &[]);
+        h.app.finder = crate::faces::tests::none_set_up();
+        h.app.open(folder.0.clone(), &h.ctx.clone());
+        h.wait("the folder", |app| app.shoot.as_ref().is_some_and(|s| s.faces.unavailable.is_some()));
+        h.press(NONE, Key::E);
+        assert!(h.app.message.as_ref().is_some_and(|(m, _)| m.contains("no detector")));
+        assert!(!h.shoot().view().zoomed);
+    }
+
+    /// A burst of three, then two frames on their own, ten seconds apart.
+    fn bursts(name: &str) -> Folder {
+        let folder = Folder::new(name);
+        let times =
+            [("12:00:00", "100"), ("12:00:00", "300"), ("12:00:00", "500"), ("12:00:10", "0"), ("12:00:20", "0")];
+        for (i, (time, fraction)) in times.into_iter().enumerate() {
+            let captured: &'static str = Box::leak(format!("2026:10:04 {time}").into_boxed_str());
+            Arw { captured: (captured, fraction), ..Arw::default() }.write(&folder.raw(i + 1));
+        }
+        folder
+    }
+
+    #[test]
+    fn a_stack_is_surveyed_and_its_winner_picked_in_one_key() {
+        let folder = bursts("app-stacks");
+        let log = folder.0.join("decisions.jsonl");
+        let mut h = Harness::open(&folder, Paths { log: Some(log.clone()), ..quiet() });
+        h.press(Modifiers::SHIFT, Key::G);
+        h.press(Modifiers::SHIFT, Key::G);
+        assert_eq!((h.cull().stacking(), h.app.state.stacking), (Stacking::Time, Stacking::Time));
+        assert_eq!(h.cull().shown_indices(), [0, 3, 4], "the burst shows one frame");
+        h.press(NONE, Key::ArrowRight);
+        assert_eq!(h.cull().current(), 3, "stepping goes past the burst");
+        h.press(NONE, Key::ArrowLeft);
+        h.press(NONE, Key::N);
+        assert_eq!((h.shoot().mode, panes(&h)), (Mode::Survey, vec![0, 1, 2]), "the stack, surveyed");
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::W);
+        assert_eq!(h.ratings(), [REJECT, PICK, REJECT, 0, 0]);
+        assert_eq!((h.shoot().mode, h.cull().current()), (Mode::Loupe, 1));
+        assert_eq!(h.cull().shown_indices(), [1, 3, 4], "the winner stands for the stack");
+        h.press(Modifiers::COMMAND, Key::Z);
+        assert_eq!(h.ratings(), [0, 0, 0, 0, 0], "one undo takes it all back");
+
+        h.app.disk.finish();
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(&log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.iter().filter(|r| r["how"] == "mark" && r["view"] == "survey").count(), 3);
+        assert_eq!(rows[0]["compared"].as_array().unwrap().len(), 2, "weighed against the rest of the stack");
+    }
+
+    #[test]
+    fn a_stack_opens_out_and_its_winner_can_be_chosen_from_the_loupe() {
+        let folder = bursts("app-stacks-loupe");
+        let mut h = Harness::open(&folder, quiet());
+        h.press(Modifiers::SHIFT, Key::G);
+        h.press(Modifiers::SHIFT, Key::G);
+        h.press(NONE, Key::G);
+        assert_eq!(h.cull().shown_indices().len(), 5, "opened out");
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::Num3);
+        h.press(NONE, Key::W);
+        assert_eq!(h.ratings(), [REJECT, 3, REJECT, 0, 0], "a starred winner keeps its stars");
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::W);
+        assert!(h.app.message.as_ref().is_some_and(|(m, _)| m.contains("stack")), "not in a stack");
+    }
+
+    #[test]
+    fn stacks_made_by_hand_are_remembered_with_the_folder() {
+        let folder = bursts("app-stacks-manual");
+        let other = Folder::with_raws("app-stacks-other", 2, &Arw::default());
+        let mut h = Harness::open(&folder, quiet());
+        h.press(NONE, Key::End);
+        h.press(Modifiers::SHIFT, Key::ArrowLeft);
+        h.press(Modifiers::COMMAND, Key::G);
+        assert_eq!(h.cull().stacking(), Stacking::Manual);
+        assert_eq!(h.cull().manual_stacks(), [vec![3, 4]]);
+        let open = |h: &mut Harness, dir: &Path| {
+            h.app.open(dir.to_path_buf(), &h.ctx.clone());
+            h.wait("the folder", |app| app.opening.is_none());
+        };
+        open(&mut h, &other.0);
+        open(&mut h, &folder.0);
+        assert_eq!(h.cull().manual_stacks(), [vec![3, 4]]);
+        h.press(Modifiers::COMMAND | Modifiers::SHIFT, Key::G);
+        assert!(h.cull().manual_stacks().is_empty(), "unstacked");
     }
 }
