@@ -7,6 +7,7 @@ mod panes;
 mod shoot;
 mod state;
 mod theme;
+mod tree;
 
 use std::path::PathBuf;
 

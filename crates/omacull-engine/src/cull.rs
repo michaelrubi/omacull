@@ -27,7 +27,7 @@ pub struct Frame {
 }
 
 /// Which frames the filmstrip shows and stepping visits.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Filter {
     #[default]
@@ -92,6 +92,8 @@ pub struct Counts {
     pub picks: usize,
     pub rejects: usize,
     pub undecided: usize,
+    /// How many have 1 to 5 stars.
+    pub stars: [usize; 5],
 }
 
 pub struct Cull {
@@ -107,7 +109,7 @@ pub struct Cull {
     selected: BTreeSet<usize>,
 }
 
-fn is_raw(path: &Path) -> bool {
+pub(crate) fn is_raw(path: &Path) -> bool {
     let hidden = path.file_name().is_some_and(|n| n.as_encoded_bytes().starts_with(b"."));
     let raw = path
         .extension()
@@ -339,13 +341,21 @@ impl Cull {
         }
     }
 
+    /// The first frame not yet decided, from the start.
+    pub fn first_undecided(&self) -> Option<usize> {
+        self.frames.iter().position(|f| f.rating == 0)
+    }
+
     pub fn counts(&self) -> Counts {
         let mut counts = Counts::default();
         for frame in &self.frames {
             match frame.rating {
                 REJECT => counts.rejects += 1,
                 0 => counts.undecided += 1,
-                _ => counts.picks += 1,
+                stars => {
+                    counts.picks += 1;
+                    counts.stars[stars.clamp(1, 5) as usize - 1] += 1;
+                }
             }
         }
         counts
@@ -384,7 +394,8 @@ mod tests {
         assert_eq!(ratings, [0, 0, 4, REJECT]);
         assert_eq!(problems.len(), 1);
         assert!(problems[0].contains("DSC00001.ARW.xmp"), "{problems:?}");
-        assert_eq!(cull.counts(), Counts { picks: 1, rejects: 1, undecided: 2 });
+        assert_eq!(cull.counts(), Counts { picks: 1, rejects: 1, undecided: 2, stars: [0, 0, 0, 1, 0] });
+        assert_eq!(cull.first_undecided(), Some(0));
 
         let empty = Folder::new("cull-empty");
         assert!(Cull::open(&empty.0).is_err());

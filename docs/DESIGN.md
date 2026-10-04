@@ -114,6 +114,25 @@ keys go to; Tab or a click makes another active.
 - **The decision log** records the view (`compare`, `survey`) and the
   other frames on screen in `compared`.
 
+M4's keys: T shows the folder tree, M the cull summary, Shift+U goes to
+the first undecided frame, and Ctrl+E (Lightroom's Edit In) opens the
+folder in darktable.
+
+- **Folder tree:** beside the loupe, rooted at the folder above the open
+  one (↑ goes higher), opened out to it, each folder with how many raws
+  it holds. Folders are read in the background as they're opened out,
+  and again each time the tree is shown. A click opens a folder; on the
+  arrow, or on a folder with no raws, it opens out instead.
+- **Cull summary:** picks and up, each star, rejects and undecided, with
+  their share, and buttons for the first undecided frame and darktable.
+- **darktable:** every mark still queued is written first, then
+  `darktable <folder>` is started, which imports the folder and reads the
+  sidecars.
+- **Places:** each folder's frame (by name) and filter are remembered in
+  `state.toml` when another folder is opened and when Omacull closes, for
+  the 200 most recent folders, and come back when it's opened again
+  (unless a raw in it was opened, which wins).
+
 - Sidecars are named the way darktable names them: `DSC01234.ARW.xmp`.
 - No sidecar yet: write a minimal one holding just the rating.
 - Sidecar exists: change the rating field and nothing else. darktable's

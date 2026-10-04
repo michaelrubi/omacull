@@ -50,6 +50,10 @@ pub enum Command {
     SelectNext,
     SelectAll,
     SelectNone,
+    Folders,
+    Summary,
+    FirstUndecided,
+    Darktable,
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -106,6 +110,10 @@ impl Command {
         Command::SelectNext,
         Command::SelectAll,
         Command::SelectNone,
+        Command::Folders,
+        Command::Summary,
+        Command::FirstUndecided,
+        Command::Darktable,
     ];
 
     /// Look a command up by its name in code, e.g. "Reject".
@@ -131,6 +139,8 @@ impl Command {
         Command::SelectNext,
         Command::SelectAll,
         Command::SelectNone,
+        Command::FirstUndecided,
+        Command::Darktable,
         Command::Quit,
         Command::Open,
         Command::Undo,
@@ -159,6 +169,8 @@ impl Command {
         Command::Lock,
         Command::NextPane,
         Command::KnockOut,
+        Command::Folders,
+        Command::Summary,
     ];
 
     pub fn label(self) -> &'static str {
@@ -205,6 +217,10 @@ impl Command {
             Command::SelectNext => "Select the Next Frame Too",
             Command::SelectAll => "Select All",
             Command::SelectNone => "Select None",
+            Command::Folders => "Folder Tree",
+            Command::Summary => "Cull Summary",
+            Command::FirstUndecided => "First Undecided Frame",
+            Command::Darktable => "Open in darktable",
         }
     }
 
@@ -256,6 +272,11 @@ impl Command {
             Command::SelectNext => s(Modifiers::SHIFT, Key::ArrowRight),
             Command::SelectAll => s(CMD, Key::A),
             Command::SelectNone => s(CMD, Key::D),
+            Command::Folders => s(Modifiers::NONE, Key::T),
+            Command::Summary => s(Modifiers::NONE, Key::M),
+            Command::FirstUndecided => s(Modifiers::SHIFT, Key::U),
+            // Lightroom's Edit In.
+            Command::Darktable => s(CMD, Key::E),
         }
     }
 

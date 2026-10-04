@@ -2,7 +2,7 @@
 
 Omacull is a fast, keyboard-first photo culler for Omarchy: a folder of raws in, XMP ratings out, then on to darktable. It is the first stage of the workflow Omapix (`~/dev/omapix`) finishes.
 
-**Status:** M3 built: M1's culling (step, mark, filter, undo, sidecars, decision log), M2's inspection (100% zoom on a full development of the raw, histogram, clipping, focus peaking, focus point, shooting settings, colour management), and compare and survey with multi-select. Waiting on a hand test with a real shoot. Read [docs/DESIGN.md](docs/DESIGN.md) for scope and architecture and [docs/ROADMAP.md](docs/ROADMAP.md) for the milestones. M4 is next.
+**Status:** M4 built: M1's culling (step, mark, filter, undo, sidecars, decision log), M2's inspection (100% zoom on a full development of the raw, histogram, clipping, focus peaking, focus point, shooting settings, colour management), compare and survey with multi-select, and M4's folder tree, cull summary, darktable handoff and per-folder places. Waiting on a hand test with a real shoot. Read [docs/DESIGN.md](docs/DESIGN.md) for scope and architecture and [docs/ROADMAP.md](docs/ROADMAP.md) for the milestones. M5 is next.
 
 ## Principles
 

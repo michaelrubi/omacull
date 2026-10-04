@@ -20,7 +20,8 @@ use crate::hotkeys::{self, format_shortcut};
 use crate::monitor;
 use crate::panes::Mode;
 use crate::shoot::Shoot;
-use crate::state::{Show, State};
+use crate::state::{Place, Show, State};
+use crate::tree::{self, Tree};
 use crate::theme::{self, Theme};
 
 /// Where Omacull keeps what it makes; somewhere else in tests.
@@ -29,6 +30,8 @@ pub struct Paths {
     pub cache: Option<PathBuf>,
     /// The decision log.
     pub log: Option<PathBuf>,
+    /// The program that opens a folder in darktable.
+    pub darktable: String,
 }
 
 /// A folder being read.
@@ -62,6 +65,10 @@ pub struct App {
     monitor: Option<monitor::Watch>,
     /// Converts frames to its colours.
     display: Arc<Display>,
+    /// The folder tree, once it's been shown.
+    tree: Option<Tree>,
+    /// The cull summary is open.
+    summary: bool,
 }
 
 /// Converts to a monitor's colours, or shows sRGB as it is if its profile
@@ -99,7 +106,7 @@ impl App {
                 parsed
             })
             .collect();
-        let paths = Paths { cache: thumbs::default_dir(), log: disk::default_log() };
+        let paths = Paths { cache: thumbs::default_dir(), log: disk::default_log(), darktable: "darktable".into() };
         let mut app = Self::build(theme, theme::watch(ctx.clone()), warnings, script, State::load(), paths, ctx);
         let watch = monitor::Watch::new();
         app.display = display_for(&watch);
@@ -137,7 +144,39 @@ impl App {
             title: String::new(),
             monitor: None,
             display: Arc::new(Display::srgb()),
+            tree: None,
+            summary: false,
         }
+    }
+
+    /// Remember where the open folder was left, to come back to it.
+    fn remember_place(&mut self) {
+        if let Some(shoot) = &self.shoot {
+            let cull = &shoot.cull;
+            let frame = file_name(&cull.frame().path);
+            self.state.remember(Place { dir: cull.dir().to_path_buf(), frame, filter: cull.filter() });
+        }
+    }
+
+    /// Hand the open folder to darktable, once every mark is in its sidecar.
+    fn darktable(&mut self) {
+        let Some(shoot) = &self.shoot else { return };
+        self.disk.flush();
+        let dir = shoot.cull.dir().to_path_buf();
+        let started = std::process::Command::new(&self.paths.darktable)
+            .arg(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        self.message = Some(match started {
+            Ok(mut child) => {
+                // Reaped when it's closed.
+                std::thread::spawn(move || child.wait());
+                (format!("Opened {} in darktable", file_name(&dir)), false)
+            }
+            Err(e) => (format!("Couldn't start {}: {e}", self.paths.darktable), true),
+        });
     }
 
     /// Open a folder of raws in the background, or the folder a raw is in,
@@ -168,8 +207,22 @@ impl App {
         let Opening { dir, select, .. } = self.opening.take().unwrap();
         match result {
             Ok((mut cull, problems)) => {
-                if let Some(at) = select.and_then(|s| cull.frames().iter().position(|f| f.path == s)) {
+                self.remember_place();
+                // Where it was left, unless a raw in it was opened.
+                let place = self.state.place(cull.dir()).cloned();
+                let at = |name: &str| cull.frames().iter().position(|f| file_name(&f.path) == name);
+                let start = match select {
+                    Some(raw) => cull.frames().iter().position(|f| f.path == raw),
+                    None => place.as_ref().and_then(|p| at(&p.frame)),
+                };
+                if let Some(at) = start {
                     cull.go_to(at);
+                }
+                if let Some(place) = place {
+                    cull.set_filter(place.filter);
+                }
+                if let Some(tree) = &mut self.tree {
+                    tree.show(cull.dir());
                 }
                 self.state.add_recent(cull.dir());
                 self.message = problems.first().map(|first| {
@@ -231,6 +284,20 @@ impl App {
                 self.state.set_auto_advance(on);
                 self.message = Some((format!("Auto-advance {}", if on { "on" } else { "off" }), false));
             }
+            Command::Folders => {
+                let on = !self.state.folders;
+                self.state.set_folders(on);
+                // Shown again, it's read again: raws come and go.
+                if let Some(tree) = &mut self.tree {
+                    tree.refresh();
+                }
+            }
+            Command::Summary => self.summary = !self.summary,
+            Command::Back if self.summary => {
+                self.summary = false;
+                return;
+            }
+            Command::Darktable => self.darktable(),
             Command::Histogram | Command::Info | Command::Clipping | Command::Peaking | Command::FocusPoint => {
                 let mut show = self.state.show;
                 let (switch, name) = match command {
@@ -286,6 +353,10 @@ impl App {
             Command::SelectPrevious if shoot.mode == Mode::Loupe => _ = shoot.cull.extend(Step::Previous),
             Command::SelectNext if shoot.mode == Mode::Loupe => _ = shoot.cull.extend(Step::Next),
             Command::SelectAll => shoot.cull.select_all(),
+            Command::FirstUndecided => match shoot.cull.first_undecided() {
+                Some(first) => shoot.cull.go_to(first),
+                None => self.message = say("Every frame is decided"),
+            },
             Command::Undo => match shoot.cull.undo() {
                 Some(change) => record(&self.disk, shoot, change, How::Undo),
                 None => self.message = say("Nothing to undo"),
@@ -433,6 +504,25 @@ impl App {
                 shoot.clicked(index, click);
             }
         }
+        if self.state.folders {
+            let open = self.shoot.as_ref().map(|s| s.cull.dir().to_path_buf());
+            let tree = self.tree.get_or_insert_with(|| Tree::new(open.as_deref(), &ctx));
+            let side = egui::Frame::new().fill(theme.dark_background).inner_margin(egui::Margin::same(6));
+            let clicked = egui::Panel::left("folders")
+                .frame(side)
+                .resizable(false)
+                .exact_size(tree::WIDTH)
+                .show(ui, |ui| tree.ui(ui, &theme, open.as_deref()))
+                .inner;
+            if let Some(dir) = clicked {
+                self.open(dir, &ctx);
+            }
+        }
+        if self.summary
+            && let Some(command) = self.summary_window(&ctx)
+        {
+            self.run(command, &ctx);
+        }
         let pasteboard = egui::Frame::new().fill(self.theme.pasteboard());
         let mut clicked = None;
         let show = self.state.show;
@@ -496,6 +586,54 @@ impl App {
                 }
             });
         });
+        command
+    }
+
+    /// Where the cull stands: picks, rejects, undecided and each star, with
+    /// the way to what's left and on to darktable. Returns a command for a
+    /// button clicked.
+    fn summary_window(&mut self, ctx: &egui::Context) -> Option<Command> {
+        let shoot = self.shoot.as_ref()?;
+        let counts = shoot.cull.counts();
+        let total = shoot.cull.frames().len();
+        let mut command = None;
+        let mut open = true;
+        egui::Window::new("Cull summary")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let share = |n: usize| format!("{:.0}%", 100.0 * n as f64 / total.max(1) as f64);
+                egui::Grid::new("summary").num_columns(3).spacing(vec2(24.0, 6.0)).show(ui, |ui| {
+                    let mut row = |label: String, n: usize, colour| {
+                        ui.label(RichText::new(label).color(colour));
+                        ui.label(n.to_string());
+                        ui.label(RichText::new(share(n)).color(self.theme.dark_foreground));
+                        ui.end_row();
+                    };
+                    row("Picks and up".into(), counts.picks, self.theme.accent);
+                    for (i, &n) in counts.stars.iter().enumerate().rev() {
+                        row(format!("  {}", crate::shoot::stars(i as i32 + 1)), n, self.theme.foreground);
+                    }
+                    row("Rejects".into(), counts.rejects, self.theme.red);
+                    row("Undecided".into(), counts.undecided, self.theme.foreground);
+                    row("All".into(), total, self.theme.dark_foreground);
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let first = ui.add_enabled(counts.undecided > 0, egui::Button::new("First undecided"));
+                    if first.on_hover_text(shortcut(Command::FirstUndecided)).clicked() {
+                        command = Some(Command::FirstUndecided);
+                    }
+                    if ui.button("Open in darktable").on_hover_text(shortcut(Command::Darktable)).clicked() {
+                        command = Some(Command::Darktable);
+                    }
+                });
+            });
+        if !open {
+            self.summary = false;
+        }
         command
     }
 
@@ -649,6 +787,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        self.remember_place();
         // Don't lose the last marks.
         self.disk.finish();
     }
@@ -661,6 +800,7 @@ mod tests {
 
     use egui::{Event, Key, Modifiers, PointerButton};
     use omacull_engine::cull::PICK;
+    use omacull_engine::cull::Filter;
     use omacull_engine::sidecar;
     use omacull_engine::testing::{Arw, Folder};
 
@@ -677,7 +817,7 @@ mod tests {
 
     impl Harness {
         fn new(script: &[Command]) -> Self {
-            Self::with(Paths { cache: None, log: None }, script)
+            Self::with(quiet(), script)
         }
 
         fn with(paths: Paths, script: &[Command]) -> Self {
@@ -806,7 +946,7 @@ mod tests {
         let folder = Folder::with_raws("app-marks", 5, &Arw::default());
         sidecar::write(&folder.raw(3), 4).unwrap();
         let log = folder.0.join("decisions.jsonl");
-        let mut h = Harness::open(&folder, Paths { cache: None, log: Some(log.clone()) });
+        let mut h = Harness::open(&folder, Paths { log: Some(log.clone()), ..quiet() });
         assert_eq!(h.ratings(), [0, 0, 4, 0, 0], "existing ratings are read on open");
         assert_eq!(h.app.title, format!("omacull-{}-app-marks — Omacull", std::process::id()));
 
@@ -855,7 +995,7 @@ mod tests {
     #[test]
     fn auto_advance_and_filters() {
         let folder = Folder::with_raws("app-filters", 6, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         h.press(NONE, Key::A);
         assert!(h.app.state.auto_advance);
         h.press(NONE, Key::P);
@@ -891,7 +1031,7 @@ mod tests {
     fn neighbours_are_decoded_ahead_and_thumbnails_cached() {
         let folder = Folder::with_raws("app-prefetch", 12, &Arw::default());
         let cache = folder.0.join("cache");
-        let mut h = Harness::open(&folder, Paths { cache: Some(cache.clone()), log: None });
+        let mut h = Harness::open(&folder, Paths { cache: Some(cache.clone()), ..quiet() });
         let previews = |app: &App, range: std::ops::RangeInclusive<usize>| {
             range.into_iter().all(|i| app.shoot.as_ref().unwrap().has_preview(i))
         };
@@ -916,7 +1056,7 @@ mod tests {
     #[test]
     fn clicking_a_thumbnail_goes_to_it() {
         let folder = Folder::with_raws("app-click", 4, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         let cells = h.app.shoot.as_ref().unwrap().cells.clone();
         let (index, rect) = cells.iter().copied().find(|&(i, _)| i == 2).unwrap();
         assert!(rect.bottom() <= 600.0 && rect.top() > 300.0, "the strip is at the bottom: {rect:?}");
@@ -927,7 +1067,7 @@ mod tests {
     #[test]
     fn opening_a_raw_starts_at_it() {
         let folder = Folder::with_raws("app-open-raw", 4, &Arw::default());
-        let mut h = Harness::with(Paths { cache: None, log: None }, &[]);
+        let mut h = Harness::with(quiet(), &[]);
         h.app.open(folder.raw(3), &h.ctx.clone());
         h.wait("the folder", |app| app.shoot.is_some());
         assert_eq!(h.cull().current(), 2);
@@ -944,7 +1084,7 @@ mod tests {
     fn a_mark_that_cant_be_written_is_taken_back() {
         let folder = Folder::with_raws("app-unwritable", 2, &Arw::default());
         std::fs::write(sidecar::path_for(&folder.raw(1)), "not a sidecar").unwrap();
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         assert!(h.app.message.as_ref().is_some_and(|(m, problem)| *problem && m.contains("DSC00001.ARW.xmp")));
         h.press(NONE, Key::Num4);
         assert_eq!(h.ratings(), [4, 0]);
@@ -956,7 +1096,7 @@ mod tests {
     #[test]
     fn the_zoom_key_toggles_when_tapped_and_looks_when_held() {
         let folder = Folder::with_raws("app-zoom-key", 2, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         h.press(NONE, Key::Z);
         assert!(h.shoot().view().zoomed, "a tap zooms in");
         h.press(NONE, Key::ArrowRight);
@@ -977,7 +1117,7 @@ mod tests {
     #[test]
     fn the_mouse_zooms_at_the_pointer_and_pans() {
         let folder = Folder::with_raws("app-zoom-mouse", 1, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         let fit = h.shoot().fit_rect();
         h.click(fit.center());
         assert!(h.shoot().view().zoomed, "a click zooms in");
@@ -996,7 +1136,7 @@ mod tests {
     #[test]
     fn full_size_frames_are_developed_ahead_and_shown_in_tiles() {
         let folder = Folder::with_raws("app-full", 3, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         // The fake raws have no raw data: developing them fails, and the
         // enlarged preview stands in.
         h.wait("a development", |app| app.shoot.as_ref().unwrap().full_state(0).is_some());
@@ -1033,7 +1173,7 @@ mod tests {
         Arw { focus: [6000, 4000, 1000, 1000], ..Arw::default() }.write(&folder.raw(1));
         Arw { focus: [6000, 4000, 5000, 3000], ..Arw::default() }.write(&folder.raw(2));
         Arw { focus_mode: 0, ..Arw::default() }.write(&folder.raw(3));
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         h.press(Modifiers::SHIFT, Key::Z);
         let view = h.shoot().view();
         assert!(view.zoomed && view.follow_focus);
@@ -1055,7 +1195,7 @@ mod tests {
     #[test]
     fn overlays_are_switched_remembered_and_baked_in() {
         let folder = Folder::with_raws("app-overlays", 2, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         assert_eq!(h.app.state.show, Show::default());
         assert!(h.shoot().info().is_some_and(|i| i.exif.iso == Some(400)));
         for key in [Key::H, Key::J, Key::S, Key::F, Key::I] {
@@ -1081,7 +1221,7 @@ mod tests {
     fn compare_brings_in_the_next_candidate_when_a_side_is_rejected() {
         let folder = Folder::with_raws("app-compare", 6, &Arw::default());
         let log = folder.0.join("decisions.jsonl");
-        let mut h = Harness::open(&folder, Paths { cache: None, log: Some(log.clone()) });
+        let mut h = Harness::open(&folder, Paths { log: Some(log.clone()), ..quiet() });
         h.press(NONE, Key::C);
         assert_eq!((h.shoot().mode, panes(&h), h.cull().current()), (Mode::Compare, vec![0, 1], 0));
         h.press(NONE, Key::X);
@@ -1115,7 +1255,7 @@ mod tests {
     #[test]
     fn survey_knocks_frames_out_until_one_is_left() {
         let folder = Folder::with_raws("app-survey", 6, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         h.press(NONE, Key::N);
         assert_eq!((h.shoot().mode, panes(&h)), (Mode::Survey, vec![0, 1, 2, 3]));
         h.frame(vec![]);
@@ -1139,7 +1279,7 @@ mod tests {
     #[test]
     fn the_selection_is_what_gets_surveyed() {
         let folder = Folder::with_raws("app-select", 6, &Arw::default());
-        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        let mut h = Harness::open(&folder, quiet());
         h.press(Modifiers::SHIFT, Key::ArrowRight);
         h.press(Modifiers::SHIFT, Key::ArrowRight);
         assert_eq!(h.cull().selection(), [0, 1, 2]);
@@ -1164,5 +1304,112 @@ mod tests {
         h.press(NONE, Key::Escape);
         h.press(NONE, Key::Escape);
         assert!(h.cull().selection().is_empty(), "Escape leaves the survey, then the selection");
+    }
+
+    fn quiet() -> Paths {
+        Paths { cache: None, log: None, darktable: "darktable".into() }
+    }
+
+    #[test]
+    fn the_folder_tree_counts_raws_and_opens_folders() {
+        let root = Folder::new("app-tree");
+        let (a, b) = (root.0.join("a shoot"), root.0.join("b shoot"));
+        for (dir, count) in [(&a, 3), (&b, 2), (&b.join("selects"), 1)] {
+            std::fs::create_dir_all(dir).unwrap();
+            for i in 1..=count {
+                Arw::default().write(&dir.join(format!("DSC{i:05}.ARW")));
+            }
+        }
+        let mut h = Harness::with(quiet(), &[]);
+        h.app.open(a.clone(), &h.ctx.clone());
+        h.wait("the folder", |app| app.shoot.is_some());
+        h.press(NONE, Key::T);
+        assert!(h.app.state.folders);
+        h.wait("the tree", |app| app.tree.as_ref().is_some_and(|t| !t.reading() && t.rows.len() == 2));
+        let tree = h.app.tree.as_ref().unwrap();
+        assert_eq!(tree.root, std::fs::canonicalize(&root.0).unwrap());
+        let (_, row) = tree.rows.iter().find(|(p, _)| p.ends_with("b shoot")).unwrap().clone();
+        h.click(row.center());
+        h.wait("the other folder", |app| app.shoot.as_ref().is_some_and(|s| s.cull.dir().ends_with("b shoot")));
+        assert_eq!(h.cull().frames().len(), 2);
+        // The loupe is beside the tree.
+        h.frame(vec![]);
+        assert!(h.shoot().view().area.left() >= tree::WIDTH);
+    }
+
+    #[test]
+    fn folders_are_reopened_where_they_were_left() {
+        let root = Folder::new("app-places");
+        let (a, b) = (root.0.join("a"), root.0.join("b"));
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+            for i in 1..=5 {
+                Arw::default().write(&dir.join(format!("DSC{i:05}.ARW")));
+            }
+        }
+        let mut h = Harness::with(quiet(), &[]);
+        let open = |h: &mut Harness, dir: &Path| {
+            h.app.open(dir.to_path_buf(), &h.ctx.clone());
+            h.wait("the folder", |app| app.opening.is_none() && app.shoot.is_some());
+        };
+        open(&mut h, &a);
+        h.press(NONE, Key::P);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        h.press(CMD_ALT, Key::Num0);
+        open(&mut h, &b);
+        assert_eq!(h.cull().current(), 0);
+        open(&mut h, &a);
+        assert_eq!((h.cull().current(), h.cull().filter()), (3, Filter::Undecided));
+    }
+
+    #[test]
+    fn the_summary_counts_and_leads_to_whats_left() {
+        let folder = Folder::with_raws("app-summary", 5, &Arw::default());
+        let mut h = Harness::open(&folder, quiet());
+        h.press(NONE, Key::Num3);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::X);
+        h.press(NONE, Key::End);
+        h.press(NONE, Key::M);
+        assert!(h.app.summary);
+        assert_eq!(h.cull().counts().stars, [0, 0, 1, 0, 0]);
+        h.press(Modifiers::SHIFT, Key::U);
+        assert_eq!(h.cull().current(), 2, "the first undecided");
+        h.press(NONE, Key::Escape);
+        assert!(!h.app.summary);
+        assert_eq!(h.shoot().mode, Mode::Loupe);
+    }
+
+    #[test]
+    fn darktable_is_handed_the_folder_once_the_marks_are_written() {
+        let folder = Folder::with_raws("app-darktable", 2, &Arw::default());
+        // A stand-in for darktable that says what it was given, and whether
+        // the sidecar was there yet.
+        let script = folder.0.join("darktable.sh");
+        let said = folder.0.join("said");
+        let sidecar = sidecar::path_for(&folder.raw(1));
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntest -e '{}' && echo \"$1\" > '{}'\n", sidecar.display(), said.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let paths = Paths { darktable: script.display().to_string(), ..quiet() };
+        let mut h = Harness::open(&folder, paths);
+        h.press(NONE, Key::P);
+        h.press(Modifiers::COMMAND, Key::E);
+        let started = Instant::now();
+        while !said.exists() {
+            assert!(started.elapsed() < Duration::from_secs(10), "darktable wasn't started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let given = std::fs::read_to_string(&said).unwrap();
+        assert_eq!(given.trim(), std::fs::canonicalize(&folder.0).unwrap().display().to_string());
+
+        let mut h = Harness::open(&folder, Paths { darktable: "/nowhere/darktable".into(), ..quiet() });
+        h.press(Modifiers::COMMAND, Key::E);
+        assert!(h.app.message.as_ref().is_some_and(|(m, problem)| *problem && m.contains("Couldn't start")));
     }
 }

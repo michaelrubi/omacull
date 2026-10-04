@@ -3,7 +3,7 @@
 What's planned, in the order we plan to do it. [DESIGN.md](DESIGN.md)
 covers the scope and architecture.
 
-Status: M0 done on 2026-10-04 (scoped the same day). M1 to M3 built the
+Status: M0 done on 2026-10-04 (scoped the same day). M1 to M4 built the
 same day, waiting to be tried on a real shoot.
 
 Each milestone ends with something Michael can use on a real shoot. M1 is
@@ -94,7 +94,9 @@ compare and survey behave are in DESIGN.md.
   degrading gracefully. Knock a frame out with one key until one is left.
 - All inspection aids from M2 work in every pane.
 
-## M4. Navigation and handoff
+## M4. Navigation and handoff (built, to be tried on a real shoot)
+
+In and tested headless; how each part works is in DESIGN.md.
 
 - Folder tree sidebar, toggleable, with counts of raws per folder.
 - Cull summary: picks, rejects, undecided, star breakdown, and a jump to
