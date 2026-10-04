@@ -27,8 +27,13 @@ const STEPS: usize = 4096;
 pub fn full(raw: &Path) -> io::Result<(Image, Image, Space, Info)> {
     let (preview, space, info) = image::preview_with_info(raw)?;
     let other = |e: rawler::RawlerError| io::Error::other(e.to_string());
-    let decoded = rawler::decode_file(raw).map_err(other)?;
-    let developed = rawler::imgop::develop::RawDevelop::default().develop_intermediate(&decoded).map_err(other)?;
+    // rawler panics on some files it can't make sense of, which would take
+    // the thread developing them with it.
+    let developed = std::panic::catch_unwind(|| {
+        let decoded = rawler::decode_file(raw).map_err(other)?;
+        rawler::imgop::develop::RawDevelop::default().develop_intermediate(&decoded).map_err(other)
+    })
+    .unwrap_or_else(|_| Err(io::Error::other("the raw decoder gave up on it")))?;
     let rawler::imgop::develop::Intermediate::ThreeColor(rgb) = developed else {
         return Err(io::Error::other("the raw didn't develop to colour"));
     };
@@ -121,5 +126,9 @@ mod tests {
     fn a_raw_that_cant_be_decoded_says_so() {
         let folder = crate::testing::Folder::with_raws("develop", 1, &crate::testing::Arw::default());
         assert!(full(&folder.raw(1)).is_err(), "the fake raws hold no raw data");
+        // Nor does one rawler panics on take the thread with it.
+        let preview = Image { width: 480, height: 320, rgba: vec![128; 480 * 320 * 4] }.encode_jpeg(90).unwrap();
+        crate::testing::Arw { preview, ..Default::default() }.write(&folder.raw(1));
+        assert!(full(&folder.raw(1)).is_err());
     }
 }

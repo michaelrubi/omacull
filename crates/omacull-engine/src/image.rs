@@ -14,6 +14,11 @@ use zune_jpeg::zune_core::options::DecoderOptions;
 use crate::color::Space;
 use crate::raw::{Info, RawFile};
 
+/// A preview is no bigger than this on its long edge: where a camera
+/// embeds only a full-size JPEG, that's shrunk to what the loupe shows
+/// whole.
+const LARGEST_PREVIEW: usize = 2048;
+
 /// 8-bit RGBA, row by row, as it's uploaded to the GPU.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Image {
@@ -123,7 +128,7 @@ impl Image {
     }
 }
 
-/// The biggest JPEG the camera embedded in a raw, upright.
+/// The JPEG the camera embedded in a raw for looking at it, upright.
 pub fn preview(raw: &Path) -> io::Result<Image> {
     Ok(preview_with_info(raw)?.0)
 }
@@ -132,7 +137,11 @@ pub fn preview(raw: &Path) -> io::Result<Image> {
 pub fn preview_with_info(raw: &Path) -> io::Result<(Image, Space, Info)> {
     let raw = RawFile::open(raw)?;
     let jpeg = raw.preview().ok_or_else(|| invalid("no preview in the raw"))?;
-    let image = Image::decode_jpeg(&raw.read(jpeg)?)?.oriented(raw.orientation);
+    let mut image = Image::decode_jpeg(&raw.read(jpeg)?)?;
+    if image.width.max(image.height) > LARGEST_PREVIEW {
+        image = image.shrunk(LARGEST_PREVIEW);
+    }
+    let image = image.oriented(raw.orientation);
     let space = if raw.adobe_rgb { Space::AdobeRgb } else { Space::Srgb };
     Ok((image, space, raw.info()))
 }
@@ -339,5 +348,11 @@ mod tests {
         let adobe = crate::testing::Arw { color_space: 0xffff, ..Default::default() };
         adobe.write(&path);
         assert_eq!(preview_with_info(&path).unwrap().1, Space::AdobeRgb);
+        // A full-size JPEG, where it's all a camera embeds, is shrunk to
+        // what the loupe shows whole.
+        let full = crate::testing::jpeg(3000, 2000, [90, 90, 90]);
+        crate::testing::Arw { preview: full, thumbnail: Vec::new(), orientation: 8, ..Default::default() }.write(&path);
+        let image = preview(&path).unwrap();
+        assert_eq!((image.width, image.height), (1365, 2048));
     }
 }

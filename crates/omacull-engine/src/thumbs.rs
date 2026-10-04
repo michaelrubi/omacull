@@ -38,7 +38,7 @@ pub fn default_dir() -> Option<PathBuf> {
 }
 
 /// FNV-1a: stable between builds, unlike std's hasher.
-fn fnv(bytes: &[u8], mut hash: u64) -> u64 {
+pub(crate) fn fnv(bytes: &[u8], mut hash: u64) -> u64 {
     for &b in bytes {
         hash = (hash ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
     }

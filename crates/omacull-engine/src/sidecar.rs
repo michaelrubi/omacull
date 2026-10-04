@@ -3,11 +3,15 @@
 //! darktable keeps its whole edit in the sidecar, so a rating is changed by
 //! replacing the characters of its value and nothing else: the file is never
 //! parsed and written back out.
+//!
+//! Other raw developers name the sidecar `DSC01234.xmp`: [`set_naming`]
+//! switches to that, for the whole program.
 
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use quick_xml::events::Event;
 use quick_xml::name::{QName, ResolveResult};
@@ -19,11 +23,42 @@ pub const REJECT: i32 = -1;
 const XMP_NS: &str = "http://ns.adobe.com/xap/1.0/";
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
-/// The sidecar darktable reads for this raw.
+/// How a raw's sidecar is named.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Naming {
+    /// `DSC01234.ARW.xmp`, as darktable names it.
+    #[default]
+    Darktable,
+    /// `DSC01234.xmp`, as Lightroom, Bridge, Capture One and most others
+    /// do.
+    Adobe,
+}
+
+static ADOBE: AtomicBool = AtomicBool::new(false);
+
+/// Name sidecars this way from now on. Set once, at startup, from the
+/// config.
+pub fn set_naming(naming: Naming) {
+    ADOBE.store(naming == Naming::Adobe, Ordering::Relaxed);
+}
+
+/// A raw's sidecar, named one way or the other.
+pub fn named(raw: &Path, naming: Naming) -> PathBuf {
+    match naming {
+        Naming::Darktable => {
+            let mut name = raw.as_os_str().to_owned();
+            name.push(".xmp");
+            name.into()
+        }
+        Naming::Adobe => raw.with_extension("xmp"),
+    }
+}
+
+/// The sidecar the raw developer reads for this raw: darktable's, unless
+/// [`set_naming`] said otherwise.
 pub fn path_for(raw: &Path) -> PathBuf {
-    let mut name = raw.as_os_str().to_owned();
-    name.push(".xmp");
-    name.into()
+    named(raw, if ADOBE.load(Ordering::Relaxed) { Naming::Adobe } else { Naming::Darktable })
 }
 
 fn invalid(what: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
@@ -200,6 +235,9 @@ mod tests {
     #[test]
     fn sidecars_are_named_as_darktable_names_them() {
         assert_eq!(path_for(Path::new("/shoot/DSC01234.ARW")), Path::new("/shoot/DSC01234.ARW.xmp"));
+        let raw = Path::new("/shoot/DSC01234.ARW");
+        assert_eq!(named(raw, Naming::Darktable), path_for(raw));
+        assert_eq!(named(raw, Naming::Adobe), Path::new("/shoot/DSC01234.xmp"), "and as the others do");
     }
 
     #[test]

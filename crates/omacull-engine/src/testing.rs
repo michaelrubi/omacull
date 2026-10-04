@@ -1,5 +1,6 @@
 //! Raws for tests: small TIFFs shaped like a Sony ARW, with whatever
-//! embedded JPEGs, orientation, focus and shooting settings a test needs.
+//! embedded JPEGs, orientation, focus and shooting settings a test needs;
+//! and the same wrapped up as Nikon, Canon and Fuji wrap theirs.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,9 @@ pub struct Arw {
     pub captured: (&'static str, &'static str),
     /// What older bodies put before the makernote's directory.
     pub makernote_header: Vec<u8>,
+    /// A makernote of another make's, whole, in place of Sony's.
+    pub makernote: Option<Vec<u8>>,
+    pub make: &'static str,
     pub model: &'static str,
     pub lens: &'static str,
     pub exposure: (u32, u32),
@@ -42,6 +46,8 @@ impl Default for Arw {
             focus_mode: 2,
             captured: ("2026:10:04 12:00:00", "123"),
             makernote_header: Vec::new(),
+            makernote: None,
+            make: "SONY",
             model: "ILCE-7M3",
             lens: "FE 85mm F1.8",
             exposure: (1, 250),
@@ -103,11 +109,15 @@ impl Arw {
         let mut stamp = self.captured.0.as_bytes().to_vec();
         stamp.resize(20, 0);
         let focus = self.focus.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let makernote = match &self.makernote {
+            Some(note) => (MAKER_NOTE, 7, note.len() as u32, Value::Bytes(note.clone())),
+            None => (MAKER_NOTE, 7, 100, Value::Directory(4)),
+        };
         let directories: Vec<Vec<Entry>> = vec![
             vec![
                 (IMAGE_WIDTH, 4, 1, long(self.size.0)),
                 (IMAGE_LENGTH, 4, 1, long(self.size.1)),
-                ascii(MAKE, "SONY"),
+                ascii(MAKE, self.make),
                 ascii(MODEL, self.model),
                 (ORIENTATION, 3, 1, short(self.orientation)),
                 (JPEG_OFFSET, 4, 1, Value::Preview),
@@ -125,7 +135,7 @@ impl Arw {
                 (DATE_TIME_ORIGINAL, 2, 20, Value::Bytes(stamp)),
                 ascii(SUB_SEC_TIME_ORIGINAL, self.captured.1),
                 rational(FOCAL_LENGTH, self.focal_length),
-                (MAKER_NOTE, 7, 100, Value::Directory(4)),
+                makernote,
                 (COLOR_SPACE, 3, 1, short(self.color_space)),
                 (INTEROP_IFD, 4, 1, Value::Directory(3)),
                 ascii(LENS_MODEL, self.lens),
@@ -202,6 +212,69 @@ pub fn jpeg(width: u16, height: u16, rgb: [u8; 3]) -> Vec<u8> {
         .encode(&pixels, width, height, jpeg_encoder::ColorType::Rgb)
         .unwrap();
     out
+}
+
+/// A Nikon makernote: a TIFF of its own behind a header, whose preview
+/// directory holds `jpeg`.
+pub fn nikon_makernote(jpeg: &[u8]) -> Vec<u8> {
+    let entry = |tag: u16, value: u32| [&tag.to_le_bytes()[..], &4u16.to_le_bytes(), &1u32.to_le_bytes(), &value.to_le_bytes()].concat();
+    // The first directory at 8 points at the preview's at 26, which says
+    // the JPEG is at 56 and how long it is.
+    let tiff = [
+        &b"II\x2a\0\x08\0\0\0"[..],
+        &1u16.to_le_bytes(),
+        &entry(NIKON_PREVIEW_IFD, 26),
+        &[0; 4],
+        &2u16.to_le_bytes(),
+        &entry(JPEG_OFFSET, 56),
+        &entry(JPEG_LENGTH, jpeg.len() as u32),
+        &[0; 4],
+        jpeg,
+    ];
+    [&b"Nikon\0\x02\x10\0\0"[..], &tiff.concat()].concat()
+}
+
+/// A JPEG with a TIFF for its Exif, as cameras write them.
+pub fn with_exif(jpeg: &[u8], tiff: &[u8]) -> Vec<u8> {
+    let len = (tiff.len() + 8) as u16;
+    [&jpeg[..2], &[0xff, 0xe1], &len.to_be_bytes(), b"Exif\0\0", tiff, &jpeg[2..]].concat()
+}
+
+/// A Fuji RAF holding `jpeg`, a whole JPEG file with its own Exif.
+pub fn raf(jpeg: &[u8]) -> Vec<u8> {
+    let mut file = b"FUJIFILMCCD-RAW 0201FF129502X-T3".to_vec();
+    file.resize(84, 0);
+    file.extend(108u32.to_be_bytes());
+    file.extend((jpeg.len() as u32).to_be_bytes());
+    file.resize(108, 0);
+    file.extend(jpeg);
+    // Where the raw data would be.
+    file.extend([0; 64]);
+    file
+}
+
+/// A Canon CR3: `settings` is a TIFF with the shooting settings, as its
+/// CMT boxes hold them.
+pub fn cr3(settings: &[u8], thumbnail: &[u8], preview: &[u8]) -> Vec<u8> {
+    let boxed = |kind: &[u8; 4], content: &[u8]| [&((content.len() + 8) as u32).to_be_bytes()[..], kind, content].concat();
+    let size = |jpeg: &[u8]| (jpeg.len() as u32).to_be_bytes();
+    let thmb = [&[0; 4][..], &160u16.to_be_bytes(), &120u16.to_be_bytes(), &size(thumbnail), &[0, 1, 0, 0], thumbnail];
+    let canon = [
+        &[0x85; 16][..],
+        &boxed(b"CNCV", b"CanonCR3_001/00.09.00/00.00.00"),
+        &boxed(b"CMT1", settings),
+        &boxed(b"THMB", &thmb.concat()),
+    ];
+    let prvw = [&[0, 0, 0, 0, 0, 1][..], &1620u16.to_be_bytes(), &1080u16.to_be_bytes(), &[0, 1], &size(preview), preview];
+    [
+        boxed(b"ftyp", b"crx \0\0\0\x01crx isom"),
+        boxed(b"moov", &boxed(b"uuid", &canon.concat())),
+        // The XMP packet, then the preview, each in a box named by 16 bytes.
+        boxed(b"uuid", &[&[0xbe; 16][..], b"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>"].concat()),
+        boxed(b"uuid", &[&[0xea; 16][..], &[0, 0, 0, 0, 0, 0, 0, 1], &boxed(b"PRVW", &prvw.concat())].concat()),
+        boxed(b"mdat", &[0; 64]),
+    ]
+    .concat()
 }
 
 /// A folder of its own for a test, removed when dropped.

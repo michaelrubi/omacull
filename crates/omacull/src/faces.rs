@@ -1,7 +1,8 @@
-//! Faces found in the background: the whole folder, nearest the cursor
-//! first, kept in a cache so a folder is only looked through once.
+//! Faces found in the background, and the signals measured: the whole
+//! folder, nearest the cursor first, kept in caches so a folder is only
+//! looked through once.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -9,6 +10,7 @@ use std::thread::JoinHandle;
 
 use omacull_engine::faces::{self, Face};
 use omacull_engine::image::{self, Image};
+use omacull_engine::signals::{self, Signals};
 
 /// Finds the faces in an upright frame.
 pub type Find = Box<dyn FnMut(&Image) -> Result<Vec<Face>, String> + Send>;
@@ -25,9 +27,22 @@ pub fn yunet() -> Finder {
 }
 
 enum Found {
-    Faces(usize, Vec<Face>),
+    /// A frame looked at: its faces, unless they can't be found, and its
+    /// signals, unless it couldn't be read.
+    Looked(usize, Option<Vec<Face>>, Option<Signals>),
     /// Faces can't be found, and why; cached ones still come.
     Unavailable(String),
+}
+
+/// A raw's preview, and where the camera focused in it.
+fn look(raw: &std::path::Path) -> Option<(Image, Option<[f32; 2]>)> {
+    match image::preview_with_info(raw) {
+        Ok((preview, _, info)) => Some((preview, info.focus)),
+        Err(e) => {
+            log::warn!("looking at {}: {e}", raw.display());
+            None
+        }
+    }
 }
 
 #[derive(Default)]
@@ -38,6 +53,9 @@ struct Queue {
 
 pub struct Faces {
     found: HashMap<usize, Vec<Face>>,
+    measured: HashMap<usize, Signals>,
+    /// Frames that have been looked at, whatever came of it.
+    looked: HashSet<usize>,
     queue: Arc<(Mutex<Queue>, Condvar)>,
     results: Receiver<Found>,
     thread: Option<JoinHandle<()>>,
@@ -48,7 +66,15 @@ pub struct Faces {
 }
 
 impl Faces {
-    pub fn new(raws: Vec<PathBuf>, cache: Option<PathBuf>, finder: Finder, wake: impl Fn() + Send + 'static) -> Self {
+    /// Looks through `raws`, keeping faces in `cache` and signals in
+    /// `measured`.
+    pub fn new(
+        raws: Vec<PathBuf>,
+        cache: Option<PathBuf>,
+        measured: Option<PathBuf>,
+        finder: Finder,
+        wake: impl Fn() + Send + 'static,
+    ) -> Self {
         let queue: Arc<(Mutex<Queue>, Condvar)> = Arc::default();
         let (tx, results) = channel();
         let shared = queue.clone();
@@ -80,41 +106,73 @@ impl Faces {
                     };
                     let Some(raw) = raws.get(index) else { continue };
                     let cached = cache.as_deref().and_then(|dir| faces::load(raw, dir));
+                    let mut preview = None;
                     let found = match (cached, &mut find) {
-                        (Some(found), _) => found,
-                        (None, Some(find)) => match image::preview(raw).map_err(|e| e.to_string()).and_then(|p| {
-                            find(&p)
-                        }) {
-                            Ok(found) => {
-                                if let Some(dir) = &cache
-                                    && let Err(e) = faces::store(raw, dir, &found)
-                                {
-                                    log::warn!("couldn't cache faces: {e}");
+                        (Some(found), _) => Some(found),
+                        (None, Some(find)) => {
+                            preview = look(raw);
+                            Some(match preview.as_ref().map(|(preview, _)| find(preview)) {
+                                Some(Ok(found)) => {
+                                    if let Some(dir) = &cache
+                                        && let Err(e) = faces::store(raw, dir, &found)
+                                    {
+                                        log::warn!("couldn't cache faces: {e}");
+                                    }
+                                    found
                                 }
-                                found
-                            }
-                            Err(e) => {
-                                log::warn!("faces in {}: {e}", raw.display());
-                                Vec::new()
-                            }
-                        },
-                        (None, None) => continue,
+                                Some(Err(e)) => {
+                                    log::warn!("faces in {}: {e}", raw.display());
+                                    Vec::new()
+                                }
+                                None => Vec::new(),
+                            })
+                        }
+                        (None, None) => None,
                     };
-                    if tx.send(Found::Faces(index, found)).is_err() {
+                    let cached = measured.as_deref().and_then(|dir| signals::load(raw, dir));
+                    let signals = cached.or_else(|| {
+                        let (preview, focus) = preview.take().or_else(|| look(raw))?;
+                        let signals = signals::measure(&preview, focus, found.as_deref().unwrap_or(&[]));
+                        // Kept once the faces are known: they'd change it.
+                        if let (Some(dir), Some(_)) = (&measured, &found)
+                            && let Err(e) = signals::store(raw, dir, &signals)
+                        {
+                            log::warn!("couldn't cache signals: {e}");
+                        }
+                        Some(signals)
+                    });
+                    if tx.send(Found::Looked(index, found, signals)).is_err() {
                         return;
                     }
                     wake();
                 }
             })
             .expect("spawn the faces thread");
-        Self { found: HashMap::new(), queue, results, thread: Some(thread), wanted: Vec::new(), unavailable: None }
+        Self {
+            found: HashMap::new(),
+            measured: HashMap::new(),
+            looked: HashSet::new(),
+            queue,
+            results,
+            thread: Some(thread),
+            wanted: Vec::new(),
+            unavailable: None,
+        }
     }
 
     /// Take in what's been found.
     pub fn update(&mut self) {
         for found in self.results.try_iter() {
             match found {
-                Found::Faces(index, faces) => _ = self.found.insert(index, faces),
+                Found::Looked(index, faces, signals) => {
+                    self.looked.insert(index);
+                    if let Some(faces) = faces {
+                        self.found.insert(index, faces);
+                    }
+                    if let Some(signals) = signals {
+                        self.measured.insert(index, signals);
+                    }
+                }
                 Found::Unavailable(why) => self.unavailable = Some(why),
             }
         }
@@ -122,7 +180,7 @@ impl Faces {
 
     /// Look at these frames next, in this order, leaving out what's done.
     pub fn want(&mut self, order: impl IntoIterator<Item = usize>) {
-        let wanted: Vec<usize> = order.into_iter().filter(|i| !self.found.contains_key(i)).collect();
+        let wanted: Vec<usize> = order.into_iter().filter(|i| !self.looked.contains(i)).collect();
         if wanted != self.wanted {
             let (lock, ready) = &*self.queue;
             lock.lock().unwrap().waiting = wanted.iter().copied().collect();
@@ -137,6 +195,16 @@ impl Faces {
         let mut faces = self.found.get(&index)?.clone();
         faces.sort_by(|a, b| a.between_eyes()[0].total_cmp(&b.between_eyes()[0]));
         Some(faces)
+    }
+
+    /// What was measured of a frame; None if it hasn't been looked at yet.
+    pub fn signals(&self, index: usize) -> Option<&Signals> {
+        self.measured.get(&index)
+    }
+
+    /// How many frames have been measured.
+    pub fn measured(&self) -> usize {
+        self.measured.len()
     }
 }
 
@@ -163,8 +231,8 @@ pub mod tests {
         Arc::new(|| {
             Ok(Box::new(|_: &Image| {
                 Ok(vec![
-                    Face { score: 0.9, bounds: [0.6, 0.2, 0.9, 0.7], eyes: [[0.68, 0.4], [0.82, 0.4]] },
-                    Face { score: 0.8, bounds: [0.1, 0.3, 0.3, 0.6], eyes: [[0.15, 0.4], [0.25, 0.4]] },
+                    Face { score: 0.9, bounds: [0.6, 0.2, 0.9, 0.7], eyes: [[0.68, 0.4], [0.82, 0.4]], open: None },
+                    Face { score: 0.8, bounds: [0.1, 0.3, 0.3, 0.6], eyes: [[0.15, 0.4], [0.25, 0.4]], open: None },
                 ])
             }) as Find)
         })
@@ -187,21 +255,31 @@ pub mod tests {
     fn faces_are_found_cached_and_read_back() {
         let folder = Folder::with_raws("faces-worker", 3, &Arw::default());
         let raws: Vec<_> = (1..=3).map(|i| folder.raw(i)).collect();
-        let cache = folder.0.join("faces");
-        let mut faces = Faces::new(raws.clone(), Some(cache.clone()), two_faces(), || {});
+        let (cache, measured) = (folder.0.join("faces"), folder.0.join("signals"));
+        let mut faces = Faces::new(raws.clone(), Some(cache.clone()), Some(measured.clone()), two_faces(), || {});
         faces.want([2, 0]);
         wait(&mut faces, |f| f.of(0).is_some() && f.of(2).is_some());
         let found = faces.of(2).unwrap();
         assert!(found[0].between_eyes()[0] < found[1].between_eyes()[0], "left to right");
         assert_eq!(faces.of(1), None, "not asked for");
+        // Measured too, with the faces found.
+        let signals = *faces.signals(2).unwrap();
+        assert_eq!((signals.faces, signals.highlights), (2, 0.0));
+        assert!((signals.face - 0.15).abs() < 1e-5, "the larger face's share of the frame");
+        assert_eq!((faces.signals(1), faces.measured()), (None, 2));
+        assert_eq!(signals::load(&raws[2], &measured), Some(signals));
         drop(faces);
 
         // Without a detector, what's cached still comes, and the reason
         // for the rest.
-        let mut faces = Faces::new(raws, Some(cache), none_set_up(), || {});
+        let mut faces = Faces::new(raws.clone(), Some(cache), Some(measured.clone()), none_set_up(), || {});
         faces.want([0, 1]);
-        wait(&mut faces, |f| f.of(0).is_some() && f.unavailable.is_some());
+        wait(&mut faces, |f| f.of(0).is_some() && f.signals(1).is_some() && f.unavailable.is_some());
         assert_eq!(faces.of(0).unwrap().len(), 2);
         assert_eq!(faces.of(1), None);
+        // What can be measured without faces is, but isn't kept: found
+        // later, the faces would change it.
+        assert_eq!(faces.signals(1).map(|s| (s.faces, s.eyes)), Some((0, None)));
+        assert_eq!(signals::load(&raws[1], &measured), None);
     }
 }

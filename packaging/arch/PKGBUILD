@@ -1,0 +1,50 @@
+# Maintainer: Michael Rubi <michael@rubiconetic.com>
+
+# Builds Omacull from the newest commit on main. From this folder:
+#   makepkg -si
+
+pkgname=omacull-git
+pkgver=0.1.0.r14.gbe2bb05
+pkgrel=1
+pkgdesc="Keyboard-first photo culler: a folder of raws in, XMP ratings for darktable out"
+arch=('x86_64')
+url="https://github.com/michaelrubi/omacull"
+license=('GPL-3.0-or-later')
+depends=('gcc-libs' 'glibc' 'lcms2' 'vulkan-icd-loader' 'wayland' 'libxkbcommon'
+         'xdg-desktop-portal' 'hicolor-icon-theme')
+makedepends=('cargo' 'git')
+optdepends=('onnxruntime: finding faces, eyes and blinks'
+            'curl: downloading the face models with omacull-fetch-models'
+            'darktable: where a culled folder goes next')
+provides=('omacull')
+conflicts=('omacull')
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd omacull
+  printf '%s.r%s.g%s' "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)" \
+    "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd omacull
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd omacull
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+package() {
+  cd omacull
+  install -Dm755 target/release/omacull "$pkgdir/usr/bin/omacull"
+  install -Dm644 assets/omacull.desktop "$pkgdir/usr/share/applications/omacull.desktop"
+  install -Dm644 assets/omacull.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/omacull.svg"
+  # scripts/fetch-models.sh: the face models, for those without Omapix's.
+  install -Dm755 scripts/fetch-models.sh "$pkgdir/usr/bin/omacull-fetch-models"
+}
