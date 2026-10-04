@@ -12,11 +12,13 @@ use egui::{
     vec2,
 };
 use omacull_engine::color::Display;
+use omacull_engine::faces::Face;
 use omacull_engine::cull::{Cull, PICK, Rating};
 use omacull_engine::loader::{Decoded, Job, Loaded, Loader, Output};
 use omacull_engine::raw::Info;
 use omacull_engine::sidecar::REJECT;
 
+use crate::faces::{Faces, Finder};
 use crate::loupe::{self, Bake, View};
 use crate::panes::{self, Mode, Pane};
 use crate::state::Show;
@@ -32,6 +34,10 @@ pub const STRIP_HEIGHT: f32 = 104.0;
 /// they come into view: a 24 MP frame is 96 MB, too much to upload at once
 /// without a stutter, and bigger than some GPUs take in one texture.
 const TILE: usize = 512;
+/// The face close-ups beside the loupe.
+pub const FACES_WIDTH: f32 = 150.0;
+/// Close-ups from the full-size frame are this many pixels square.
+const CLOSE_UP: usize = 256;
 
 /// Something decoded and on the GPU, or why it isn't.
 enum Slot<T> {
@@ -100,6 +106,15 @@ pub struct Shoot {
     pub panes: Vec<Pane>,
     /// Compare's and survey's panes zoom and pan together.
     pub locked: bool,
+    pub faces: Faces,
+    /// The face the zoom last went to, in the current frame, by its place
+    /// left to right; E again goes to the next.
+    eyes: Option<(usize, usize)>,
+    /// The current frame's face close-ups, and whether they're from its
+    /// full-size frame (else they're cut from the preview as it's drawn).
+    close_ups: Option<(usize, Vec<TextureHandle>)>,
+    /// The close-ups where they were last drawn, for tests.
+    pub close_up_cells: Vec<Rect>,
 }
 
 /// How a filmstrip click was meant.
@@ -118,13 +133,20 @@ pub fn stars(rating: Rating) -> String {
 }
 
 impl Shoot {
-    pub fn new(cull: Cull, cache: Option<PathBuf>, display: Arc<Display>, ctx: &egui::Context) -> Self {
-        let raws = cull.frames().iter().map(|f| f.path.clone()).collect();
-        let ctx = ctx.clone();
+    pub fn new(
+        cull: Cull,
+        cache: Option<PathBuf>,
+        faces: (Option<PathBuf>, Finder),
+        display: Arc<Display>,
+        ctx: &egui::Context,
+    ) -> Self {
+        let raws: Vec<PathBuf> = cull.frames().iter().map(|f| f.path.clone()).collect();
+        let (wake, wake_faces) = (ctx.clone(), ctx.clone());
+        let faces = Faces::new(raws.clone(), faces.0, faces.1, move || wake_faces.request_repaint());
         let seen = cull.current();
         Self {
             cull,
-            loader: Loader::new(raws, cache, display, move || ctx.request_repaint()),
+            loader: Loader::new(raws, cache, display, move || wake.request_repaint()),
             previews: HashMap::new(),
             full: HashMap::new(),
             thumbnails: HashMap::new(),
@@ -137,7 +159,52 @@ impl Shoot {
             mode: Mode::Loupe,
             panes: vec![Pane::new(seen, View::default())],
             locked: true,
+            faces,
+            eyes: None,
+            close_ups: None,
+            close_up_cells: Vec::new(),
         }
+    }
+
+    /// E: zoom to a face's eyes in the current frame. The first time, the
+    /// face nearest the pointer if it's on the frame, else the largest;
+    /// again, the next face to the right, round to the first.
+    pub fn zoom_to_eyes(&mut self, pointer: Option<Pos2>, ppp: f32) -> Result<(), String> {
+        let current = self.cull.current();
+        let faces = match self.faces.of(current) {
+            Some(faces) => faces,
+            None => return Err(self.faces.unavailable.clone().unwrap_or_else(|| "Still looking for faces".into())),
+        };
+        if faces.is_empty() {
+            return Err("No faces found in this frame".into());
+        }
+        let next = match self.eyes {
+            Some((frame, k)) if frame == current && self.view().zoomed => (k + 1) % faces.len(),
+            _ => {
+                let fit = self.fit_rect();
+                let at = pointer.filter(|p| fit.contains(*p)).map(|p| ((p - fit.min) / fit.size()).to_pos2());
+                let distance = |f: &Face, at: Pos2| {
+                    let [x, y] = f.between_eyes();
+                    (x - at.x).powi(2) + (y - at.y).powi(2)
+                };
+                let by = |key: &dyn Fn(&Face) -> f32| {
+                    (0..faces.len()).min_by(|&a, &b| key(&faces[a]).total_cmp(&key(&faces[b]))).unwrap_or(0)
+                };
+                match at {
+                    Some(at) => by(&|f| distance(f, at)),
+                    None => by(&|f| -f.area()),
+                }
+            }
+        };
+        self.go_to_face(next, &faces, ppp);
+        Ok(())
+    }
+
+    fn go_to_face(&mut self, k: usize, faces: &[Face], ppp: f32) {
+        let size = self.full_size(ppp);
+        self.view_mut().zoom_to(faces[k].between_eyes(), size);
+        self.eyes = Some((self.cull.current(), k));
+        self.sync(self.active());
     }
 
     /// Which pane is the current frame's.
@@ -432,6 +499,7 @@ impl Shoot {
     /// Take in what has loaded, and ask for what's wanted next.
     pub fn update(&mut self, ctx: &egui::Context, show: Show) {
         self.dwell();
+        self.faces.update();
         let current = self.cull.current();
         // The loupe's pane shows the current frame; elsewhere, a frame
         // that isn't on screen (undo went to it) takes back to the loupe.
@@ -557,6 +625,82 @@ impl Shoot {
         if wanted != self.wanted {
             self.loader.want(wanted.iter().copied());
             self.wanted = wanted;
+        }
+        // Faces: what's on screen and near it first, then the whole folder.
+        let mut order = ring.clone();
+        let mut rest: Vec<usize> = (0..self.cull.frames().len()).filter(|i| !ring.contains(i)).collect();
+        rest.sort_by_key(|&i| i.abs_diff(current));
+        order.extend(rest);
+        self.faces.want(order);
+
+        // Close-ups for the current frame, sharp once it's developed.
+        let developed = matches!(self.full.get(&current), Some(Slot::Ready(_)));
+        let stale = self.close_ups.as_ref().is_some_and(|(frame, _)| *frame != current);
+        if stale || (developed && self.close_ups.is_none()) {
+            self.close_ups = None;
+            if let (Some(Slot::Ready(full)), Some(faces)) = (self.full.get(&current), self.faces.of(current)) {
+                let image = &full.decoded.image;
+                let textures = faces
+                    .iter()
+                    .enumerate()
+                    .map(|(k, face)| {
+                        let [x, y, side] = close_up(face, image.width as f32, image.height as f32);
+                        let crop = image.crop(x as usize, y as usize, side as usize, side as usize).shrunk(CLOSE_UP);
+                        let pixels = egui::ColorImage::from_rgba_unmultiplied([crop.width, crop.height], &crop.rgba);
+                        ctx.load_texture(format!("face-{current}-{k}"), pixels, TextureOptions::LINEAR)
+                    })
+                    .collect();
+                self.close_ups = Some((current, textures));
+            }
+        }
+    }
+
+    /// The current frame's faces, close up, top to bottom in a column.
+    /// A click zooms to that face's eyes.
+    pub fn face_strip(&mut self, ui: &mut Ui, theme: &Theme) {
+        let current = self.cull.current();
+        self.close_up_cells.clear();
+        let Some(faces) = self.faces.of(current) else {
+            let text = self.faces.unavailable.clone().unwrap_or_else(|| "Looking for faces…".into());
+            ui.label(egui::RichText::new(text).color(theme.dark_foreground));
+            return;
+        };
+        if faces.is_empty() {
+            ui.label(egui::RichText::new("No faces").color(theme.dark_foreground));
+            return;
+        }
+        let side = ui.available_width();
+        let mut clicked = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            for (k, face) in faces.iter().enumerate() {
+                let (rect, response) = ui.allocate_exact_size(vec2(side, side), Sense::click());
+                self.close_up_cells.push(rect);
+                let painter = ui.painter_at(rect);
+                let on = self.eyes == Some((current, k)) && self.view().zoomed;
+                match (&self.close_ups, self.previews.get(&current)) {
+                    (Some((frame, textures)), _) if *frame == current && k < textures.len() => {
+                        let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
+                        painter.image(textures[k].id(), rect, uv, Color32::WHITE);
+                    }
+                    (_, Some(Slot::Ready(shown))) => {
+                        // Cut from the preview until the frame is developed.
+                        let size = shown.texture.size_vec2();
+                        let [x, y, s] = close_up(face, size.x, size.y);
+                        let uv = Rect::from_min_size(pos2(x / size.x, y / size.y), vec2(s / size.x, s / size.y));
+                        painter.image(shown.texture.id(), rect, uv, Color32::WHITE);
+                    }
+                    _ => {}
+                }
+                let stroke = if on { Stroke::new(2.0, theme.accent) } else { Stroke::new(1.0, theme.selection) };
+                painter.rect_stroke(rect.shrink(1.0), 2.0, stroke, StrokeKind::Inside);
+                if response.clicked() {
+                    clicked = Some(k);
+                }
+                ui.add_space(4.0);
+            }
+        });
+        if let Some(k) = clicked {
+            self.go_to_face(k, &faces, ui.ctx().pixels_per_point());
         }
     }
 
@@ -726,6 +870,17 @@ impl Shoot {
         };
         self.cells.iter().find(|(_, rect)| rect.contains(pointer)).map(|&(i, _)| (i, click))
     }
+}
+
+/// A face's close-up in a frame `width` × `height` pixels: a square round
+/// its eyes, twice as wide as the face, kept inside the frame. Left, top
+/// and side, in pixels.
+fn close_up(face: &Face, width: f32, height: f32) -> [f32; 3] {
+    let [x, y] = face.between_eyes();
+    let side = ((face.bounds[2] - face.bounds[0]) * 2.0 * width).clamp(1.0, width.min(height));
+    let left = (x * width - side / 2.0).clamp(0.0, width - side);
+    let top = (y * height - side / 2.0).clamp(0.0, height - side);
+    [left, top, side]
 }
 
 /// The tiles of a full-size frame drawn at `rect` that fall in `visible`,

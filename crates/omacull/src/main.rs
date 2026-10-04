@@ -1,5 +1,6 @@
 mod app;
 mod commands;
+mod faces;
 mod hotkeys;
 mod loupe;
 mod monitor;

@@ -16,6 +16,7 @@ use omacull_engine::sidecar::REJECT;
 use omacull_engine::thumbs;
 
 use crate::commands::Command;
+use crate::faces::Finder;
 use crate::hotkeys::{self, format_shortcut};
 use crate::monitor;
 use crate::panes::Mode;
@@ -32,6 +33,8 @@ pub struct Paths {
     pub log: Option<PathBuf>,
     /// The program that opens a folder in darktable.
     pub darktable: String,
+    /// The faces found in each raw.
+    pub faces: Option<PathBuf>,
 }
 
 /// A folder being read.
@@ -69,6 +72,8 @@ pub struct App {
     tree: Option<Tree>,
     /// The cull summary is open.
     summary: bool,
+    /// Finds faces; a stand-in in tests.
+    finder: Finder,
 }
 
 /// Converts to a monitor's colours, or shows sRGB as it is if its profile
@@ -106,8 +111,14 @@ impl App {
                 parsed
             })
             .collect();
-        let paths = Paths { cache: thumbs::default_dir(), log: disk::default_log(), darktable: "darktable".into() };
+        let paths = Paths {
+            cache: thumbs::default_dir(),
+            log: disk::default_log(),
+            darktable: "darktable".into(),
+            faces: omacull_engine::faces::default_dir(),
+        };
         let mut app = Self::build(theme, theme::watch(ctx.clone()), warnings, script, State::load(), paths, ctx);
+        app.finder = crate::faces::yunet();
         let watch = monitor::Watch::new();
         app.display = display_for(&watch);
         app.monitor = Some(watch);
@@ -146,6 +157,7 @@ impl App {
             display: Arc::new(Display::srgb()),
             tree: None,
             summary: false,
+            finder: std::sync::Arc::new(|| Err("Faces aren't looked for".into())),
         }
     }
 
@@ -232,7 +244,8 @@ impl App {
                     };
                     (text, true)
                 });
-                self.shoot = Some(Shoot::new(cull, self.paths.cache.clone(), self.display.clone(), ctx));
+                let faces = (self.paths.faces.clone(), self.finder.clone());
+                self.shoot = Some(Shoot::new(cull, self.paths.cache.clone(), faces, self.display.clone(), ctx));
             }
             Err(e) => {
                 if !dir.is_dir() {
@@ -298,13 +311,19 @@ impl App {
                 return;
             }
             Command::Darktable => self.darktable(),
-            Command::Histogram | Command::Info | Command::Clipping | Command::Peaking | Command::FocusPoint => {
+            Command::Histogram
+            | Command::Info
+            | Command::Clipping
+            | Command::Peaking
+            | Command::FocusPoint
+            | Command::FaceStrip => {
                 let mut show = self.state.show;
                 let (switch, name) = match command {
                     Command::Histogram => (&mut show.histogram, "Histogram"),
                     Command::Info => (&mut show.info, "Shooting settings"),
                     Command::Clipping => (&mut show.clipping, "Clipping"),
                     Command::Peaking => (&mut show.peaking, "Focus peaking"),
+                    Command::FaceStrip => (&mut show.faces, "Face close-ups"),
                     _ => (&mut show.focus_point, "Focus point"),
                 };
                 *switch = !*switch;
@@ -322,6 +341,12 @@ impl App {
                 let (fit, size) = (shoot.fit_rect(), shoot.full_size(ppp));
                 shoot.view_mut().key_down(pointer, fit, size, time);
                 shoot.sync(shoot.active());
+            }
+            Command::Eyes => {
+                let pointer = ctx.input(|i| i.pointer.hover_pos());
+                if let Err(why) = shoot.zoom_to_eyes(pointer, ppp) {
+                    self.message = Some((why, false));
+                }
             }
             Command::ZoomToFocus => {
                 let (focus, size) = (shoot.info().and_then(|i| i.focus), shoot.full_size(ppp));
@@ -504,6 +529,16 @@ impl App {
                 shoot.clicked(index, click);
             }
         }
+        if self.state.show.faces
+            && let Some(shoot) = &mut self.shoot
+        {
+            let side = egui::Frame::new().fill(theme.dark_background).inner_margin(egui::Margin::same(6));
+            egui::Panel::right("faces")
+                .frame(side)
+                .resizable(false)
+                .exact_size(crate::shoot::FACES_WIDTH)
+                .show(ui, |ui| shoot.face_strip(ui, &theme));
+        }
         if self.state.folders {
             let open = self.shoot.as_ref().map(|s| s.cull.dir().to_path_buf());
             let tree = self.tree.get_or_insert_with(|| Tree::new(open.as_deref(), &ctx));
@@ -564,13 +599,14 @@ impl App {
                         command = Some(Command::AutoAdvance);
                     }
                     ui.separator();
-                    let Show { histogram, info, clipping, peaking, focus_point } = self.state.show;
+                    let Show { histogram, info, clipping, peaking, focus_point, faces } = self.state.show;
                     for (on, label, toggle) in [
                         (histogram, "Histogram", Command::Histogram),
                         (info, "Info", Command::Info),
                         (clipping, "Clipping", Command::Clipping),
                         (peaking, "Peaking", Command::Peaking),
                         (focus_point, "AF", Command::FocusPoint),
+                        (faces, "Faces", Command::FaceStrip),
                         (shoot.view().zoomed, "100%", Command::Zoom),
                     ] {
                         let tip = format!("{} ({})", toggle.label(), shortcut(toggle));
@@ -1307,7 +1343,7 @@ mod tests {
     }
 
     fn quiet() -> Paths {
-        Paths { cache: None, log: None, darktable: "darktable".into() }
+        Paths { cache: None, log: None, darktable: "darktable".into(), faces: None }
     }
 
     #[test]
@@ -1411,5 +1447,52 @@ mod tests {
         let mut h = Harness::open(&folder, Paths { darktable: "/nowhere/darktable".into(), ..quiet() });
         h.press(Modifiers::COMMAND, Key::E);
         assert!(h.app.message.as_ref().is_some_and(|(m, problem)| *problem && m.contains("Couldn't start")));
+    }
+
+    #[test]
+    fn e_zooms_to_the_eyes_and_cycles_the_faces() {
+        let folder = Folder::with_raws("app-eyes", 3, &Arw::default());
+        let mut h = Harness::with(quiet(), &[]);
+        h.app.finder = crate::faces::tests::two_faces();
+        h.app.open(folder.0.clone(), &h.ctx.clone());
+        h.wait("the faces", |app| {
+            app.shoot.as_ref().is_some_and(|s| s.preview_ready() && s.faces.of(s.cull.current()).is_some())
+        });
+        h.frame(vec![]);
+        h.press(NONE, Key::E);
+        let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4;
+        let faces = h.shoot().faces.of(0).unwrap();
+        assert!(h.shoot().view().zoomed);
+        let first = h.shoot().view().center;
+        assert!(near(first, faces[1].between_eyes()), "the largest face first: {first:?}");
+        h.press(NONE, Key::E);
+        assert!(near(h.shoot().view().center, faces[0].between_eyes()), "again: the next face, round to the left");
+        h.press(NONE, Key::E);
+        assert_eq!(h.shoot().view().center, first, "and round again");
+
+        // The close-ups, and a click on one.
+        h.press(Modifiers::SHIFT, Key::E);
+        assert!(h.app.state.show.faces);
+        h.frame(vec![]);
+        let cells = h.shoot().close_up_cells.clone();
+        assert_eq!(cells.len(), 2);
+        assert!(cells[0].left() > h.shoot().view().area.right(), "beside the loupe");
+        h.press(NONE, Key::Z);
+        assert!(!h.shoot().view().zoomed);
+        h.click(cells[1].center());
+        assert!(h.shoot().view().zoomed, "a close-up zooms to its face");
+        assert_eq!(h.shoot().view().center, first);
+    }
+
+    #[test]
+    fn without_face_detection_e_says_why() {
+        let folder = Folder::with_raws("app-no-faces", 1, &Arw::default());
+        let mut h = Harness::with(quiet(), &[]);
+        h.app.finder = crate::faces::tests::none_set_up();
+        h.app.open(folder.0.clone(), &h.ctx.clone());
+        h.wait("the folder", |app| app.shoot.as_ref().is_some_and(|s| s.faces.unavailable.is_some()));
+        h.press(NONE, Key::E);
+        assert!(h.app.message.as_ref().is_some_and(|(m, _)| m.contains("no detector")));
+        assert!(!h.shoot().view().zoomed);
     }
 }

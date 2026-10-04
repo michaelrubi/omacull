@@ -133,6 +133,28 @@ folder in darktable.
   the 200 most recent folders, and come back when it's opened again
   (unless a raw in it was opened, which wins).
 
+M5's keys: E zooms to the eyes of the face nearest the pointer (or the
+largest, with the pointer off the frame), and again to the next face, left
+to right; Shift+E shows the face close-ups beside the loupe, where a click
+zooms to that face.
+
+- **Detection:** YuNet (OpenCV's model zoo, MIT) in `omacull-ai`, on the
+  system's ONNX Runtime opened at run time (`/usr/lib/libonnxruntime.so`,
+  or `OMACULL_ORT_LIBRARY`), on the CPU: it's small, and a folder is a few
+  milliseconds a frame. It finds each face's box and both eyes. The model
+  comes from `scripts/fetch-models.sh` into `~/.local/share/omacull/models`,
+  or is Omapix's copy, which is the same file; both are checked by size and
+  SHA-256. Omacull downloads nothing itself. Without ONNX Runtime or the
+  model, everything else works and E says why there are no faces.
+- **In the background:** one thread works through the whole folder from
+  the time it's opened, what's on screen and near it first, finding faces
+  on the preview, upright. What it finds is cached in
+  `~/.cache/omacull/faces/`, keyed like the thumbnails, so a folder is
+  looked through once. Faces are kept as fractions of the frame, so they
+  hold for the preview and the full development alike.
+- **Close-ups:** a square round the eyes, twice as wide as the face, cut
+  from the full development once it's there, from the preview until then.
+
 - Sidecars are named the way darktable names them: `DSC01234.ARW.xmp`.
 - No sidecar yet: write a minimal one holding just the rating.
 - Sidecar exists: change the rating field and nothing else. darktable's

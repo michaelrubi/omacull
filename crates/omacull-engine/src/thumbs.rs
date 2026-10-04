@@ -24,12 +24,17 @@ const QUALITY: u8 = 85;
 /// Bumped when thumbnails are made differently, so old ones aren't used.
 const VERSION: u64 = 2;
 
-/// `$XDG_CACHE_HOME/omacull/thumbnails`, or `~/.cache/omacull/thumbnails`.
-pub fn default_dir() -> Option<PathBuf> {
+/// `$XDG_CACHE_HOME/omacull`, or `~/.cache/omacull`.
+pub fn cache_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(dir.join("omacull").join("thumbnails"))
+    Some(dir.join("omacull"))
+}
+
+/// `$XDG_CACHE_HOME/omacull/thumbnails`, or `~/.cache/omacull/thumbnails`.
+pub fn default_dir() -> Option<PathBuf> {
+    Some(cache_dir()?.join("thumbnails"))
 }
 
 /// FNV-1a: stable between builds, unlike std's hasher.
@@ -41,15 +46,21 @@ fn fnv(bytes: &[u8], mut hash: u64) -> u64 {
 }
 
 /// Where a raw's thumbnail is cached in `dir`.
-fn cached(dir: &Path, raw: &Path) -> io::Result<PathBuf> {
+/// A name for what's cached of a raw: changes with its path, size and
+/// modification time, and with `version`, how it was made.
+pub(crate) fn key(raw: &Path, version: u64) -> io::Result<String> {
     let raw = fs::canonicalize(raw)?;
     let meta = fs::metadata(&raw)?;
     let modified = meta.modified()?.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
     let mut hash = fnv(raw.as_os_str().as_encoded_bytes(), 0xcbf2_9ce4_8422_2325);
-    for part in [meta.len(), modified as u64, (modified >> 64) as u64, VERSION] {
+    for part in [meta.len(), modified as u64, (modified >> 64) as u64, version] {
         hash = fnv(&part.to_le_bytes(), hash);
     }
-    Ok(dir.join(format!("{hash:016x}.jpg")))
+    Ok(format!("{hash:016x}"))
+}
+
+fn cached(dir: &Path, raw: &Path) -> io::Result<PathBuf> {
+    Ok(dir.join(format!("{}.jpg", key(raw, VERSION)?)))
 }
 
 fn make(raw: &Path) -> io::Result<Image> {

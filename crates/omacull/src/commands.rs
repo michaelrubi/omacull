@@ -54,6 +54,8 @@ pub enum Command {
     Summary,
     FirstUndecided,
     Darktable,
+    Eyes,
+    FaceStrip,
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -114,6 +116,8 @@ impl Command {
         Command::Summary,
         Command::FirstUndecided,
         Command::Darktable,
+        Command::Eyes,
+        Command::FaceStrip,
     ];
 
     /// Look a command up by its name in code, e.g. "Reject".
@@ -141,6 +145,7 @@ impl Command {
         Command::SelectNone,
         Command::FirstUndecided,
         Command::Darktable,
+        Command::FaceStrip,
         Command::Quit,
         Command::Open,
         Command::Undo,
@@ -171,6 +176,7 @@ impl Command {
         Command::KnockOut,
         Command::Folders,
         Command::Summary,
+        Command::Eyes,
     ];
 
     pub fn label(self) -> &'static str {
@@ -221,6 +227,8 @@ impl Command {
             Command::Summary => "Cull Summary",
             Command::FirstUndecided => "First Undecided Frame",
             Command::Darktable => "Open in darktable",
+            Command::Eyes => "Zoom to the Eyes (Again: the Next Face)",
+            Command::FaceStrip => "Face Close-Ups",
         }
     }
 
@@ -277,6 +285,8 @@ impl Command {
             Command::FirstUndecided => s(Modifiers::SHIFT, Key::U),
             // Lightroom's Edit In.
             Command::Darktable => s(CMD, Key::E),
+            Command::Eyes => s(Modifiers::NONE, Key::E),
+            Command::FaceStrip => s(Modifiers::SHIFT, Key::E),
         }
     }
 

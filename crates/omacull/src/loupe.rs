@@ -105,6 +105,13 @@ impl View {
         true
     }
 
+    /// Zoom to a point of the frame, as fractions of its width and height.
+    pub fn zoom_to(&mut self, at: [f32; 2], size: Vec2) {
+        self.center = self.clamped(at, size);
+        self.zoomed = true;
+        self.follow_focus = false;
+    }
+
     /// The next frame: its focus point, if following them.
     pub fn arrive(&mut self, focus: Option<[f32; 2]>, size: Vec2) {
         if self.follow_focus

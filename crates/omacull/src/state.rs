@@ -31,12 +31,14 @@ pub struct Show {
     pub clipping: bool,
     pub peaking: bool,
     pub focus_point: bool,
+    /// The face close-ups beside the loupe.
+    pub faces: bool,
 }
 
 impl Default for Show {
     /// Only the shooting settings, a line under the frame.
     fn default() -> Self {
-        Self { histogram: false, info: true, clipping: false, peaking: false, focus_point: false }
+        Self { histogram: false, info: true, clipping: false, peaking: false, focus_point: false, faces: false }
     }
 }
 

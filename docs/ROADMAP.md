@@ -3,7 +3,7 @@
 What's planned, in the order we plan to do it. [DESIGN.md](DESIGN.md)
 covers the scope and architecture.
 
-Status: M0 done on 2026-10-04 (scoped the same day). M1 to M4 built the
+Status: M0 done on 2026-10-04 (scoped the same day). M1 to M5 built the
 same day, waiting to be tried on a real shoot.
 
 Each milestone ends with something Michael can use on a real shoot. M1 is
@@ -104,7 +104,11 @@ In and tested headless; how each part works is in DESIGN.md.
 - "Open in darktable" key for the current folder.
 - Remember per-folder position and filter between sessions.
 
-## M5. Faces
+## M5. Faces (built, to be tried on a real shoot)
+
+In and tested headless, and with the real ONNX Runtime and YuNet on a
+crowd photo (OpenCV's sample): 50 faces found, every pair of eyes inside
+its face. How it works is in DESIGN.md.
 
 - Face and eye detection, run in the background over the folder and
   cached.

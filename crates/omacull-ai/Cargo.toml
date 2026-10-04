@@ -1,0 +1,12 @@
+[package]
+name = "omacull-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+omacull-engine = { version = "0.1.0", path = "../omacull-engine" }
+# Opened at run time from the system's ONNX Runtime, as Omapix does.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-27"] }
+log = "0.4.34"
+sha2 = "0.10"
