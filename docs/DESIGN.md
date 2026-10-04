@@ -155,6 +155,32 @@ zooms to that face.
 - **Close-ups:** a square round the eyes, twice as wide as the face, cut
   from the full development once it's there, from the preview until then.
 
+M6's keys: Shift+G goes round how frames are stacked (also in the status
+bar), G opens out the current stack or closes it up, Ctrl+G stacks the
+selection by hand, Ctrl+Shift+G takes a hand-made stack apart, and W
+chooses a winner.
+
+- **Stacking** is a setting, remembered: off (the default), by hand, by
+  time (frames taken less than 2 s apart), or by time and look (less than
+  30 s apart and alike). How alike two frames look is measured on the
+  camera's own 160×120 thumbnail, as a 16×12 grid of brightness with the
+  overall brightness evened out, so a burst whose exposure wanders still
+  counts as one. Capture times and these signatures are read when a folder
+  opens, on every core: a few small reads a raw.
+- **Collapsed**, a stack is one frame in the filmstrip and to the arrows:
+  its best-rated frame the filter lets through (the first, when they're
+  equal), so once a winner is chosen it's the one shown. It has cards
+  behind it and a count. Opened out, its frames are underlined together.
+- **Surveying a stack:** N with nothing selected, on a frame in a stack,
+  surveys the whole stack.
+- **The winner** (W): the current frame is picked, unless it has stars
+  already, and the rest of the survey, or in the loupe the rest of its
+  stack, are rejected. One step to undo. Each mark is in the decision log
+  with the others in `compared`.
+- **Stacks by hand** are kept per folder, with its place in `state.toml`,
+  as the raws' names. Making one switches stacking to by hand.
+- **Undo** now takes back a step at a time, a winner's marks together.
+
 - Sidecars are named the way darktable names them: `DSC01234.ARW.xmp`.
 - No sidecar yet: write a minimal one holding just the rating.
 - Sidecar exists: change the rating field and nothing else. darktable's

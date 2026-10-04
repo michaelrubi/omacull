@@ -11,6 +11,7 @@ use std::time::SystemTime;
 use egui::{Align2, FontId, RichText, Sense, Ui, pos2, vec2};
 use omacull_engine::color::Display;
 use omacull_engine::cull::{Change, Cull, Filter, Step};
+use omacull_engine::stacks::Stacking;
 use omacull_engine::disk::{self, Disk, How, Mark, Problem};
 use omacull_engine::sidecar::REJECT;
 use omacull_engine::thumbs;
@@ -166,7 +167,9 @@ impl App {
         if let Some(shoot) = &self.shoot {
             let cull = &shoot.cull;
             let frame = file_name(&cull.frame().path);
-            self.state.remember(Place { dir: cull.dir().to_path_buf(), frame, filter: cull.filter() });
+            let name = |i: &usize| file_name(&cull.frames()[*i].path);
+            let stacks = cull.manual_stacks().iter().map(|s| s.iter().map(name).collect()).collect();
+            self.state.remember(Place { dir: cull.dir().to_path_buf(), frame, filter: cull.filter(), stacks });
         }
     }
 
@@ -227,6 +230,10 @@ impl App {
                     Some(raw) => cull.frames().iter().position(|f| f.path == raw),
                     None => place.as_ref().and_then(|p| at(&p.frame)),
                 };
+                let stacks: &[Vec<String>] = place.as_ref().map_or(&[], |p| &p.stacks);
+                let manual = stacks.iter().map(|s| s.iter().filter_map(|n| at(n)).collect()).collect();
+                cull.set_manual_stacks(manual);
+                cull.set_stacking(self.state.stacking);
                 if let Some(at) = start {
                     cull.go_to(at);
                 }
@@ -382,13 +389,57 @@ impl App {
                 Some(first) => shoot.cull.go_to(first),
                 None => self.message = say("Every frame is decided"),
             },
-            Command::Undo => match shoot.cull.undo() {
-                Some(change) => record(&self.disk, shoot, change, How::Undo),
-                None => self.message = say("Nothing to undo"),
-            },
-            Command::Redo => match shoot.cull.redo() {
-                Some(change) => record(&self.disk, shoot, change, How::Redo),
-                None => self.message = say("Nothing to redo"),
+            Command::Undo | Command::Redo => {
+                let (changes, how) = match command {
+                    Command::Undo => (shoot.cull.undo(), How::Undo),
+                    _ => (shoot.cull.redo(), How::Redo),
+                };
+                if changes.is_empty() {
+                    self.message = say(if how == How::Undo { "Nothing to undo" } else { "Nothing to redo" });
+                }
+                let compared: Vec<usize> = changes.iter().map(|c| c.index).collect();
+                for change in changes {
+                    record(&self.disk, shoot, change, how, &compared);
+                }
+            }
+            Command::StackSelection => {
+                if shoot.cull.stack_selection() {
+                    self.state.set_stacking(Stacking::Manual);
+                    self.message = say("Stacked by hand");
+                } else {
+                    self.message = say("Select two or more frames to stack");
+                }
+            }
+            Command::Unstack => {
+                if !shoot.cull.unstack() {
+                    self.message = say("Only stacks made by hand come apart");
+                }
+            }
+            Command::ToggleStack => {
+                if !shoot.cull.toggle_stack() {
+                    self.message = say("Not in a stack");
+                }
+            }
+            Command::Stacking => {
+                let stacking = shoot.cull.stacking().next();
+                shoot.cull.set_stacking(stacking);
+                self.state.set_stacking(stacking);
+                let count = shoot.cull.stack_count();
+                self.message = Some((format!("Stacks: {} ({count})", stacking.label()), false));
+            }
+            Command::Winner => match shoot.winner() {
+                Ok(marks) => {
+                    let changes = shoot.cull.mark_many(&marks);
+                    let compared: Vec<usize> = marks.iter().map(|&(f, _)| f).collect();
+                    for change in changes {
+                        record(&self.disk, shoot, change, How::Mark, &compared);
+                    }
+                    shoot.back_to_loupe();
+                    if self.state.auto_advance {
+                        shoot.cull.step(Step::Next);
+                    }
+                }
+                Err(why) => self.message = say(why),
             },
             // Away from the loupe, the arrows work on the panes.
             Command::Previous | Command::Next if shoot.mode != Mode::Loupe => {
@@ -402,7 +453,8 @@ impl App {
         }
         if let Some(rating) = command.rating() {
             if let Some(change) = shoot.cull.mark(rating) {
-                record(&self.disk, shoot, change, How::Mark);
+                let compared = shoot.others();
+                record(&self.disk, shoot, change, How::Mark, &compared);
             }
             match shoot.mode {
                 // Marked down in compare, the next candidate comes in.
@@ -510,12 +562,16 @@ impl App {
         let bar = egui::Frame::new()
             .fill(self.theme.dark_background)
             .inner_margin(egui::Margin::symmetric(8, 4));
-        let command = egui::Panel::bottom("status")
+        let (command, stack_to) = egui::Panel::bottom("status")
             .frame(bar)
             .show(ui, |ui| self.status_bar(ui))
             .inner;
         if let Some(command) = command {
             self.run(command, &ctx);
+        }
+        if let (Some(stacking), Some(shoot)) = (stack_to, &mut self.shoot) {
+            shoot.cull.set_stacking(stacking);
+            self.state.set_stacking(stacking);
         }
         let theme = self.theme.clone();
         if let Some(shoot) = &mut self.shoot {
@@ -572,10 +628,11 @@ impl App {
         }
     }
 
-    /// Where the cull stands, and the filter and auto-advance switches.
-    /// Returns the command for a switch clicked.
-    fn status_bar(&self, ui: &mut Ui) -> Option<Command> {
-        let mut command = None;
+    /// Where the cull stands, and the filter, stacking and auto-advance
+    /// switches. Returns the command for a switch clicked, or the stacking
+    /// chosen.
+    fn status_bar(&self, ui: &mut Ui) -> (Option<Command>, Option<Stacking>) {
+        let (mut command, mut stack_to) = (None, None);
         ui.horizontal(|ui| {
             match &self.shoot {
                 Some(shoot) => _ = ui.label(RichText::new(status_line(shoot)).color(self.theme.foreground)),
@@ -594,6 +651,18 @@ impl App {
                                 }
                             }
                         });
+                    let stacking = shoot.cull.stacking();
+                    egui::ComboBox::from_id_salt("stacking")
+                        .selected_text(format!("Stacks: {}", stacking.label()))
+                        .show_ui(ui, |ui| {
+                            for s in Stacking::ALL {
+                                if ui.selectable_label(s == stacking, s.label()).clicked() {
+                                    stack_to = Some(s);
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(shortcut(Command::Stacking));
                     let auto = ui.selectable_label(self.state.auto_advance, "Auto-advance");
                     if auto.on_hover_text(shortcut(Command::AutoAdvance)).clicked() {
                         command = Some(Command::AutoAdvance);
@@ -622,7 +691,7 @@ impl App {
                 }
             });
         });
-        command
+        (command, stack_to)
     }
 
     /// Where the cull stands: picks, rejects, undecided and each star, with
@@ -726,7 +795,9 @@ impl App {
 }
 
 /// Record a change in the sidecar and the decision log.
-fn record(disk: &Disk, shoot: &mut Shoot, change: Change, how: How) {
+/// Record a change in the sidecar and the decision log, with the frames
+/// it was weighed against.
+fn record(disk: &Disk, shoot: &mut Shoot, change: Change, how: How, compared: &[usize]) {
     let dwell = shoot.dwell();
     let cull = &shoot.cull;
     let path = |i: usize| cull.frames()[i].path.clone();
@@ -736,7 +807,7 @@ fn record(disk: &Disk, shoot: &mut Shoot, change: Change, how: How) {
         was: change.was,
         how,
         view: shoot.mode.name(),
-        compared: shoot.others().into_iter().filter(|&f| f != change.index).map(path).collect(),
+        compared: compared.iter().copied().filter(|&f| f != change.index).map(path).collect(),
         filter: cull.filter(),
         dwell,
         at: SystemTime::now(),
@@ -1494,5 +1565,85 @@ mod tests {
         h.press(NONE, Key::E);
         assert!(h.app.message.as_ref().is_some_and(|(m, _)| m.contains("no detector")));
         assert!(!h.shoot().view().zoomed);
+    }
+
+    /// A burst of three, then two frames on their own, ten seconds apart.
+    fn bursts(name: &str) -> Folder {
+        let folder = Folder::new(name);
+        let times =
+            [("12:00:00", "100"), ("12:00:00", "300"), ("12:00:00", "500"), ("12:00:10", "0"), ("12:00:20", "0")];
+        for (i, (time, fraction)) in times.into_iter().enumerate() {
+            let captured: &'static str = Box::leak(format!("2026:10:04 {time}").into_boxed_str());
+            Arw { captured: (captured, fraction), ..Arw::default() }.write(&folder.raw(i + 1));
+        }
+        folder
+    }
+
+    #[test]
+    fn a_stack_is_surveyed_and_its_winner_picked_in_one_key() {
+        let folder = bursts("app-stacks");
+        let log = folder.0.join("decisions.jsonl");
+        let mut h = Harness::open(&folder, Paths { log: Some(log.clone()), ..quiet() });
+        h.press(Modifiers::SHIFT, Key::G);
+        h.press(Modifiers::SHIFT, Key::G);
+        assert_eq!((h.cull().stacking(), h.app.state.stacking), (Stacking::Time, Stacking::Time));
+        assert_eq!(h.cull().shown_indices(), [0, 3, 4], "the burst shows one frame");
+        h.press(NONE, Key::ArrowRight);
+        assert_eq!(h.cull().current(), 3, "stepping goes past the burst");
+        h.press(NONE, Key::ArrowLeft);
+        h.press(NONE, Key::N);
+        assert_eq!((h.shoot().mode, panes(&h)), (Mode::Survey, vec![0, 1, 2]), "the stack, surveyed");
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::W);
+        assert_eq!(h.ratings(), [REJECT, PICK, REJECT, 0, 0]);
+        assert_eq!((h.shoot().mode, h.cull().current()), (Mode::Loupe, 1));
+        assert_eq!(h.cull().shown_indices(), [1, 3, 4], "the winner stands for the stack");
+        h.press(Modifiers::COMMAND, Key::Z);
+        assert_eq!(h.ratings(), [0, 0, 0, 0, 0], "one undo takes it all back");
+
+        h.app.disk.finish();
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(&log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.iter().filter(|r| r["how"] == "mark" && r["view"] == "survey").count(), 3);
+        assert_eq!(rows[0]["compared"].as_array().unwrap().len(), 2, "weighed against the rest of the stack");
+    }
+
+    #[test]
+    fn a_stack_opens_out_and_its_winner_can_be_chosen_from_the_loupe() {
+        let folder = bursts("app-stacks-loupe");
+        let mut h = Harness::open(&folder, quiet());
+        h.press(Modifiers::SHIFT, Key::G);
+        h.press(Modifiers::SHIFT, Key::G);
+        h.press(NONE, Key::G);
+        assert_eq!(h.cull().shown_indices().len(), 5, "opened out");
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::Num3);
+        h.press(NONE, Key::W);
+        assert_eq!(h.ratings(), [REJECT, 3, REJECT, 0, 0], "a starred winner keeps its stars");
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::W);
+        assert!(h.app.message.as_ref().is_some_and(|(m, _)| m.contains("stack")), "not in a stack");
+    }
+
+    #[test]
+    fn stacks_made_by_hand_are_remembered_with_the_folder() {
+        let folder = bursts("app-stacks-manual");
+        let other = Folder::with_raws("app-stacks-other", 2, &Arw::default());
+        let mut h = Harness::open(&folder, quiet());
+        h.press(NONE, Key::End);
+        h.press(Modifiers::SHIFT, Key::ArrowLeft);
+        h.press(Modifiers::COMMAND, Key::G);
+        assert_eq!(h.cull().stacking(), Stacking::Manual);
+        assert_eq!(h.cull().manual_stacks(), [vec![3, 4]]);
+        let open = |h: &mut Harness, dir: &Path| {
+            h.app.open(dir.to_path_buf(), &h.ctx.clone());
+            h.wait("the folder", |app| app.opening.is_none());
+        };
+        open(&mut h, &other.0);
+        open(&mut h, &folder.0);
+        assert_eq!(h.cull().manual_stacks(), [vec![3, 4]]);
+        h.press(Modifiers::COMMAND | Modifiers::SHIFT, Key::G);
+        assert!(h.cull().manual_stacks().is_empty(), "unstacked");
     }
 }

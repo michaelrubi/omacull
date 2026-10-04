@@ -56,6 +56,11 @@ pub enum Command {
     Darktable,
     Eyes,
     FaceStrip,
+    StackSelection,
+    Unstack,
+    ToggleStack,
+    Stacking,
+    Winner,
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -118,6 +123,11 @@ impl Command {
         Command::Darktable,
         Command::Eyes,
         Command::FaceStrip,
+        Command::StackSelection,
+        Command::Unstack,
+        Command::ToggleStack,
+        Command::Stacking,
+        Command::Winner,
     ];
 
     /// Look a command up by its name in code, e.g. "Reject".
@@ -129,6 +139,7 @@ impl Command {
     /// Ctrl+Z even when Shift is also held, so Ctrl+Shift+Z has to be
     /// checked before it.
     pub const KEYBOARD_ORDER: &[Command] = &[
+        Command::Unstack,
         Command::ShowAll,
         Command::ShowUndecided,
         Command::ShowPicks,
@@ -146,6 +157,8 @@ impl Command {
         Command::FirstUndecided,
         Command::Darktable,
         Command::FaceStrip,
+        Command::StackSelection,
+        Command::Stacking,
         Command::Quit,
         Command::Open,
         Command::Undo,
@@ -177,6 +190,8 @@ impl Command {
         Command::Folders,
         Command::Summary,
         Command::Eyes,
+        Command::ToggleStack,
+        Command::Winner,
     ];
 
     pub fn label(self) -> &'static str {
@@ -229,6 +244,11 @@ impl Command {
             Command::Darktable => "Open in darktable",
             Command::Eyes => "Zoom to the Eyes (Again: the Next Face)",
             Command::FaceStrip => "Face Close-Ups",
+            Command::StackSelection => "Stack the Selection",
+            Command::Unstack => "Unstack",
+            Command::ToggleStack => "Open Out or Close Up the Stack",
+            Command::Stacking => "How Frames Are Stacked",
+            Command::Winner => "Winner: Pick It, Reject the Rest",
         }
     }
 
@@ -287,6 +307,12 @@ impl Command {
             Command::Darktable => s(CMD, Key::E),
             Command::Eyes => s(Modifiers::NONE, Key::E),
             Command::FaceStrip => s(Modifiers::SHIFT, Key::E),
+            // Lightroom's Ctrl+G groups into a stack, and G-ish opens it.
+            Command::StackSelection => s(CMD, Key::G),
+            Command::Unstack => s(CMD_SHIFT, Key::G),
+            Command::ToggleStack => s(Modifiers::NONE, Key::G),
+            Command::Stacking => s(Modifiers::SHIFT, Key::G),
+            Command::Winner => s(Modifiers::NONE, Key::W),
         }
     }
 

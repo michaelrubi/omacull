@@ -3,7 +3,7 @@
 What's planned, in the order we plan to do it. [DESIGN.md](DESIGN.md)
 covers the scope and architecture.
 
-Status: M0 done on 2026-10-04 (scoped the same day). M1 to M5 built the
+Status: M0 done on 2026-10-04 (scoped the same day). M1 to M6 built the
 same day, waiting to be tried on a real shoot.
 
 Each milestone ends with something Michael can use on a real shoot. M1 is
@@ -116,7 +116,11 @@ its face. How it works is in DESIGN.md.
 - Face close-ups strip beside the loupe (optional panel).
 - Adds the `omacull-ai` crate, following Omapix's ONNX Runtime approach.
 
-## M6. Stacks
+## M6. Stacks (built, to be tried on a real shoot)
+
+In and tested headless; how stacks are made and shown is in DESIGN.md.
+The gaps (2 s by time, 30 s by time and look) and how alike frames must
+look want trying on real bursts.
 
 - A stack is a set of frames culled together: enter it in survey, pick a
   winner, reject the rest in one key.

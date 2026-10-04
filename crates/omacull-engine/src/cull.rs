@@ -4,12 +4,18 @@
 //! This is only the model. Marks reach the sidecars through
 //! [`crate::disk::Disk`], which the app hands every [`Change`].
 
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
+use crate::image::Image;
+use crate::raw::RawFile;
 use crate::sidecar::{self, REJECT};
+use crate::stacks::{self, Signature, Stacking};
 
 /// The raws a folder is culled for. ARW only until other cameras are tried.
 const RAW_EXTENSIONS: &[&str] = &["arw"];
@@ -20,10 +26,20 @@ pub type Rating = i32;
 
 pub const PICK: Rating = 1;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     pub path: PathBuf,
     pub rating: Rating,
+    /// When it was taken, in seconds, for stacking by time.
+    pub captured: Option<f64>,
+    /// What it looks like, roughly, for stacking by look.
+    pub signature: Option<Signature>,
+}
+
+impl Frame {
+    pub fn new(path: PathBuf, rating: Rating) -> Self {
+        Self { path, rating, captured: None, signature: None }
+    }
 }
 
 /// Which frames the filmstrip shows and stepping visits.
@@ -103,10 +119,20 @@ pub struct Cull {
     filter: Filter,
     /// 1 or -1: the way the cursor last moved, for prefetching.
     direction: isize,
-    undo: Vec<Change>,
-    redo: Vec<Change>,
+    /// Each step is one or more changes, undone together.
+    undo: Vec<Vec<Change>>,
+    redo: Vec<Vec<Change>>,
     /// Frames picked out in the filmstrip, for compare and survey.
     selected: BTreeSet<usize>,
+    stacking: Stacking,
+    /// The stacks made by hand, each in order.
+    manual: Vec<Vec<usize>>,
+    /// The stacks as the setting makes them, in order.
+    stacks: Vec<Vec<usize>>,
+    /// Which stack each frame is in.
+    stack_of: Vec<Option<usize>>,
+    /// Stacks opened out in the filmstrip; the rest show one frame.
+    expanded: BTreeSet<usize>,
 }
 
 pub(crate) fn is_raw(path: &Path) -> bool {
@@ -132,26 +158,46 @@ impl Cull {
             return Err(io::Error::new(ErrorKind::NotFound, format!("no raws in {}", dir.display())));
         }
         paths.sort();
-        let mut problems = Vec::new();
-        let frames = paths
-            .into_iter()
+        // Each raw's mark, and its capture time and look for stacking: a
+        // few small reads each, so on every core.
+        let read: Vec<(Frame, Option<String>)> = paths
+            .into_par_iter()
             .map(|path| {
-                let rating = match sidecar::read(&path) {
-                    Ok(rating) => rating.unwrap_or(0).clamp(REJECT, 5),
-                    Err(e) => {
-                        problems.push(format!("{}: {e}", sidecar::path_for(&path).display()));
-                        0
-                    }
+                let (rating, problem) = match sidecar::read(&path) {
+                    Ok(rating) => (rating.unwrap_or(0).clamp(REJECT, 5), None),
+                    Err(e) => (0, Some(format!("{}: {e}", sidecar::path_for(&path).display()))),
                 };
-                Frame { path, rating }
+                let raw = RawFile::open(&path).ok();
+                let captured = raw.as_ref().and_then(|r| r.captured.as_deref()).and_then(stacks::seconds);
+                let signature = raw.as_ref().and_then(|r| {
+                    let jpeg = r.read(r.thumbnail()?).ok()?;
+                    Some(Signature::of(&Image::decode_jpeg(&jpeg).ok()?))
+                });
+                (Frame { path, rating, captured, signature }, problem)
             })
             .collect();
-        Ok((Self::new(dir.to_path_buf(), frames), problems))
+        let (frames, problems): (Vec<Frame>, Vec<Option<String>>) = read.into_iter().unzip();
+        Ok((Self::new(dir.to_path_buf(), frames), problems.into_iter().flatten().collect()))
     }
 
     pub fn new(dir: PathBuf, frames: Vec<Frame>) -> Self {
         let (undo, redo, selected) = (Vec::new(), Vec::new(), BTreeSet::new());
-        Self { dir, frames, current: 0, filter: Filter::All, direction: 1, undo, redo, selected }
+        let stack_of = vec![None; frames.len()];
+        Self {
+            dir,
+            frames,
+            current: 0,
+            filter: Filter::All,
+            direction: 1,
+            undo,
+            redo,
+            selected,
+            stacking: Stacking::Off,
+            manual: Vec::new(),
+            stacks: Vec::new(),
+            stack_of,
+            expanded: BTreeSet::new(),
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -182,7 +228,24 @@ impl Cull {
     /// frame, which stays until the cursor leaves it even if a mark took it
     /// out of the filter.
     pub fn shown(&self, index: usize) -> bool {
-        index == self.current || self.matches(index)
+        index == self.current || self.visible(index)
+    }
+
+    /// What the filter lets through, and in a collapsed stack only the
+    /// frame that stands for it.
+    fn visible(&self, index: usize) -> bool {
+        self.matches(index)
+            && match self.stack_of[index] {
+                Some(stack) if !self.expanded.contains(&stack) => self.representative(stack) == Some(index),
+                _ => true,
+            }
+    }
+
+    /// The frame a collapsed stack shows: its best-rated frame the filter
+    /// lets through, the first of equals; none if it lets none through.
+    pub fn representative(&self, stack: usize) -> Option<usize> {
+        let members = self.stacks.get(stack)?;
+        members.iter().copied().filter(|&i| self.matches(i)).max_by_key(|&i| (self.frames[i].rating, Reverse(i)))
     }
 
     /// Whether the filter lets a frame through.
@@ -198,7 +261,7 @@ impl Cull {
     fn onward(&self, from: usize, direction: isize) -> impl Iterator<Item = usize> + '_ {
         let indices: Box<dyn Iterator<Item = usize>> =
             if direction > 0 { Box::new(from + 1..self.frames.len()) } else { Box::new((0..from).rev()) };
-        indices.filter(|&i| self.matches(i))
+        indices.filter(|&i| self.visible(i))
     }
 
     /// The next `n` frames stepping would visit, the way the cursor last
@@ -221,8 +284,8 @@ impl Cull {
         let to = match step {
             Step::Next => self.onward(self.current, 1).next(),
             Step::Previous => self.onward(self.current, -1).next(),
-            Step::First => (0..self.frames.len()).find(|&i| self.matches(i)),
-            Step::Last => (0..self.frames.len()).rev().find(|&i| self.matches(i)),
+            Step::First => (0..self.frames.len()).find(|&i| self.visible(i)),
+            Step::Last => (0..self.frames.len()).rev().find(|&i| self.visible(i)),
         };
         let moved = to.is_some_and(|to| to != self.current);
         if let Some(to) = to {
@@ -298,9 +361,20 @@ impl Cull {
     /// Mark the current frame. None if it already had that mark.
     pub fn mark(&mut self, rating: Rating) -> Option<Change> {
         let change = self.set(self.current, rating)?;
-        self.undo.push(change);
+        self.undo.push(vec![change]);
         self.redo.clear();
         Some(change)
+    }
+
+    /// Mark several frames at once, undone as one step. Returns what
+    /// changed.
+    pub fn mark_many(&mut self, marks: &[(usize, Rating)]) -> Vec<Change> {
+        let changes: Vec<Change> = marks.iter().filter_map(|&(index, rating)| self.set(index, rating)).collect();
+        if !changes.is_empty() {
+            self.undo.push(changes.clone());
+            self.redo.clear();
+        }
+        changes
     }
 
     fn set(&mut self, index: usize, rating: Rating) -> Option<Change> {
@@ -309,21 +383,35 @@ impl Cull {
         (was != rating).then_some(Change { index, was, now: rating })
     }
 
-    /// Take back the last mark, going to its frame to show what changed.
-    pub fn undo(&mut self) -> Option<Change> {
-        let change = self.undo.pop()?;
-        self.redo.push(change);
-        self.go_to(change.index);
-        let was = std::mem::replace(&mut self.frames[change.index].rating, change.was);
-        Some(Change { index: change.index, was, now: change.was })
+    /// Take back the last step, going to its (first) frame to show what
+    /// changed. Returns the changes made, none if there was nothing to undo.
+    pub fn undo(&mut self) -> Vec<Change> {
+        let Some(step) = self.undo.pop() else { return Vec::new() };
+        self.go_to(step[0].index);
+        let done = step
+            .iter()
+            .rev()
+            .map(|c| {
+                let was = std::mem::replace(&mut self.frames[c.index].rating, c.was);
+                Change { index: c.index, was, now: c.was }
+            })
+            .collect();
+        self.redo.push(step);
+        done
     }
 
-    pub fn redo(&mut self) -> Option<Change> {
-        let change = self.redo.pop()?;
-        self.undo.push(change);
-        self.go_to(change.index);
-        let was = std::mem::replace(&mut self.frames[change.index].rating, change.now);
-        Some(Change { index: change.index, was, now: change.now })
+    pub fn redo(&mut self) -> Vec<Change> {
+        let Some(step) = self.redo.pop() else { return Vec::new() };
+        self.go_to(step[0].index);
+        let done = step
+            .iter()
+            .map(|c| {
+                let was = std::mem::replace(&mut self.frames[c.index].rating, c.now);
+                Change { index: c.index, was, now: c.now }
+            })
+            .collect();
+        self.undo.push(step);
+        done
     }
 
     pub fn can_undo(&self) -> bool {
@@ -339,6 +427,110 @@ impl Cull {
         if let Some(frame) = self.frames.iter_mut().find(|f| f.path == path) {
             frame.rating = rating;
         }
+    }
+
+    pub fn stacking(&self) -> Stacking {
+        self.stacking
+    }
+
+    /// Stack the folder another way.
+    pub fn set_stacking(&mut self, stacking: Stacking) {
+        self.stacking = stacking;
+        self.restack();
+    }
+
+    /// The stacks made by hand.
+    pub fn manual_stacks(&self) -> &[Vec<usize>] {
+        &self.manual
+    }
+
+    /// The stacks made by hand, as remembered.
+    pub fn set_manual_stacks(&mut self, stacks: Vec<Vec<usize>>) {
+        let count = self.frames.len();
+        self.manual = stacks
+            .into_iter()
+            .map(|mut s| {
+                s.retain(|&i| i < count);
+                s.sort();
+                s.dedup();
+                s
+            })
+            .filter(|s| s.len() > 1)
+            .collect();
+        self.restack();
+    }
+
+    /// Ctrl+G: stack the selected frames by hand (taking them out of other
+    /// stacks), which switches stacking to by hand. False with fewer than
+    /// two selected.
+    pub fn stack_selection(&mut self) -> bool {
+        let selected = self.selection();
+        if selected.len() < 2 {
+            return false;
+        }
+        for stack in &mut self.manual {
+            stack.retain(|i| !selected.contains(i));
+        }
+        self.manual.retain(|s| s.len() > 1);
+        self.manual.push(selected);
+        self.manual.sort();
+        self.selected.clear();
+        self.set_stacking(Stacking::Manual);
+        true
+    }
+
+    /// Take the current frame's stack apart, if it was made by hand.
+    pub fn unstack(&mut self) -> bool {
+        let before = self.manual.len();
+        let current = self.current;
+        self.manual.retain(|s| !s.contains(&current));
+        let done = self.manual.len() != before;
+        self.restack();
+        done
+    }
+
+    fn restack(&mut self) {
+        self.stacks = match self.stacking {
+            Stacking::Off => Vec::new(),
+            Stacking::Manual => self.manual.clone(),
+            auto => {
+                let frames: Vec<_> = self.frames.iter().map(|f| (f.captured, f.signature.as_ref())).collect();
+                stacks::group(&frames, auto)
+            }
+        };
+        self.stack_of = vec![None; self.frames.len()];
+        for (s, stack) in self.stacks.iter().enumerate() {
+            for &i in stack {
+                self.stack_of[i] = Some(s);
+            }
+        }
+        self.expanded.clear();
+    }
+
+    /// The stack a frame is in, if any.
+    pub fn stack(&self, index: usize) -> Option<&[usize]> {
+        self.stack_of.get(index).copied().flatten().map(|s| self.stacks[s].as_slice())
+    }
+
+    pub fn stack_count(&self) -> usize {
+        self.stacks.len()
+    }
+
+    /// Whether the stack a frame is in shows all its frames.
+    pub fn expanded(&self, index: usize) -> bool {
+        self.stack_of.get(index).copied().flatten().is_some_and(|s| self.expanded.contains(&s))
+    }
+
+    /// Open out the current frame's stack, or close it up, going to the
+    /// frame that stands for it. False if it isn't in one.
+    pub fn toggle_stack(&mut self) -> bool {
+        let Some(stack) = self.stack_of[self.current] else { return false };
+        if !self.expanded.remove(&stack) {
+            self.expanded.insert(stack);
+        } else if let Some(to) = self.representative(stack) {
+            self.go_to(to);
+        }
+        true
     }
 
     /// The first frame not yet decided, from the start.
@@ -371,7 +563,7 @@ mod tests {
         let frames = ratings
             .iter()
             .enumerate()
-            .map(|(i, &rating)| Frame { path: PathBuf::from(format!("/shoot/DSC{i:05}.ARW")), rating })
+            .map(|(i, &rating)| Frame::new(PathBuf::from(format!("/shoot/DSC{i:05}.ARW")), rating))
             .collect();
         Cull::new(PathBuf::from("/shoot"), frames)
     }
@@ -427,16 +619,16 @@ mod tests {
         assert_eq!(c.frames().iter().map(|f| f.rating).collect::<Vec<_>>(), [PICK, 3, 0]);
 
         c.step(Step::Last);
-        assert_eq!(c.undo(), Some(Change { index: 1, was: 3, now: REJECT }));
+        assert_eq!(c.undo(), [Change { index: 1, was: 3, now: REJECT }]);
         assert_eq!(c.current(), 1, "undo goes to the frame it changed");
-        assert_eq!(c.undo(), Some(Change { index: 1, was: REJECT, now: 0 }));
-        assert_eq!(c.undo(), Some(Change { index: 0, was: PICK, now: 0 }));
+        assert_eq!(c.undo(), [Change { index: 1, was: REJECT, now: 0 }]);
+        assert_eq!(c.undo(), [Change { index: 0, was: PICK, now: 0 }]);
         assert_eq!(c.current(), 0);
-        assert_eq!(c.undo(), None);
+        assert_eq!(c.undo(), []);
         assert!(!c.can_undo());
 
-        assert_eq!(c.redo(), Some(Change { index: 0, was: 0, now: PICK }));
-        assert_eq!(c.redo(), Some(Change { index: 1, was: 0, now: REJECT }));
+        assert_eq!(c.redo(), [Change { index: 0, was: 0, now: PICK }]);
+        assert_eq!(c.redo(), [Change { index: 1, was: 0, now: REJECT }]);
         assert_eq!(c.current(), 1);
         // A new mark drops what's left to redo.
         c.mark(5);
@@ -537,6 +729,94 @@ mod tests {
         assert_eq!(c.candidate(0, 1, &[0, 1, 2]), Some(3));
         assert_eq!(c.candidate(4, 1, &[]), None);
         assert_eq!(c.candidate(4, -1, &[3]), Some(2));
+    }
+
+    /// Frames taken at these seconds past noon, all of one scene.
+    fn burst(times: &[f64]) -> Cull {
+        let mut c = cull(&vec![0; times.len()]);
+        for (frame, &t) in c.frames.iter_mut().zip(times) {
+            frame.captured = Some(t);
+        }
+        c
+    }
+
+    #[test]
+    fn collapsed_stacks_show_one_frame_the_best_rated() {
+        let mut c = burst(&[0.0, 0.1, 0.2, 10.0, 20.0, 20.3]);
+        c.set_stacking(Stacking::Time);
+        assert_eq!(c.stack_count(), 2);
+        assert_eq!(c.shown_indices(), [0, 3, 4]);
+        assert!(c.step(Step::Next));
+        assert_eq!(c.current(), 3, "stepping goes stack to stack");
+        // A rating makes a frame the one that stands for its stack.
+        c.go_to(1);
+        c.mark(4);
+        c.go_to(3);
+        assert_eq!(c.shown_indices(), [1, 3, 4]);
+        c.set_filter(Filter::Undecided);
+        assert_eq!(c.shown_indices(), [0, 3, 4], "the best the filter lets through");
+        c.set_filter(Filter::All);
+
+        c.go_to(1);
+        assert!(c.toggle_stack());
+        assert_eq!(c.shown_indices(), [0, 1, 2, 3, 4]);
+        assert!(c.expanded(1));
+        c.go_to(2);
+        assert!(c.toggle_stack());
+        assert_eq!(c.current(), 1, "closing it goes to the frame that stands for it");
+        c.go_to(3);
+        assert!(!c.toggle_stack(), "not in a stack");
+        c.set_stacking(Stacking::Off);
+        assert_eq!(c.shown_indices().len(), 6);
+    }
+
+    #[test]
+    fn stacks_are_made_by_hand_from_the_selection() {
+        let mut c = cull(&[0; 6]);
+        c.toggle_selected(1);
+        c.toggle_selected(4);
+        assert!(c.stack_selection());
+        assert_eq!((c.stacking(), c.manual_stacks()), (Stacking::Manual, &[vec![0, 1, 4]][..]));
+        assert!(c.selection().is_empty());
+        assert_eq!(c.shown_indices(), [0, 2, 3, 4, 5], "the current frame stays");
+        c.go_to(0);
+        assert_eq!(c.shown_indices(), [0, 2, 3, 5]);
+        assert!(!c.stack_selection(), "nothing selected");
+        c.go_to(0);
+        assert!(c.unstack());
+        assert!(c.manual_stacks().is_empty());
+        c.set_manual_stacks(vec![vec![5, 2, 2], vec![9, 3], vec![1]]);
+        assert_eq!(c.manual_stacks(), [vec![2, 5]], "tidied: in order, in range, two or more");
+    }
+
+    #[test]
+    fn marking_many_is_one_step_to_undo() {
+        let mut c = cull(&[0, 0, 0, 0]);
+        c.go_to(2);
+        let changes = c.mark_many(&[(2, PICK), (0, REJECT), (1, REJECT), (3, 0)]);
+        assert_eq!(changes.len(), 3, "the last was already unmarked");
+        assert_eq!(c.frames().iter().map(|f| f.rating).collect::<Vec<_>>(), [REJECT, REJECT, PICK, 0]);
+        c.go_to(3);
+        assert_eq!(c.undo().len(), 3);
+        assert_eq!(c.current(), 2);
+        assert!(c.frames().iter().all(|f| f.rating == 0));
+        assert_eq!(c.redo().len(), 3);
+        assert_eq!(c.frames()[2].rating, PICK);
+    }
+
+    #[test]
+    fn opening_reads_capture_times_for_stacking() {
+        let folder = Folder::new("cull-times");
+        for (i, (time, colour)) in [("12:00:00", 40), ("12:00:00", 40), ("12:00:05", 220)].iter().enumerate() {
+            let captured: &'static str = Box::leak(format!("2026:10:04 {time}").into_boxed_str());
+            let thumbnail = crate::testing::jpeg(16, 12, [*colour; 3]);
+            Arw { captured: (captured, "100"), thumbnail, ..Arw::default() }.write(&folder.raw(i + 1));
+        }
+        let (mut c, _) = Cull::open(&folder.0).unwrap();
+        assert!(c.frames().iter().all(|f| f.captured.is_some() && f.signature.is_some()));
+        c.set_stacking(Stacking::Time);
+        assert_eq!(c.stack(0), Some(&[0, 1][..]));
+        assert_eq!(c.stack(2), None);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use omacull_engine::cull::Filter;
+use omacull_engine::stacks::Stacking;
 
 const MAX_RECENT: usize = 10;
 /// Folders whose place is remembered, the most recently left first.
@@ -19,6 +20,9 @@ pub struct Place {
     pub frame: String,
     #[serde(default)]
     pub filter: Filter,
+    /// The stacks made by hand, each as its raws' names.
+    #[serde(default)]
+    pub stacks: Vec<Vec<String>>,
 }
 
 /// What the loupe shows over a frame.
@@ -51,6 +55,9 @@ pub struct State {
     /// The folder tree beside the loupe.
     #[serde(default)]
     pub folders: bool,
+    /// How frames are stacked.
+    #[serde(default)]
+    pub stacking: Stacking,
     /// Most recent first.
     #[serde(default)]
     pub recent: Vec<PathBuf>,
@@ -115,6 +122,11 @@ impl State {
         self.save();
     }
 
+    pub fn set_stacking(&mut self, stacking: Stacking) {
+        self.stacking = stacking;
+        self.save();
+    }
+
     pub fn set_folders(&mut self, on: bool) {
         self.folders = on;
         self.save();
@@ -165,7 +177,9 @@ mod tests {
 
         // Where each folder was left, and the filter it had.
         let mut state = loaded;
-        let place = |dir: &Path, frame: &str, filter| Place { dir: dir.to_path_buf(), frame: frame.into(), filter };
+        let place = |dir: &Path, frame: &str, filter| {
+            Place { dir: dir.to_path_buf(), frame: frame.into(), filter, stacks: vec![] }
+        };
         state.remember(place(&a, "DSC00012.ARW", Filter::AtLeast(3)));
         state.remember(place(&b, "DSC00002.ARW", Filter::All));
         state.remember(place(&a, "DSC00013.ARW", Filter::Rejects));

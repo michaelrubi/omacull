@@ -2,7 +2,7 @@
 
 Omacull is a fast, keyboard-first photo culler for Omarchy: a folder of raws in, XMP ratings out, then on to darktable. It is the first stage of the workflow Omapix (`~/dev/omapix`) finishes.
 
-**Status:** M5 built: M1's culling (step, mark, filter, undo, sidecars, decision log), M2's inspection (100% zoom on a full development of the raw, histogram, clipping, focus peaking, focus point, shooting settings, colour management), compare and survey with multi-select, M4's folder tree, cull summary, darktable handoff and per-folder places, and M5's face and eye detection (`omacull-ai`, YuNet on the system's ONNX Runtime) with zoom to the eyes and face close-ups. Waiting on a hand test with a real shoot. Read [docs/DESIGN.md](docs/DESIGN.md) for scope and architecture and [docs/ROADMAP.md](docs/ROADMAP.md) for the milestones. M6 is next.
+**Status:** M6 built: M1's culling (step, mark, filter, undo, sidecars, decision log), M2's inspection (100% zoom on a full development of the raw, histogram, clipping, focus peaking, focus point, shooting settings, colour management), compare and survey with multi-select, M4's folder tree, cull summary, darktable handoff and per-folder places, and M5's face and eye detection (`omacull-ai`, YuNet on the system's ONNX Runtime) with zoom to the eyes and face close-ups, and M6's stacks (by hand, by time, or by time and look) with a winner chosen in one key. Waiting on a hand test with a real shoot. Read [docs/DESIGN.md](docs/DESIGN.md) for scope and architecture and [docs/ROADMAP.md](docs/ROADMAP.md) for the milestones. M7 is next.
 
 ## Principles
 
