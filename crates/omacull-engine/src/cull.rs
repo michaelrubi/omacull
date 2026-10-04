@@ -4,6 +4,7 @@
 //! This is only the model. Marks reach the sidecars through
 //! [`crate::disk::Disk`], which the app hands every [`Change`].
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -102,6 +103,8 @@ pub struct Cull {
     direction: isize,
     undo: Vec<Change>,
     redo: Vec<Change>,
+    /// Frames picked out in the filmstrip, for compare and survey.
+    selected: BTreeSet<usize>,
 }
 
 fn is_raw(path: &Path) -> bool {
@@ -145,7 +148,8 @@ impl Cull {
     }
 
     pub fn new(dir: PathBuf, frames: Vec<Frame>) -> Self {
-        Self { dir, frames, current: 0, filter: Filter::All, direction: 1, undo: Vec::new(), redo: Vec::new() }
+        let (undo, redo, selected) = (Vec::new(), Vec::new(), BTreeSet::new());
+        Self { dir, frames, current: 0, filter: Filter::All, direction: 1, undo, redo, selected }
     }
 
     pub fn dir(&self) -> &Path {
@@ -223,6 +227,58 @@ impl Cull {
             self.go_to(to);
         }
         moved
+    }
+
+    /// The next frame the filter lets through after `from`, going
+    /// `direction`, that isn't in `skip`: what comes into compare or survey
+    /// when a frame leaves it.
+    pub fn candidate(&self, from: usize, direction: isize, skip: &[usize]) -> Option<usize> {
+        self.onward(from, direction).find(|i| !skip.contains(i))
+    }
+
+    /// The selected frames, in order.
+    pub fn selection(&self) -> Vec<usize> {
+        self.selected.iter().copied().collect()
+    }
+
+    pub fn is_selected(&self, index: usize) -> bool {
+        self.selected.contains(&index)
+    }
+
+    /// Ctrl+click: add a frame to the selection, or take it out, and go to
+    /// it. The current frame is in the selection it starts.
+    pub fn toggle_selected(&mut self, index: usize) {
+        if self.selected.is_empty() {
+            self.selected.insert(self.current);
+        }
+        if !self.selected.remove(&index) {
+            self.selected.insert(index);
+        }
+        self.go_to(index);
+    }
+
+    /// Shift+click: select the shown frames from the current one to `index`,
+    /// and go there.
+    pub fn select_to(&mut self, index: usize) {
+        let (from, to) = (self.current.min(index), self.current.max(index));
+        self.selected = (from..=to).filter(|&i| self.shown(i)).collect();
+        self.go_to(index);
+    }
+
+    /// Shift+arrow: step, taking the frames passed into the selection.
+    pub fn extend(&mut self, step: Step) -> bool {
+        self.selected.insert(self.current);
+        let moved = self.step(step);
+        self.selected.insert(self.current);
+        moved
+    }
+
+    pub fn select_all(&mut self) {
+        self.selected = self.shown_indices().into_iter().collect();
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
     }
 
     /// Show only what `filter` lets through. If that leaves out the current
@@ -445,6 +501,31 @@ mod tests {
         assert_eq!(c.neighbours(3, 1), [3, 2, 1, 5]);
         c.set_filter(Filter::AtLeast(PICK));
         assert_eq!(c.neighbours(3, 1), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn frames_are_selected_by_ctrl_shift_and_arrows() {
+        let mut c = cull(&[0, PICK, 0, REJECT, 0]);
+        c.toggle_selected(2);
+        assert_eq!((c.selection(), c.current()), (vec![0, 2], 2), "starting from the current frame");
+        c.toggle_selected(0);
+        assert_eq!((c.selection(), c.current()), (vec![2], 0));
+        c.set_filter(Filter::Undecided);
+        c.select_to(4);
+        assert_eq!(c.selection(), [0, 2, 4], "only shown frames");
+        c.clear_selection();
+        c.extend(Step::Previous);
+        assert_eq!((c.selection(), c.current()), (vec![2, 4], 2));
+        c.select_all();
+        assert_eq!(c.selection(), [0, 2, 4]);
+    }
+
+    #[test]
+    fn candidates_skip_whats_already_on_screen() {
+        let c = cull(&[0, REJECT, 0, 0, 0]);
+        assert_eq!(c.candidate(0, 1, &[0, 1, 2]), Some(3));
+        assert_eq!(c.candidate(4, 1, &[]), None);
+        assert_eq!(c.candidate(4, -1, &[3]), Some(2));
     }
 
     #[test]

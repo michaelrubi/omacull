@@ -3,7 +3,7 @@
 What's planned, in the order we plan to do it. [DESIGN.md](DESIGN.md)
 covers the scope and architecture.
 
-Status: M0 done on 2026-10-04 (scoped the same day). M1 and M2 built the
+Status: M0 done on 2026-10-04 (scoped the same day). M1 to M3 built the
 same day, waiting to be tried on a real shoot.
 
 Each milestone ends with something Michael can use on a real shoot. M1 is
@@ -81,7 +81,10 @@ monitor. How it's built is in DESIGN.md.
 - AF point overlay, and "zoom to AF point".
 - Colour-managed display through the monitor profile.
 
-## M3. Compare and survey
+## M3. Compare and survey (built, to be tried on a real shoot)
+
+In and tested headless and on a synthetic shoot; the keys and how
+compare and survey behave are in DESIGN.md.
 
 - Multi-select in the filmstrip.
 - Compare: two frames, zoom and pan locked together, with a key to unlock.

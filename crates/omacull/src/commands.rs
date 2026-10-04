@@ -40,6 +40,16 @@ pub enum Command {
     Clipping,
     Peaking,
     FocusPoint,
+    Compare,
+    Survey,
+    Back,
+    Lock,
+    NextPane,
+    KnockOut,
+    SelectPrevious,
+    SelectNext,
+    SelectAll,
+    SelectNone,
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -86,6 +96,16 @@ impl Command {
         Command::Clipping,
         Command::Peaking,
         Command::FocusPoint,
+        Command::Compare,
+        Command::Survey,
+        Command::Back,
+        Command::Lock,
+        Command::NextPane,
+        Command::KnockOut,
+        Command::SelectPrevious,
+        Command::SelectNext,
+        Command::SelectAll,
+        Command::SelectNone,
     ];
 
     /// Look a command up by its name in code, e.g. "Reject".
@@ -107,6 +127,10 @@ impl Command {
         Command::ShowRejects,
         Command::Redo,
         Command::ZoomToFocus,
+        Command::SelectPrevious,
+        Command::SelectNext,
+        Command::SelectAll,
+        Command::SelectNone,
         Command::Quit,
         Command::Open,
         Command::Undo,
@@ -129,6 +153,12 @@ impl Command {
         Command::Clipping,
         Command::Peaking,
         Command::FocusPoint,
+        Command::Compare,
+        Command::Survey,
+        Command::Back,
+        Command::Lock,
+        Command::NextPane,
+        Command::KnockOut,
     ];
 
     pub fn label(self) -> &'static str {
@@ -165,6 +195,16 @@ impl Command {
             Command::Clipping => "Highlight and Shadow Clipping",
             Command::Peaking => "Focus Peaking",
             Command::FocusPoint => "Focus Point",
+            Command::Compare => "Compare",
+            Command::Survey => "Survey",
+            Command::Back => "Back to the Loupe",
+            Command::Lock => "Lock Zoom Together",
+            Command::NextPane => "Next Pane",
+            Command::KnockOut => "Knock Out of Survey",
+            Command::SelectPrevious => "Select the Previous Frame Too",
+            Command::SelectNext => "Select the Next Frame Too",
+            Command::SelectAll => "Select All",
+            Command::SelectNone => "Select None",
         }
     }
 
@@ -205,6 +245,17 @@ impl Command {
             Command::Clipping => s(Modifiers::NONE, Key::J),
             Command::Peaking => s(Modifiers::NONE, Key::S),
             Command::FocusPoint => s(Modifiers::NONE, Key::F),
+            // Lightroom's C, N and / (out of the survey); L for the lock.
+            Command::Compare => s(Modifiers::NONE, Key::C),
+            Command::Survey => s(Modifiers::NONE, Key::N),
+            Command::Back => s(Modifiers::NONE, Key::Escape),
+            Command::Lock => s(Modifiers::NONE, Key::L),
+            Command::NextPane => s(Modifiers::NONE, Key::Tab),
+            Command::KnockOut => s(Modifiers::NONE, Key::Slash),
+            Command::SelectPrevious => s(Modifiers::SHIFT, Key::ArrowLeft),
+            Command::SelectNext => s(Modifiers::SHIFT, Key::ArrowRight),
+            Command::SelectAll => s(CMD, Key::A),
+            Command::SelectNone => s(CMD, Key::D),
         }
     }
 

@@ -91,6 +91,29 @@ The mouse does the same as Z on the loupe: click to toggle, press and hold
 for a look, drag to pan; the wheel pans. Which overlays are on is
 remembered. The status bar has a switch for each, its key in the tooltip.
 
+M3's keys: C compares two frames, N surveys several, Escape goes back to
+the loupe (and then clears the selection). Ctrl+click and Shift+click in
+the filmstrip select, as do Shift+arrows, Ctrl+A and Ctrl+D. In both views
+the current frame is the active pane, outlined, which marks and the zoom
+keys go to; Tab or a click makes another active.
+
+- **Compare** takes the first two selected frames, or the current one and
+  the next. Rejecting a side (or / to dismiss it unmarked) brings in the
+  next candidate after both; the arrows change the active side's frame; a
+  plain click in the filmstrip puts that frame on the active side.
+- **Survey** takes the selection, or the current frame and the next three.
+  / knocks the active frame out, without marking it, until one is left,
+  which opens in the loupe; the arrows move between panes.
+- **Layout:** frames go in rows, each row's frames the same height and
+  filling its width, with as many rows as leave the smallest frame
+  largest, so landscape frames stay big and portraits sit side by side.
+- **Zoom** works in every pane, locked together by default (L unlocks):
+  the same spot in each frame, or with Shift+Z each frame's own focus
+  point. Every M2 overlay works in every pane. Full developments are made
+  for every frame on screen, one at a time.
+- **The decision log** records the view (`compare`, `survey`) and the
+  other frames on screen in `compared`.
+
 - Sidecars are named the way darktable names them: `DSC01234.ARW.xmp`.
 - No sidecar yet: write a minimal one holding just the rating.
 - Sidecar exists: change the rating field and nothing else. darktable's

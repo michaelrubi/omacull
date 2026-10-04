@@ -3,6 +3,7 @@ mod commands;
 mod hotkeys;
 mod loupe;
 mod monitor;
+mod panes;
 mod shoot;
 mod state;
 mod theme;

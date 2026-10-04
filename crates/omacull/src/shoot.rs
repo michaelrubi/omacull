@@ -1,5 +1,6 @@
-//! An open folder on screen: the loupe and the filmstrip, and the decoded
-//! frames behind them, kept ahead of the cursor.
+//! An open folder on screen: the frames in their panes (the loupe, compare
+//! or survey) and the filmstrip, and the decoded frames behind them, kept
+//! ahead of the cursor.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -17,6 +18,7 @@ use omacull_engine::raw::Info;
 use omacull_engine::sidecar::REJECT;
 
 use crate::loupe::{self, Bake, View};
+use crate::panes::{self, Mode, Pane};
 use crate::state::Show;
 use crate::theme::Theme;
 
@@ -92,10 +94,22 @@ pub struct Shoot {
     /// The frame on screen, and since when.
     seen: usize,
     arrived: Instant,
-    pub view: View,
-    /// The frame whose focus point the view last went to, when following
-    /// them: its preview may land after the cursor does.
-    followed: Option<usize>,
+    pub mode: Mode,
+    /// The frames on screen. The current frame's pane is the active one,
+    /// which marks and zoom keys go to.
+    pub panes: Vec<Pane>,
+    /// Compare's and survey's panes zoom and pan together.
+    pub locked: bool,
+}
+
+/// How a filmstrip click was meant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Click {
+    Plain,
+    /// Ctrl: in or out of the selection.
+    Toggle,
+    /// Shift: the selection runs to here.
+    Range,
 }
 
 /// "★★★" for three stars; a pick is one star.
@@ -120,8 +134,186 @@ impl Shoot {
             cells: Vec::new(),
             seen,
             arrived: Instant::now(),
-            view: View::default(),
-            followed: None,
+            mode: Mode::Loupe,
+            panes: vec![Pane::new(seen, View::default())],
+            locked: true,
+        }
+    }
+
+    /// Which pane is the current frame's.
+    pub fn active(&self) -> usize {
+        self.panes.iter().position(|p| p.frame == self.cull.current()).unwrap_or(0)
+    }
+
+    pub fn view(&self) -> &View {
+        &self.panes[self.active()].view
+    }
+
+    pub fn view_mut(&mut self) -> &mut View {
+        let active = self.active();
+        &mut self.panes[active].view
+    }
+
+    /// The frames on screen besides the current one, for the decision log.
+    pub fn others(&self) -> Vec<usize> {
+        let current = self.cull.current();
+        self.panes.iter().map(|p| p.frame).filter(|&f| f != current).collect()
+    }
+
+    /// When locked, the other panes take on `from`'s zoom.
+    pub fn sync(&mut self, from: usize) {
+        if !self.locked || from >= self.panes.len() {
+            return;
+        }
+        let view = self.panes[from].view.clone();
+        for (k, pane) in self.panes.iter_mut().enumerate() {
+            if k != from {
+                pane.view.follow(&view);
+                pane.followed = None;
+            }
+        }
+    }
+
+    fn enter(&mut self, mode: Mode, frames: Vec<usize>) {
+        let view = self.view().clone();
+        self.panes = frames.into_iter().map(|f| Pane::new(f, view.clone())).collect();
+        self.mode = mode;
+    }
+
+    /// Back to one frame, the current one, zoomed as it was.
+    pub fn back_to_loupe(&mut self) {
+        let view = self.view().clone();
+        self.panes = vec![Pane::new(self.cull.current(), view)];
+        self.mode = Mode::Loupe;
+    }
+
+    /// Compare two frames: the first two selected, or the current one and
+    /// the next. Again, back to the loupe. Says why not if it can't.
+    pub fn compare(&mut self) -> Result<(), &'static str> {
+        if self.mode == Mode::Compare {
+            self.back_to_loupe();
+            return Ok(());
+        }
+        let current = self.cull.current();
+        let selected = self.cull.selection();
+        let other = match selected.iter().find(|&&f| f != current) {
+            Some(&f) if selected.len() >= 2 => Some(f),
+            _ => self.cull.candidate(current, 1, &[current]).or_else(|| self.cull.candidate(current, -1, &[current])),
+        };
+        let other = other.ok_or("Nothing to compare with")?;
+        let mut frames = vec![current, other];
+        frames.sort();
+        self.enter(Mode::Compare, frames);
+        Ok(())
+    }
+
+    /// Survey the selected frames, or the current one and the next three.
+    /// Again, back to the loupe.
+    pub fn survey(&mut self) -> Result<(), &'static str> {
+        if self.mode == Mode::Survey {
+            self.back_to_loupe();
+            return Ok(());
+        }
+        let current = self.cull.current();
+        let mut frames = self.cull.selection();
+        if frames.len() < 2 {
+            frames = vec![current];
+            for direction in [1, -1] {
+                while frames.len() < 4 {
+                    let ends = (frames.iter().min().copied(), frames.iter().max().copied());
+                    let from = if direction > 0 { ends.1 } else { ends.0 }.unwrap_or(current);
+                    match self.cull.candidate(from, direction, &frames) {
+                        Some(f) => frames.push(f),
+                        None => break,
+                    }
+                }
+            }
+            frames.sort();
+        }
+        if frames.len() < 2 {
+            return Err("Nothing to survey with");
+        }
+        if !frames.contains(&current) {
+            self.cull.go_to(frames[0]);
+        }
+        self.enter(Mode::Survey, frames);
+        Ok(())
+    }
+
+    /// The active frame out of the survey, or out of compare for the next
+    /// candidate. With one left, back to the loupe on it.
+    pub fn knock_out(&mut self) {
+        let active = self.active();
+        match self.mode {
+            Mode::Loupe => {}
+            Mode::Compare => {
+                let frames: Vec<usize> = self.panes.iter().map(|p| p.frame).collect();
+                let last = *frames.iter().max().unwrap();
+                match self.cull.candidate(last, 1, &frames) {
+                    Some(next) => {
+                        self.panes[active].frame = next;
+                        self.panes[active].followed = None;
+                        self.cull.go_to(next);
+                    }
+                    None => {
+                        self.cull.go_to(frames[1 - active]);
+                        self.back_to_loupe();
+                    }
+                }
+            }
+            Mode::Survey => {
+                self.panes.remove(active);
+                let next = self.panes[active.min(self.panes.len() - 1)].frame;
+                self.cull.go_to(next);
+                if self.panes.len() == 1 {
+                    self.back_to_loupe();
+                }
+            }
+        }
+    }
+
+    /// The arrow keys away from the loupe: in survey they move between
+    /// panes; in compare they change the active pane's frame.
+    pub fn step_panes(&mut self, direction: isize) {
+        let active = self.active();
+        match self.mode {
+            Mode::Loupe => {}
+            Mode::Survey => {
+                let to = active.saturating_add_signed(direction).min(self.panes.len() - 1);
+                self.cull.go_to(self.panes[to].frame);
+            }
+            Mode::Compare => {
+                let frames: Vec<usize> = self.panes.iter().map(|p| p.frame).collect();
+                if let Some(next) = self.cull.candidate(frames[active], direction, &frames) {
+                    self.panes[active].frame = next;
+                    self.panes[active].followed = None;
+                    self.cull.go_to(next);
+                }
+            }
+        }
+    }
+
+    /// Tab: the next pane is the active one.
+    pub fn next_pane(&mut self) {
+        let next = (self.active() + 1) % self.panes.len();
+        self.cull.go_to(self.panes[next].frame);
+    }
+
+    /// A frame clicked in the filmstrip.
+    pub fn clicked(&mut self, index: usize, click: Click) {
+        match click {
+            Click::Toggle => self.cull.toggle_selected(index),
+            Click::Range => self.cull.select_to(index),
+            Click::Plain => {
+                self.cull.clear_selection();
+                if self.mode == Mode::Compare && !self.panes.iter().any(|p| p.frame == index) {
+                    // In compare, the clicked frame takes the active side.
+                    let active = self.active();
+                    self.panes[active].frame = index;
+                    self.panes[active].followed = None;
+                }
+                self.cull.go_to(index);
+            }
         }
     }
 
@@ -147,7 +339,11 @@ impl Shoot {
     /// The shooting settings and focus point of the current frame, once
     /// its preview is in.
     pub fn info(&self) -> Option<&Info> {
-        match self.previews.get(&self.cull.current()) {
+        self.info_of(self.cull.current())
+    }
+
+    fn info_of(&self, frame: usize) -> Option<&Info> {
+        match self.previews.get(&frame) {
             Some(Slot::Ready(shown)) => Some(&shown.decoded.info),
             _ => None,
         }
@@ -156,7 +352,11 @@ impl Shoot {
     /// The current frame's size at 100%, in points: the full-size frame's
     /// once it's developed, else what the raw says it will be.
     pub fn full_size(&self, pixels_per_point: f32) -> Vec2 {
-        let current = self.cull.current();
+        self.full_size_of(self.cull.current(), pixels_per_point)
+    }
+
+    fn full_size_of(&self, frame: usize, pixels_per_point: f32) -> Vec2 {
+        let current = frame;
         let pixels = match (self.full.get(&current), self.previews.get(&current)) {
             (Some(Slot::Ready(full)), _) => vec2(full.decoded.image.width as f32, full.decoded.image.height as f32),
             (_, Some(Slot::Ready(shown))) => match shown.decoded.info.size {
@@ -168,15 +368,19 @@ impl Shoot {
         pixels / pixels_per_point
     }
 
-    /// Where the current frame is drawn whole, in the loupe as last drawn.
+    /// Where the current frame is drawn whole, in its pane as last drawn.
     pub fn fit_rect(&self) -> Rect {
-        let current = self.cull.current();
-        let size = match (self.previews.get(&current), self.thumbnails.get(&current)) {
-            (Some(Slot::Ready(shown)), _) => shown.texture.size_vec2(),
-            (_, Some(Slot::Ready(texture))) => texture.size_vec2(),
-            _ => return self.view.area,
-        };
-        fit(size, self.view.area)
+        let area = self.view().area;
+        self.size_of(self.cull.current()).map_or(area, |size| fit(size, area))
+    }
+
+    /// A frame's shape, from its preview or its thumbnail.
+    fn size_of(&self, frame: usize) -> Option<Vec2> {
+        match (self.previews.get(&frame), self.thumbnails.get(&frame)) {
+            (Some(Slot::Ready(shown)), _) => Some(shown.texture.size_vec2()),
+            (_, Some(Slot::Ready(texture))) => Some(texture.size_vec2()),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -229,10 +433,23 @@ impl Shoot {
     pub fn update(&mut self, ctx: &egui::Context, show: Show) {
         self.dwell();
         let current = self.cull.current();
+        // The loupe's pane shows the current frame; elsewhere, a frame
+        // that isn't on screen (undo went to it) takes back to the loupe.
+        match self.mode {
+            Mode::Loupe => self.panes[0].frame = current,
+            _ if !self.panes.iter().any(|p| p.frame == current) => self.back_to_loupe(),
+            _ => {}
+        }
+        let on_screen: Vec<usize> = self.panes.iter().map(|p| p.frame).collect();
         let mut ring = vec![current];
-        ring.extend(self.cull.neighbours(AHEAD, BEHIND));
-        let mut full_ring = vec![current];
-        full_ring.extend(self.cull.neighbours(1, 1));
+        ring.extend(on_screen.iter().copied().filter(|&f| f != current));
+        ring.extend(self.cull.neighbours(AHEAD, BEHIND).into_iter().filter(|f| !on_screen.contains(f)));
+        // Full-size frames for what's on screen; in the loupe, for the
+        // neighbours too.
+        let mut full_ring = ring[..on_screen.len()].to_vec();
+        if self.mode == Mode::Loupe {
+            full_ring.extend(self.cull.neighbours(1, 1));
+        }
         let near = |i: &usize| i.abs_diff(current) <= KEEP_THUMBNAILS;
         self.previews.retain(|i, _| ring.contains(i));
         self.full.retain(|i, _| full_ring.contains(i));
@@ -272,30 +489,37 @@ impl Shoot {
             }
         }
 
-        // The overlays as they're set now, on the frame on screen; others
-        // catch up when they're stepped to. Only it keeps tiles on the GPU.
-        if let Some(Slot::Ready(shown)) = self.previews.get_mut(&current)
-            && shown.baked != bake
-        {
-            shown.texture = upload(ctx, format!("preview-{current}"), &shown.decoded, bake, whole(&shown.decoded));
-            shown.baked = bake;
+        // The overlays as they're set now, on the frames on screen; others
+        // catch up when they're stepped to. Only they keep tiles on the GPU.
+        for &frame in &on_screen {
+            if let Some(Slot::Ready(shown)) = self.previews.get_mut(&frame)
+                && shown.baked != bake
+            {
+                shown.texture = upload(ctx, format!("preview-{frame}"), &shown.decoded, bake, whole(&shown.decoded));
+                shown.baked = bake;
+            }
         }
-        for (&i, slot) in &mut self.full {
+        for (i, slot) in &mut self.full {
             if let Slot::Ready(full) = slot
-                && (i != current || full.baked != bake)
+                && (!on_screen.contains(i) || full.baked != bake)
             {
                 full.tiles.clear();
                 full.baked = bake;
             }
         }
-        if !self.view.follow_focus {
-            self.followed = None;
-        } else if self.followed != Some(current)
-            && let Some(info) = self.info()
-        {
-            let (focus, size) = (info.focus, self.full_size(ctx.pixels_per_point()));
-            self.view.arrive(focus, size);
-            self.followed = Some(current);
+        // Following focus points, each pane goes to its own frame's.
+        let ppp = ctx.pixels_per_point();
+        for k in 0..self.panes.len() {
+            let frame = self.panes[k].frame;
+            if !self.panes[k].view.follow_focus {
+                self.panes[k].followed = None;
+            } else if self.panes[k].followed != Some(frame)
+                && let Some(focus) = self.info_of(frame).map(|info| info.focus)
+            {
+                let size = self.full_size_of(frame, ppp);
+                self.panes[k].view.arrive(focus, size);
+                self.panes[k].followed = Some(frame);
+            }
         }
 
         // The current frame first, then the next one, then the filmstrip,
@@ -310,7 +534,7 @@ impl Shoot {
         strip.sort_by_key(|&i| i.abs_diff(current));
         let previews = ring.iter().map(|&i| Job::Preview(i));
         let full = full_ring.iter().map(|&i| Job::Full(i));
-        let first = if self.view.zoomed { 1 } else { 0 };
+        let first = if self.view().zoomed { 1 } else { 0 };
         let thumbnails = strip.into_iter().map(Job::Thumbnail);
         let mut uncached: Vec<usize> = (0..self.cull.frames().len()).filter(|i| !self.cached.contains(i)).collect();
         uncached.sort_by_key(|&i| i.abs_diff(current));
@@ -318,9 +542,9 @@ impl Shoot {
             .clone()
             .take(1)
             .chain(full.clone().take(first))
-            .chain(previews.clone().skip(1).take(1))
+            .chain(previews.clone().skip(1).take(on_screen.len()))
             .chain(thumbnails)
-            .chain(previews.skip(2))
+            .chain(previews.skip(1 + on_screen.len()))
             .chain(full.skip(first))
             .chain(uncached.into_iter().map(Job::Cache))
             .filter(|job| match *job {
@@ -336,28 +560,67 @@ impl Shoot {
         }
     }
 
-    /// The current frame, whole or at 100%, with what's to be shown over it.
+    /// The frames on screen, each in its pane, whole or at 100%, with
+    /// what's to be shown over it.
     pub fn loupe(&mut self, ui: &mut Ui, theme: &Theme, show: Show) {
+        let whole_area = ui.max_rect();
+        let areas = match self.mode {
+            Mode::Loupe => vec![whole_area],
+            _ => {
+                let aspects: Vec<f32> =
+                    self.panes.iter().map(|p| self.size_of(p.frame).map_or(1.5, |s| s.x / s.y)).collect();
+                // Room round each frame for the active one's outline.
+                let rects = panes::layout(&aspects, whole_area.shrink(4.0), 8.0);
+                rects.into_iter().map(|r| r.expand(4.0)).collect()
+            }
+        };
+        let active = self.active();
+        let pressed = ui.input(|i| i.pointer.primary_pressed());
+        for (k, area) in areas.into_iter().enumerate() {
+            let response = ui.interact(area, egui::Id::new(("pane", k)), Sense::click_and_drag());
+            // A press on another pane makes it the active one, and does no
+            // more.
+            let activates = k != active && pressed && response.is_pointer_button_down_on();
+            if activates {
+                self.cull.go_to(self.panes[k].frame);
+            }
+            self.panes[k].view.area = area.shrink(8.0);
+            if !activates && (k == active || self.mode == Mode::Loupe) {
+                let frame = self.panes[k].frame;
+                let size = self.full_size_of(frame, ui.ctx().pixels_per_point());
+                let fit_rect = self.size_of(frame).map_or(area, |s| fit(s, self.panes[k].view.area));
+                let before = self.panes[k].view.clone();
+                self.panes[k].view.pointer(ui, &response, fit_rect, size);
+                if self.panes[k].view != before {
+                    self.sync(k);
+                }
+            }
+            self.pane(ui, k, area, theme, show);
+        }
+    }
+
+    /// One pane: its frame, and what's shown over it.
+    fn pane(&mut self, ui: &mut Ui, k: usize, outer: Rect, theme: &Theme, show: Show) {
         let ctx = ui.ctx().clone();
         let ppp = ctx.pixels_per_point();
-        self.view.area = ui.max_rect().shrink(8.0);
-        let area = self.view.area;
-        let response = ui.interact(ui.max_rect(), egui::Id::new("loupe"), Sense::click_and_drag());
-        let (fit_rect, size) = (self.fit_rect(), self.full_size(ppp));
-        self.view.pointer(ui, &response, fit_rect, size);
-
-        let painter = ui.painter_at(ui.max_rect());
-        let current = self.cull.current();
-        let frame = self.cull.frame();
+        let Pane { frame: index, ref view, .. } = self.panes[k];
+        let area = view.area;
+        let size = self.full_size_of(index, ppp);
+        let painter = ui.painter_at(outer);
+        let frame = &self.cull.frames()[index];
         let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
+        let several = self.panes.len() > 1;
+        if several && index == self.cull.current() {
+            painter.rect_stroke(outer.shrink(1.0), 2.0, Stroke::new(2.0, theme.accent), StrokeKind::Inside);
+        }
         // The thumbnail, enlarged, until the preview is ready.
-        let texture = match (self.previews.get(&current), self.thumbnails.get(&current)) {
+        let texture = match (self.previews.get(&index), self.thumbnails.get(&index)) {
             (Some(Slot::Ready(shown)), _) => Some(&shown.texture),
             (_, Some(Slot::Ready(t))) => Some(t),
             _ => None,
         };
         let Some(texture) = texture else {
-            if let Some(Slot::Failed(e)) = self.previews.get(&current) {
+            if let Some(Slot::Failed(e)) = self.previews.get(&index) {
                 let name = frame.path.file_name().unwrap_or_default().to_string_lossy();
                 let text = format!("Can't show {name}: {e}");
                 painter.text(area.center(), Align2::CENTER_CENTER, text, FontId::proportional(14.0), theme.red);
@@ -365,11 +628,12 @@ impl Shoot {
             return;
         };
 
-        let drawn = if self.view.zoomed {
-            let rect = self.view.zoomed_rect(size, ppp);
-            match self.full.get_mut(&current) {
+        let zoomed = view.zoomed;
+        let drawn = if zoomed {
+            let rect = view.zoomed_rect(size, ppp);
+            match self.full.get_mut(&index) {
                 Some(Slot::Ready(full)) => {
-                    let visible = ui.max_rect().expand(TILE as f32 / ppp);
+                    let visible = outer.expand(TILE as f32 / ppp);
                     tiles(&ctx, &painter, full, rect, visible, ppp);
                 }
                 other => {
@@ -382,7 +646,8 @@ impl Shoot {
                         }
                         _ => ("Developing the raw…".to_owned(), theme.foreground),
                     };
-                    loupe::plate(&painter, area.center_top() + vec2(0.0, 12.0), Align2::CENTER_TOP, text, colour);
+                    let at = area.center_top() + vec2(0.0, 12.0);
+                    loupe::plate(&painter, at, Align2::CENTER_TOP, text, colour, area.width());
                 }
             }
             rect
@@ -392,29 +657,35 @@ impl Shoot {
             rect
         };
 
-        let info = self.info();
+        let frame = &self.cull.frames()[index];
+        let info = self.info_of(index);
         if show.focus_point
             && let Some(focus) = info.and_then(|i| i.focus)
         {
             loupe::focus_point(&painter, drawn, focus, theme);
         }
-        let badge_at = if self.view.zoomed { area.left_top() } else { drawn.left_top() };
+        let badge_at = if zoomed { area.left_top() } else { drawn.left_top() };
         badge(&painter, badge_at + vec2(8.0, 8.0), Align2::LEFT_TOP, frame.rating, 18.0, theme);
-        if let Some(Slot::Ready(shown)) = self.previews.get(&current) {
+        if let Some(Slot::Ready(shown)) = self.previews.get(&index) {
             if show.histogram {
                 loupe::histogram(&painter, area, &shown.decoded.histogram);
             }
             let summary = shown.decoded.info.summary();
             if show.info && !summary.is_empty() {
                 let at = area.center_bottom() - vec2(0.0, 10.0);
-                loupe::plate(&painter, at, Align2::CENTER_BOTTOM, summary, theme.foreground);
+                loupe::plate(&painter, at, Align2::CENTER_BOTTOM, summary, theme.foreground, area.width());
             }
+        }
+        if several {
+            let name = frame.path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let at = area.right_top() + vec2(-8.0, 8.0);
+            loupe::plate(&painter, at, Align2::RIGHT_TOP, name, theme.foreground, area.width() / 2.0);
         }
     }
 
     /// The shown frames in a strip, the current one in the middle. Returns
-    /// the frame clicked.
-    pub fn filmstrip(&mut self, ui: &mut Ui, theme: &Theme) -> Option<usize> {
+    /// the frame clicked, and how.
+    pub fn filmstrip(&mut self, ui: &mut Ui, theme: &Theme) -> Option<(usize, Click)> {
         let (strip, response) = ui.allocate_exact_size(vec2(ui.available_width(), STRIP_HEIGHT), Sense::click());
         let painter = ui.painter_at(strip);
         let cell = vec2(STRIP_HEIGHT * 1.5, STRIP_HEIGHT);
@@ -428,9 +699,14 @@ impl Shoot {
             let rect = Rect::from_center_size(pos2(x, strip.center().y), cell);
             self.cells.push((i, rect));
             let rating = self.cull.frames()[i].rating;
-            if i == current {
+            if i == current || self.cull.is_selected(i) {
                 painter.rect_filled(rect.shrink(1.0), 0.0, theme.selection);
+            }
+            if i == current {
                 painter.rect_stroke(rect.shrink(2.0), 0.0, Stroke::new(2.0, theme.accent), StrokeKind::Inside);
+            } else if self.panes.len() > 1 && self.panes.iter().any(|p| p.frame == i) {
+                // On screen in compare or survey.
+                painter.rect_stroke(rect.shrink(2.0), 0.0, Stroke::new(1.0, theme.accent), StrokeKind::Inside);
             }
             let inner = rect.shrink(6.0);
             if let Some(Slot::Ready(texture)) = self.thumbnails.get(&i) {
@@ -442,7 +718,13 @@ impl Shoot {
             badge(&painter, inner.center_bottom() - vec2(0.0, 3.0), Align2::CENTER_BOTTOM, rating, 13.0, theme);
         }
         let pointer = response.interact_pointer_pos().filter(|_| response.clicked())?;
-        self.cells.iter().find(|(_, rect)| rect.contains(pointer)).map(|&(i, _)| i)
+        let modifiers = ui.input(|i| i.modifiers);
+        let click = match () {
+            () if modifiers.command => Click::Toggle,
+            () if modifiers.shift => Click::Range,
+            () => Click::Plain,
+        };
+        self.cells.iter().find(|(_, rect)| rect.contains(pointer)).map(|&(i, _)| (i, click))
     }
 }
 

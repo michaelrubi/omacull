@@ -12,11 +12,13 @@ use egui::{Align2, FontId, RichText, Sense, Ui, pos2, vec2};
 use omacull_engine::color::Display;
 use omacull_engine::cull::{Change, Cull, Filter, Step};
 use omacull_engine::disk::{self, Disk, How, Mark, Problem};
+use omacull_engine::sidecar::REJECT;
 use omacull_engine::thumbs;
 
 use crate::commands::Command;
 use crate::hotkeys::{self, format_shortcut};
 use crate::monitor;
+use crate::panes::Mode;
 use crate::shoot::Shoot;
 use crate::state::{Show, State};
 use crate::theme::{self, Theme};
@@ -246,42 +248,74 @@ impl App {
         }
         let Some(shoot) = &mut self.shoot else { return };
         let ppp = ctx.pixels_per_point();
+        let say = |text: &str| Some((text.to_owned(), false));
         match command {
             Command::Zoom => {
                 let (pointer, time) = ctx.input(|i| (i.pointer.hover_pos(), i.time));
                 let (fit, size) = (shoot.fit_rect(), shoot.full_size(ppp));
-                shoot.view.key_down(pointer, fit, size, time);
+                shoot.view_mut().key_down(pointer, fit, size, time);
+                shoot.sync(shoot.active());
             }
             Command::ZoomToFocus => {
-                let focus = shoot.info().and_then(|i| i.focus);
-                if !shoot.view.zoom_to_focus(focus, shoot.full_size(ppp)) {
-                    self.message = Some(("No focus point recorded for this frame".into(), false));
+                let (focus, size) = (shoot.info().and_then(|i| i.focus), shoot.full_size(ppp));
+                if shoot.view_mut().zoom_to_focus(focus, size) {
+                    shoot.sync(shoot.active());
+                } else {
+                    self.message = say("No focus point recorded for this frame");
                 }
             }
-            _ => {}
-        }
-        let cull = &mut shoot.cull;
-        match command {
-            Command::Undo => match cull.undo() {
+            Command::Compare => {
+                if let Err(why) = shoot.compare() {
+                    self.message = say(why);
+                }
+            }
+            Command::Survey => {
+                if let Err(why) = shoot.survey() {
+                    self.message = say(why);
+                }
+            }
+            Command::Back if shoot.mode != Mode::Loupe => shoot.back_to_loupe(),
+            Command::Back | Command::SelectNone => shoot.cull.clear_selection(),
+            Command::Lock => {
+                shoot.locked = !shoot.locked;
+                shoot.sync(shoot.active());
+                self.message = say(if shoot.locked { "Zoom locked together" } else { "Zoom unlocked" });
+            }
+            Command::NextPane => shoot.next_pane(),
+            Command::KnockOut => shoot.knock_out(),
+            Command::SelectPrevious if shoot.mode == Mode::Loupe => _ = shoot.cull.extend(Step::Previous),
+            Command::SelectNext if shoot.mode == Mode::Loupe => _ = shoot.cull.extend(Step::Next),
+            Command::SelectAll => shoot.cull.select_all(),
+            Command::Undo => match shoot.cull.undo() {
                 Some(change) => record(&self.disk, shoot, change, How::Undo),
-                None => self.message = Some(("Nothing to undo".into(), false)),
+                None => self.message = say("Nothing to undo"),
             },
-            Command::Redo => match cull.redo() {
+            Command::Redo => match shoot.cull.redo() {
                 Some(change) => record(&self.disk, shoot, change, How::Redo),
-                None => self.message = Some(("Nothing to redo".into(), false)),
+                None => self.message = say("Nothing to redo"),
             },
-            Command::Previous => _ = cull.step(Step::Previous),
-            Command::Next => _ = cull.step(Step::Next),
-            Command::First => _ = cull.step(Step::First),
-            Command::Last => _ = cull.step(Step::Last),
+            // Away from the loupe, the arrows work on the panes.
+            Command::Previous | Command::Next if shoot.mode != Mode::Loupe => {
+                shoot.step_panes(if command == Command::Next { 1 } else { -1 });
+            }
+            Command::Previous => _ = shoot.cull.step(Step::Previous),
+            Command::Next => _ = shoot.cull.step(Step::Next),
+            Command::First if shoot.mode == Mode::Loupe => _ = shoot.cull.step(Step::First),
+            Command::Last if shoot.mode == Mode::Loupe => _ = shoot.cull.step(Step::Last),
             _ => {}
         }
         if let Some(rating) = command.rating() {
             if let Some(change) = shoot.cull.mark(rating) {
                 record(&self.disk, shoot, change, How::Mark);
             }
-            if self.state.auto_advance {
-                shoot.cull.step(Step::Next);
+            match shoot.mode {
+                // Marked down in compare, the next candidate comes in.
+                Mode::Compare if rating == REJECT => shoot.knock_out(),
+                Mode::Compare => {}
+                Mode::Survey if self.state.auto_advance => shoot.step_panes(1),
+                Mode::Survey => {}
+                Mode::Loupe if self.state.auto_advance => _ = shoot.cull.step(Step::Next),
+                Mode::Loupe => {}
             }
         }
         if let Some(filter) = command.filter() {
@@ -329,6 +363,13 @@ impl App {
         self.finish_picking(ctx);
         self.finish_opening(ctx);
         self.disk_problems();
+        // Nothing in Omacull takes typing, so no widget keeps the keyboard:
+        // egui gives it to the next button on Tab, which is a key here.
+        ctx.memory_mut(|m| {
+            if let Some(focused) = m.focused() {
+                m.surrender_focus(focused);
+            }
+        });
         if !ctx.egui_wants_keyboard_input() {
             for command in Command::pressed(ctx) {
                 self.run(command, ctx);
@@ -341,7 +382,13 @@ impl App {
             && let Some(key) = zoom_key
             && let (false, time) = ctx.input(|i| (i.key_down(key), i.time))
         {
-            shoot.view.key_up(time);
+            let before = shoot.view().zoomed;
+            for pane in &mut shoot.panes {
+                pane.view.key_up(time);
+            }
+            if shoot.view().zoomed != before {
+                shoot.sync(shoot.active());
+            }
         }
         if self.monitor.as_mut().is_some_and(|m| m.check(ctx)) {
             self.display = display_for(self.monitor.as_ref().unwrap());
@@ -382,8 +429,8 @@ impl App {
                 .resizable(false)
                 .show(ui, |ui| shoot.filmstrip(ui, &theme))
                 .inner;
-            if let Some(index) = clicked {
-                shoot.cull.go_to(index);
+            if let Some((index, click)) = clicked {
+                shoot.clicked(index, click);
             }
         }
         let pasteboard = egui::Frame::new().fill(self.theme.pasteboard());
@@ -406,7 +453,7 @@ impl App {
         let mut command = None;
         ui.horizontal(|ui| {
             match &self.shoot {
-                Some(shoot) => _ = ui.label(RichText::new(status(&shoot.cull)).color(self.theme.foreground)),
+                Some(shoot) => _ = ui.label(RichText::new(status_line(shoot)).color(self.theme.foreground)),
                 None => _ = ui.label(RichText::new("No folder open").color(self.theme.dark_foreground)),
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -434,7 +481,7 @@ impl App {
                         (clipping, "Clipping", Command::Clipping),
                         (peaking, "Peaking", Command::Peaking),
                         (focus_point, "AF", Command::FocusPoint),
-                        (shoot.view.zoomed, "100%", Command::Zoom),
+                        (shoot.view().zoomed, "100%", Command::Zoom),
                     ] {
                         let tip = format!("{} ({})", toggle.label(), shortcut(toggle));
                         if ui.selectable_label(on, label).on_hover_text(tip).clicked() {
@@ -508,13 +555,14 @@ impl App {
 fn record(disk: &Disk, shoot: &mut Shoot, change: Change, how: How) {
     let dwell = shoot.dwell();
     let cull = &shoot.cull;
+    let path = |i: usize| cull.frames()[i].path.clone();
     disk.write(Mark {
-        path: cull.frames()[change.index].path.clone(),
+        path: path(change.index),
         rating: change.now,
         was: change.was,
         how,
-        view: "loupe",
-        compared: Vec::new(),
+        view: shoot.mode.name(),
+        compared: shoot.others().into_iter().filter(|&f| f != change.index).map(path).collect(),
         filter: cull.filter(),
         dwell,
         at: SystemTime::now(),
@@ -553,6 +601,26 @@ fn shortcut(command: Command) -> String {
 }
 
 /// The current frame, its place in the folder, and the cull so far.
+/// The status line: the view, the selection, and the cull.
+fn status_line(shoot: &Shoot) -> String {
+    let view = match shoot.mode {
+        Mode::Loupe => String::new(),
+        mode => {
+            let lock = if shoot.locked { "" } else { ", unlocked" };
+            let name = match mode {
+                Mode::Compare => "Compare".to_owned(),
+                _ => format!("Survey of {}", shoot.panes.len()),
+            };
+            format!("{name}{lock}   ")
+        }
+    };
+    let selected = match shoot.cull.selection().len() {
+        0 => String::new(),
+        n => format!("   {n} selected"),
+    };
+    format!("{view}{}{selected}", status(&shoot.cull))
+}
+
 fn status(cull: &Cull) -> String {
     let counts = cull.counts();
     let filter = cull.filter();
@@ -593,7 +661,7 @@ mod tests {
 
     use egui::{Event, Key, Modifiers, PointerButton};
     use omacull_engine::cull::PICK;
-    use omacull_engine::sidecar::{self, REJECT};
+    use omacull_engine::sidecar;
     use omacull_engine::testing::{Arw, Folder};
 
     const NONE: Modifiers = Modifiers::NONE;
@@ -664,7 +732,7 @@ mod tests {
         /// one between.
         fn drag(&mut self, from: egui::Pos2, to: egui::Pos2) {
             let button =
-                |at, pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: NONE };
+                |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: NONE };
             self.frame(vec![Event::PointerMoved(from), button(from, true)]);
             self.frame(vec![Event::PointerMoved(from + (to - from) / 2.0)]);
             self.frame(vec![Event::PointerMoved(to)]);
@@ -890,20 +958,20 @@ mod tests {
         let folder = Folder::with_raws("app-zoom-key", 2, &Arw::default());
         let mut h = Harness::open(&folder, Paths { cache: None, log: None });
         h.press(NONE, Key::Z);
-        assert!(h.shoot().view.zoomed, "a tap zooms in");
+        assert!(h.shoot().view().zoomed, "a tap zooms in");
         h.press(NONE, Key::ArrowRight);
-        assert!(h.shoot().view.zoomed, "and stays zoomed from frame to frame");
+        assert!(h.shoot().view().zoomed, "and stays zoomed from frame to frame");
         h.press(NONE, Key::Z);
-        assert!(!h.shoot().view.zoomed, "the next tap zooms out");
+        assert!(!h.shoot().view().zoomed, "the next tap zooms out");
 
         h.key_down(Key::Z);
-        assert!(h.shoot().view.zoomed);
+        assert!(h.shoot().view().zoomed);
         for _ in 0..8 {
             h.frame(vec![]);
         }
-        assert!(h.shoot().view.zoomed, "held");
+        assert!(h.shoot().view().zoomed, "held");
         h.key_up(Key::Z);
-        assert!(!h.shoot().view.zoomed, "let go after a look");
+        assert!(!h.shoot().view().zoomed, "let go after a look");
     }
 
     #[test]
@@ -912,17 +980,17 @@ mod tests {
         let mut h = Harness::open(&folder, Paths { cache: None, log: None });
         let fit = h.shoot().fit_rect();
         h.click(fit.center());
-        assert!(h.shoot().view.zoomed, "a click zooms in");
-        let before = h.shoot().view.center;
+        assert!(h.shoot().view().zoomed, "a click zooms in");
+        let before = h.shoot().view().center;
         h.drag(pos2(400.0, 200.0), pos2(300.0, 150.0));
-        assert!(h.shoot().view.zoomed, "dragging pans, and stays zoomed");
-        let after = h.shoot().view.center;
+        assert!(h.shoot().view().zoomed, "dragging pans, and stays zoomed");
+        let after = h.shoot().view().center;
         assert!(after[0] > before[0] && after[1] > before[1], "dragged left and up shows more to the right and below");
         h.click(fit.center());
-        assert!(!h.shoot().view.zoomed, "a click zooms out");
+        assert!(!h.shoot().view().zoomed, "a click zooms out");
         // Pressing from whole and dragging is a look.
         h.drag(fit.center(), fit.center() + vec2(-60.0, 0.0));
-        assert!(!h.shoot().view.zoomed);
+        assert!(!h.shoot().view().zoomed);
     }
 
     #[test]
@@ -935,7 +1003,7 @@ mod tests {
         h.wait("the next one", |app| app.shoot.as_ref().unwrap().full_state(1).is_some());
         assert!(h.shoot().full_state(0).unwrap().is_err());
         h.press(NONE, Key::Z);
-        assert!(h.shoot().view.zoomed);
+        assert!(h.shoot().view().zoomed);
 
         // A real development, as the loader would hand it over.
         let (w, h_) = (1500, 1000);
@@ -967,20 +1035,20 @@ mod tests {
         Arw { focus_mode: 0, ..Arw::default() }.write(&folder.raw(3));
         let mut h = Harness::open(&folder, Paths { cache: None, log: None });
         h.press(Modifiers::SHIFT, Key::Z);
-        let view = &h.shoot().view;
+        let view = h.shoot().view();
         assert!(view.zoomed && view.follow_focus);
         let first = view.center;
         h.press(NONE, Key::ArrowRight);
         h.wait("the next preview", |app| app.shoot.as_ref().unwrap().preview_ready());
         h.frame(vec![]);
-        let second = h.shoot().view.center;
+        let second = h.shoot().view().center;
         assert!(second[0] > first[0] && second[1] > first[1], "{first:?} then {second:?}");
         // Manual focus: nothing to go to.
         h.press(NONE, Key::ArrowRight);
         h.wait("the last preview", |app| app.shoot.as_ref().unwrap().preview_ready());
         h.press(NONE, Key::Z);
         h.press(Modifiers::SHIFT, Key::Z);
-        assert!(!h.shoot().view.zoomed);
+        assert!(!h.shoot().view().zoomed);
         assert!(h.app.message.as_ref().is_some_and(|(m, _)| m.contains("No focus point")));
     }
 
@@ -1003,5 +1071,98 @@ mod tests {
         h.wait("the next preview", |app| app.shoot.as_ref().unwrap().preview_ready());
         h.frame(vec![]);
         assert_eq!(h.shoot().preview_bake(), Some(crate::loupe::Bake { clipping: false, peaking: true }));
+    }
+
+    fn panes(h: &Harness) -> Vec<usize> {
+        h.shoot().panes.iter().map(|p| p.frame).collect()
+    }
+
+    #[test]
+    fn compare_brings_in_the_next_candidate_when_a_side_is_rejected() {
+        let folder = Folder::with_raws("app-compare", 6, &Arw::default());
+        let log = folder.0.join("decisions.jsonl");
+        let mut h = Harness::open(&folder, Paths { cache: None, log: Some(log.clone()) });
+        h.press(NONE, Key::C);
+        assert_eq!((h.shoot().mode, panes(&h), h.cull().current()), (Mode::Compare, vec![0, 1], 0));
+        h.press(NONE, Key::X);
+        assert_eq!(h.ratings()[0], REJECT);
+        assert_eq!((panes(&h), h.cull().current()), (vec![2, 1], 2), "the rejected side is replaced");
+        h.press(NONE, Key::ArrowRight);
+        assert_eq!(panes(&h), [3, 1], "the arrows change the active side's frame");
+        h.press(NONE, Key::Tab);
+        assert_eq!(h.cull().current(), 1);
+        h.press(NONE, Key::P);
+        assert_eq!(panes(&h), [3, 1], "a pick stays");
+
+        // Zoom is locked together, until unlocked.
+        h.press(NONE, Key::Z);
+        assert!(h.shoot().panes.iter().all(|p| p.view.zoomed));
+        h.press(NONE, Key::L);
+        h.press(NONE, Key::Z);
+        let zoomed: Vec<bool> = h.shoot().panes.iter().map(|p| p.view.zoomed).collect();
+        assert_eq!(zoomed, [true, false]);
+        h.press(NONE, Key::Escape);
+        assert_eq!((h.shoot().mode, h.cull().current()), (Mode::Loupe, 1));
+
+        h.app.disk.finish();
+        let rows: Vec<serde_json::Value> =
+            std::fs::read_to_string(&log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows[0]["view"], "compare");
+        let compared = rows[0]["compared"][0]["path"].as_str().unwrap();
+        assert!(compared.ends_with("DSC00002.ARW"), "{compared}");
+    }
+
+    #[test]
+    fn survey_knocks_frames_out_until_one_is_left() {
+        let folder = Folder::with_raws("app-survey", 6, &Arw::default());
+        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        h.press(NONE, Key::N);
+        assert_eq!((h.shoot().mode, panes(&h)), (Mode::Survey, vec![0, 1, 2, 3]));
+        h.frame(vec![]);
+        // Laid out in two rows, none overlapping.
+        let areas: Vec<_> = h.shoot().panes.iter().map(|p| p.view.area).collect();
+        for (i, a) in areas.iter().enumerate() {
+            assert!(areas[i + 1..].iter().all(|b| !a.intersects(*b)), "{areas:?}");
+        }
+        h.press(NONE, Key::Slash);
+        assert_eq!((panes(&h), h.cull().current()), (vec![1, 2, 3], 1));
+        h.press(NONE, Key::ArrowRight);
+        assert_eq!(h.cull().current(), 2, "the arrows move between panes");
+        h.press(NONE, Key::Num3);
+        assert_eq!(h.ratings()[2], 3);
+        h.press(NONE, Key::Slash);
+        h.press(NONE, Key::Slash);
+        assert_eq!((h.shoot().mode, h.cull().current()), (Mode::Loupe, 1), "one left: the loupe");
+        assert_eq!(h.ratings(), [0, 0, 3, 0, 0, 0], "knocking out doesn't mark");
+    }
+
+    #[test]
+    fn the_selection_is_what_gets_surveyed() {
+        let folder = Folder::with_raws("app-select", 6, &Arw::default());
+        let mut h = Harness::open(&folder, Paths { cache: None, log: None });
+        h.press(Modifiers::SHIFT, Key::ArrowRight);
+        h.press(Modifiers::SHIFT, Key::ArrowRight);
+        assert_eq!(h.cull().selection(), [0, 1, 2]);
+        // Ctrl+click adds a frame from the filmstrip.
+        let cells = h.shoot().cells.clone();
+        let (_, rect) = cells.iter().copied().find(|&(i, _)| i == 4).unwrap();
+        let at = rect.center();
+        let (primary, modifiers) = (PointerButton::Primary, Modifiers::COMMAND);
+        let button = |pressed| Event::PointerButton { pos: at, button: primary, pressed, modifiers };
+        h.frame(vec![Event::ModifiersChanged(Modifiers::COMMAND), Event::PointerMoved(at), button(true)]);
+        h.frame(vec![button(false)]);
+        h.frame(vec![Event::ModifiersChanged(NONE)]);
+        assert_eq!(h.cull().selection(), [0, 1, 2, 4]);
+        h.press(NONE, Key::N);
+        assert_eq!(panes(&h), [0, 1, 2, 4]);
+        // A click on another pane makes it the active one.
+        h.frame(vec![]);
+        let second = h.shoot().panes[1].view.area.center();
+        h.click(second);
+        assert_eq!(h.cull().current(), 1);
+        assert!(!h.shoot().view().zoomed, "and doesn't zoom it");
+        h.press(NONE, Key::Escape);
+        h.press(NONE, Key::Escape);
+        assert!(h.cull().selection().is_empty(), "Escape leaves the survey, then the selection");
     }
 }

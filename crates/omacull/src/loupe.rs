@@ -114,6 +114,14 @@ impl View {
         }
     }
 
+    /// Take on another pane's zoom, locked to it: whole or at 100%, at the
+    /// same spot, or following focus points.
+    pub fn follow(&mut self, other: &View) {
+        self.zoomed = other.zoomed;
+        self.center = other.center;
+        self.follow_focus = other.follow_focus;
+    }
+
     /// Move the frame by `delta` points.
     pub fn pan(&mut self, delta: Vec2, size: Vec2) {
         self.center = self.clamped([self.center[0] - delta.x / size.x, self.center[1] - delta.y / size.y], size);
@@ -215,9 +223,12 @@ pub fn histogram(painter: &Painter, area: Rect, histogram: &Histogram) {
     }
 }
 
-/// Text on a dark plate, anchored at `at`.
-pub fn plate(painter: &Painter, at: Pos2, align: Align2, text: String, colour: Color32) -> Rect {
-    let galley = painter.layout_no_wrap(text, FontId::proportional(13.0), colour);
+/// Text on a dark plate, anchored at `at`, cut short with … to fit
+/// `max_width`.
+pub fn plate(painter: &Painter, at: Pos2, align: Align2, text: String, colour: Color32, max_width: f32) -> Rect {
+    let mut job = egui::text::LayoutJob::simple_singleline(text, FontId::proportional(13.0), colour);
+    job.wrap = egui::text::TextWrapping::truncate_at_width((max_width - 12.0).max(20.0));
+    let galley = painter.layout_job(job);
     let rect = align.anchor_size(at, galley.size());
     painter.rect_filled(rect.expand2(vec2(6.0, 3.0)), 4.0, Color32::from_black_alpha(170));
     painter.galley(rect.min, galley, colour);
