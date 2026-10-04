@@ -3,10 +3,13 @@
 //! both go through this list, so they can't disagree.
 
 use egui::{Key, KeyboardShortcut, Modifiers};
+use omacull_engine::cull::{Filter, PICK, Rating};
+use omacull_engine::sidecar::REJECT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Command {
     Quit,
+    Open,
     Undo,
     Redo,
     Previous,
@@ -21,6 +24,15 @@ pub enum Command {
     Star3,
     Star4,
     Star5,
+    AutoAdvance,
+    ShowAll,
+    ShowUndecided,
+    ShowPicks,
+    ShowStars2,
+    ShowStars3,
+    ShowStars4,
+    ShowStars5,
+    ShowRejects,
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -28,10 +40,15 @@ const CMD_SHIFT: Modifiers = Modifiers {
     shift: true,
     ..Modifiers::COMMAND
 };
+const CMD_ALT: Modifiers = Modifiers {
+    alt: true,
+    ..Modifiers::COMMAND
+};
 
 impl Command {
     pub const ALL: &[Command] = &[
         Command::Quit,
+        Command::Open,
         Command::Undo,
         Command::Redo,
         Command::Previous,
@@ -46,6 +63,15 @@ impl Command {
         Command::Star3,
         Command::Star4,
         Command::Star5,
+        Command::AutoAdvance,
+        Command::ShowAll,
+        Command::ShowUndecided,
+        Command::ShowPicks,
+        Command::ShowStars2,
+        Command::ShowStars3,
+        Command::ShowStars4,
+        Command::ShowStars5,
+        Command::ShowRejects,
     ];
 
     /// Look a command up by its name in code, e.g. "Reject".
@@ -57,8 +83,17 @@ impl Command {
     /// Ctrl+Z even when Shift is also held, so Ctrl+Shift+Z has to be
     /// checked before it.
     pub const KEYBOARD_ORDER: &[Command] = &[
+        Command::ShowAll,
+        Command::ShowUndecided,
+        Command::ShowPicks,
+        Command::ShowStars2,
+        Command::ShowStars3,
+        Command::ShowStars4,
+        Command::ShowStars5,
+        Command::ShowRejects,
         Command::Redo,
         Command::Quit,
+        Command::Open,
         Command::Undo,
         Command::Previous,
         Command::Next,
@@ -72,11 +107,13 @@ impl Command {
         Command::Star3,
         Command::Star4,
         Command::Star5,
+        Command::AutoAdvance,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Command::Quit => "Quit",
+            Command::Open => "Open Folder…",
             Command::Undo => "Undo",
             Command::Redo => "Redo",
             Command::Previous => "Previous Frame",
@@ -91,6 +128,15 @@ impl Command {
             Command::Star3 => "3 Stars",
             Command::Star4 => "4 Stars",
             Command::Star5 => "5 Stars",
+            Command::AutoAdvance => "Auto-Advance After a Mark",
+            Command::ShowAll => "Show All",
+            Command::ShowUndecided => "Show Undecided",
+            Command::ShowPicks => "Show Picks and Up",
+            Command::ShowStars2 => "Show 2 Stars and Up",
+            Command::ShowStars3 => "Show 3 Stars and Up",
+            Command::ShowStars4 => "Show 4 Stars and Up",
+            Command::ShowStars5 => "Show 5 Stars",
+            Command::ShowRejects => "Show Rejects",
         }
     }
 
@@ -98,6 +144,7 @@ impl Command {
         let s = |m, k| Some(KeyboardShortcut::new(m, k));
         match self {
             Command::Quit => s(CMD, Key::Q),
+            Command::Open => s(CMD, Key::O),
             Command::Undo => s(CMD, Key::Z),
             Command::Redo => s(CMD_SHIFT, Key::Z),
             Command::Previous => s(Modifiers::NONE, Key::ArrowLeft),
@@ -112,7 +159,52 @@ impl Command {
             Command::Star3 => s(Modifiers::NONE, Key::Num3),
             Command::Star4 => s(Modifiers::NONE, Key::Num4),
             Command::Star5 => s(Modifiers::NONE, Key::Num5),
+            Command::AutoAdvance => s(Modifiers::NONE, Key::A),
+            // Bridge's filter keys, with X for rejects as in marking.
+            Command::ShowAll => s(CMD_ALT, Key::A),
+            Command::ShowUndecided => s(CMD_ALT, Key::Num0),
+            Command::ShowPicks => s(CMD_ALT, Key::Num1),
+            Command::ShowStars2 => s(CMD_ALT, Key::Num2),
+            Command::ShowStars3 => s(CMD_ALT, Key::Num3),
+            Command::ShowStars4 => s(CMD_ALT, Key::Num4),
+            Command::ShowStars5 => s(CMD_ALT, Key::Num5),
+            Command::ShowRejects => s(CMD_ALT, Key::X),
         }
+    }
+
+    /// The mark a marking command makes.
+    pub fn rating(self) -> Option<Rating> {
+        Some(match self {
+            Command::Reject => REJECT,
+            Command::Unmark => 0,
+            Command::Pick => PICK,
+            Command::Star1 => 1,
+            Command::Star2 => 2,
+            Command::Star3 => 3,
+            Command::Star4 => 4,
+            Command::Star5 => 5,
+            _ => return None,
+        })
+    }
+
+    /// The filter a filtering command shows.
+    pub fn filter(self) -> Option<Filter> {
+        Some(match self {
+            Command::ShowAll => Filter::All,
+            Command::ShowUndecided => Filter::Undecided,
+            Command::ShowPicks => Filter::AtLeast(PICK),
+            Command::ShowStars2 => Filter::AtLeast(2),
+            Command::ShowStars3 => Filter::AtLeast(3),
+            Command::ShowStars4 => Filter::AtLeast(4),
+            Command::ShowStars5 => Filter::AtLeast(5),
+            Command::ShowRejects => Filter::Rejects,
+            _ => return None,
+        })
+    }
+
+    /// The command that shows a filter.
+    pub fn show(filter: Filter) -> Command {
+        Self::ALL.iter().copied().find(|c| c.filter() == Some(filter)).unwrap_or(Command::ShowAll)
     }
 
     /// Commands whose shortcut was pressed this frame, consuming the keys.
@@ -196,7 +288,20 @@ mod tests {
         assert_eq!(press(&ctx, none, Key::Num3), [Command::Star3]);
         assert_eq!(press(&ctx, none, Key::ArrowRight), [Command::Next]);
         assert_eq!(press(&ctx, none, Key::Home), [Command::First]);
-        assert_eq!(press(&ctx, none, Key::A), []);
+        assert_eq!(press(&ctx, none, Key::A), [Command::AutoAdvance]);
+        assert_eq!(press(&ctx, none, Key::B), []);
+    }
+
+    #[test]
+    fn filters_are_ctrl_alt_and_dont_mark() {
+        let ctx = egui::Context::default();
+        assert_eq!(press(&ctx, CMD_ALT, Key::Num0), [Command::ShowUndecided]);
+        assert_eq!(press(&ctx, CMD_ALT, Key::Num3), [Command::ShowStars3]);
+        assert_eq!(press(&ctx, CMD_ALT, Key::X), [Command::ShowRejects]);
+        assert_eq!(press(&ctx, CMD_ALT, Key::A), [Command::ShowAll]);
+        for filter in Filter::ALL {
+            assert_eq!(Command::show(filter).filter(), Some(filter));
+        }
     }
 
     #[test]

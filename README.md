@@ -11,8 +11,8 @@ It's the first stage of one workflow: cull in Omacull, base edit in
 darktable, retouch in [Omapix](https://github.com/michaelrubi/omapix),
 export.
 
-**Status:** early. The groundwork is in (M0), the culler itself is next
-(M1). See [docs/DESIGN.md](docs/DESIGN.md)
+**Status:** early. The basic culler is in (M1): `omacull <folder>`, arrows
+to step, P/X/U and 0-5 to mark, Ctrl+Z to undo. See [docs/DESIGN.md](docs/DESIGN.md)
 for what it will and won't do and [docs/ROADMAP.md](docs/ROADMAP.md) for
 the plan.
 

@@ -3,7 +3,8 @@
 What's planned, in the order we plan to do it. [DESIGN.md](DESIGN.md)
 covers the scope and architecture.
 
-Status: M0 done on 2026-10-04 (scoped the same day). M1 is next.
+Status: M0 done on 2026-10-04 (scoped the same day). M1 built the same
+day, waiting to be tried on a real shoot.
 
 Each milestone ends with something Michael can use on a real shoot. M1 is
 the point where Omacull replaces XnView MP for a basic cull; everything
@@ -33,9 +34,16 @@ them are in DESIGN.md.
   themed window, with theme, hotkeys, `Command`, `OMACULL_SCRIPT` and the
   headless test harness carried over from Omapix. `make install`.
 
-## M1. Loupe cull (next)
+## M1. Loupe cull (built, to be tried on a real shoot)
 
-The minimum that replaces XnView MP.
+The minimum that replaces XnView MP. Everything below is in and tested
+headless and on a synthetic shoot; still to check by hand on a real
+shoot: that stepping never shows a wait, how long the first open of a
+big folder takes to fill the thumbnail cache, and the filter and
+auto-advance keys in daily use. Decisions made on the way are in
+DESIGN.md: thumbnails are shrunk previews in a JPEG cache, the decision
+log's schema, the filter keys, and that a frame marked out of the filter
+stays until the cursor leaves it.
 
 - Open a folder from the command line, a picker, or the recent list.
 - Filmstrip of thumbnails with a disk cache; loupe showing the embedded

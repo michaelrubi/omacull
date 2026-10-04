@@ -218,7 +218,7 @@ pub(crate) fn parse_file(s: &str) -> (Hotkeys, Vec<String>) {
     (hotkeys, warnings)
 }
 
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;

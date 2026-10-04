@@ -35,16 +35,21 @@ pub struct RawFile {
     /// None when the camera recorded no focus location (manual focus, or
     /// tracking on some bodies).
     pub focus: Option<Focus>,
+    /// When the shutter fired, as Exif writes it (`2023:10:25 15:43:16`),
+    /// with the fraction of a second after a dot if the camera recorded it.
+    pub captured: Option<String>,
 }
 
-const MAKE: u16 = 0x010f;
-const JPEG_OFFSET: u16 = 0x0201;
-const JPEG_LENGTH: u16 = 0x0202;
-const ORIENTATION: u16 = 0x0112;
-const SUB_IFDS: u16 = 0x014a;
-const EXIF_IFD: u16 = 0x8769;
-const MAKER_NOTE: u16 = 0x927c;
-const SONY_FOCUS_LOCATION: u16 = 0x2027;
+pub(crate) const MAKE: u16 = 0x010f;
+pub(crate) const JPEG_OFFSET: u16 = 0x0201;
+pub(crate) const JPEG_LENGTH: u16 = 0x0202;
+pub(crate) const ORIENTATION: u16 = 0x0112;
+pub(crate) const SUB_IFDS: u16 = 0x014a;
+pub(crate) const EXIF_IFD: u16 = 0x8769;
+pub(crate) const MAKER_NOTE: u16 = 0x927c;
+pub(crate) const SONY_FOCUS_LOCATION: u16 = 0x2027;
+pub(crate) const DATE_TIME_ORIGINAL: u16 = 0x9003;
+pub(crate) const SUB_SEC_TIME_ORIGINAL: u16 = 0x9291;
 
 fn invalid(what: &str) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, what)
@@ -102,6 +107,18 @@ impl Tiff<'_> {
         if e.kind == 3 { u32::from(self.u16(&e.value)) } else { self.u32(&e.value) }
     }
 
+    /// An entry's value as text (ASCII), without the trailing NULs.
+    fn text(&self, e: &Entry) -> io::Result<String> {
+        let mut bytes = vec![0; e.count.min(64) as usize];
+        if e.count <= 4 {
+            let len = bytes.len();
+            bytes.copy_from_slice(&e.value[..len]);
+        } else {
+            self.file.read_exact_at(&mut bytes, u64::from(self.u32(&e.value)))?;
+        }
+        Ok(String::from_utf8_lossy(&bytes).trim_end_matches('\0').trim().to_owned())
+    }
+
     /// An entry's value as a list of offsets (LONGs).
     fn offsets(&self, e: &Entry) -> io::Result<Vec<u64>> {
         if e.count <= 1 {
@@ -130,6 +147,7 @@ impl RawFile {
         }
 
         let (mut jpegs, mut orientation, mut focus) = (Vec::new(), None, None);
+        let (mut date, mut fraction) = (None, None);
         let mut sony = false;
         // The main chain of directories, and the sub-directories hanging off
         // them. A corrupt file could chain in a loop, so stop after a few.
@@ -157,6 +175,8 @@ impl RawFile {
                         sony = file.read_exact_at(&mut make, u64::from(tiff.u32(&e.value))).is_ok() && &make == b"SONY";
                     }
                     MAKER_NOTE if sony => focus = sony_focus(&tiff, u64::from(tiff.u32(&e.value))),
+                    DATE_TIME_ORIGINAL if date.is_none() => date = tiff.text(e).ok(),
+                    SUB_SEC_TIME_ORIGINAL if fraction.is_none() => fraction = tiff.text(e).ok(),
                     _ => {}
                 }
             }
@@ -166,7 +186,12 @@ impl RawFile {
                 jpegs.push(Embedded { offset: u64::from(at), len: u64::from(len) });
             }
         }
-        Ok(Self { file, jpegs, orientation: orientation.unwrap_or(1), focus })
+        // Cameras without a clock set write blanks.
+        let captured = date.filter(|d| d.starts_with(|c: char| c.is_ascii_digit())).map(|date| match fraction {
+            Some(f) if !f.is_empty() => format!("{date}.{f}"),
+            _ => date,
+        });
+        Ok(Self { file, jpegs, orientation: orientation.unwrap_or(1), focus, captured })
     }
 
     /// The biggest embedded JPEG: the one to show.
@@ -205,60 +230,13 @@ fn sony_focus(tiff: &Tiff, offset: u64) -> Option<Focus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::Arw;
 
-    /// A little-endian TIFF shaped like an ARW: IFD0 with a preview, an
-    /// orientation and an Exif directory holding a Sony makernote, then
-    /// IFD1 with a thumbnail.
-    fn arw(focus: [u16; 4]) -> Vec<u8> {
-        arw_with(focus, b"")
+    fn open(arw: &Arw) -> io::Result<RawFile> {
+        open_bytes(&arw.bytes())
     }
 
-    fn arw_with(focus: [u16; 4], makernote_header: &[u8]) -> Vec<u8> {
-        fn entry(out: &mut Vec<u8>, tag: u16, kind: u16, count: u32, value: u32) {
-            out.extend(tag.to_le_bytes());
-            out.extend(kind.to_le_bytes());
-            out.extend(count.to_le_bytes());
-            out.extend(value.to_le_bytes());
-        }
-        let mut f = b"II\x2a\0\x08\0\0\0".to_vec();
-        // IFD0 at 8: five entries, then IFD1 at 74.
-        f.extend(5u16.to_le_bytes());
-        entry(&mut f, MAKE, 2, 5, 190);
-        entry(&mut f, JPEG_OFFSET, 4, 1, 200);
-        entry(&mut f, JPEG_LENGTH, 4, 1, 30);
-        entry(&mut f, ORIENTATION, 3, 1, 8);
-        entry(&mut f, EXIF_IFD, 4, 1, 104);
-        f.extend(74u32.to_le_bytes());
-        // IFD1 at 74: the thumbnail.
-        assert_eq!(f.len(), 74);
-        f.extend(2u16.to_le_bytes());
-        entry(&mut f, JPEG_OFFSET, 4, 1, 230);
-        entry(&mut f, JPEG_LENGTH, 4, 1, 10);
-        f.extend(0u32.to_le_bytes());
-        // Exif directory at 104: the makernote at 122.
-        assert_eq!(f.len(), 104);
-        f.extend(1u16.to_le_bytes());
-        entry(&mut f, MAKER_NOTE, 7, 100, 122);
-        f.extend(0u32.to_le_bytes());
-        // Makernote at 122: a directory with FocusLocation at 180.
-        assert_eq!(f.len(), 122);
-        f.extend(makernote_header);
-        f.extend(1u16.to_le_bytes());
-        entry(&mut f, SONY_FOCUS_LOCATION, 3, 4, 180);
-        f.extend(0u32.to_le_bytes());
-        f.resize(180, 0);
-        for v in focus {
-            f.extend(v.to_le_bytes());
-        }
-        f.resize(190, 0);
-        f.extend(b"SONY\0");
-        f.resize(200, 0);
-        f.extend([b'P'; 30]);
-        f.extend([b'T'; 10]);
-        f
-    }
-
-    fn open(bytes: &[u8]) -> io::Result<RawFile> {
+    fn open_bytes(bytes: &[u8]) -> io::Result<RawFile> {
         let path = std::env::temp_dir().join(format!(
             "omacull-raw-{}-{:?}.arw",
             std::process::id(),
@@ -271,28 +249,44 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_embedded_jpegs_orientation_and_focus() {
-        let raw = open(&arw([6000, 4000, 3543, 2575])).unwrap();
-        assert_eq!(raw.jpegs, [Embedded { offset: 200, len: 30 }, Embedded { offset: 230, len: 10 }]);
+    fn finds_the_embedded_jpegs_orientation_focus_and_capture_time() {
+        let arw = Arw {
+            preview: vec![b'P'; 30],
+            thumbnail: vec![b'T'; 10],
+            orientation: 8,
+            focus: [6000, 4000, 3543, 2575],
+            ..Arw::default()
+        };
+        let raw = open(&arw).unwrap();
+        assert_eq!(raw.jpegs.len(), 2);
         assert_eq!(raw.read(raw.preview().unwrap()).unwrap(), [b'P'; 30]);
         assert_eq!(raw.read(raw.thumbnail().unwrap()).unwrap(), [b'T'; 10]);
         assert_eq!(raw.orientation, 8);
         assert_eq!(raw.focus, Some(Focus { width: 6000, height: 4000, x: 3543, y: 2575 }));
+        assert_eq!(raw.captured.as_deref(), Some("2026:10:04 12:00:00.123"));
     }
 
     #[test]
     fn finds_the_focus_behind_an_older_bodys_makernote_header() {
-        let raw = open(&arw_with([6000, 4000, 1, 2], b"SONY DSC \0\0\0")).unwrap();
-        assert_eq!(raw.focus, Some(Focus { width: 6000, height: 4000, x: 1, y: 2 }));
+        let arw = Arw { focus: [6000, 4000, 1, 2], makernote_header: b"SONY DSC \0\0\0".to_vec(), ..Arw::default() };
+        assert_eq!(open(&arw).unwrap().focus, Some(Focus { width: 6000, height: 4000, x: 1, y: 2 }));
     }
 
     #[test]
     fn no_focus_location_when_the_camera_recorded_zeros() {
-        assert_eq!(open(&arw([0; 4])).unwrap().focus, None);
+        assert_eq!(open(&Arw { focus: [0; 4], ..Arw::default() }).unwrap().focus, None);
+    }
+
+    #[test]
+    fn capture_time_without_a_fraction_or_a_clock() {
+        let whole = Arw { captured: ("2026:10:04 12:00:00", ""), ..Arw::default() };
+        assert_eq!(open(&whole).unwrap().captured.as_deref(), Some("2026:10:04 12:00:00"));
+        let unset = Arw { captured: ("    :  :     :  :  ", ""), ..Arw::default() };
+        assert_eq!(open(&unset).unwrap().captured, None);
     }
 
     #[test]
     fn rejects_files_that_arent_tiff() {
-        assert!(open(b"\xff\xd8\xff\xe1 not a raw").is_err());
+        assert!(open_bytes(b"\xff\xd8\xff\xe1 not a raw").is_err());
     }
 }
