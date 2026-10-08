@@ -8,6 +8,9 @@
 //! inside for the settings; Fuji's RAF is a header pointing at a whole
 //! JPEG file, with the settings in that JPEG's own Exif. The focus point
 //! is only read from Sony's.
+//!
+//! A JPEG on its own is read the same way: the picture is the whole file,
+//! and its Exif holds the settings and, from a camera, a thumbnail.
 
 use std::fs::File;
 use std::io::{self, ErrorKind};
@@ -124,6 +127,8 @@ pub struct RawFile {
     pub adobe_rgb: bool,
     /// The largest image in the file, the raw data, as stored.
     pub size: Option<(u32, u32)>,
+    /// Not a raw: a JPEG on its own, the picture itself.
+    pub developed: bool,
 }
 
 pub(crate) const MAKE: u16 = 0x010f;
@@ -350,7 +355,10 @@ impl RawFile {
         let mut header = [0; 16];
         file.read_exact_at(&mut header, 0)?;
         let mut found = Found::default();
-        if header.starts_with(b"FUJIFILMCCD-RAW") {
+        let developed = header.starts_with(&[0xff, 0xd8]);
+        if developed {
+            jpeg(&file, &mut found)?;
+        } else if header.starts_with(b"FUJIFILMCCD-RAW") {
             raf(&file, &mut found)?;
         } else if &header[4..8] == b"ftyp" {
             cr3(&file, &mut found)?;
@@ -366,7 +374,26 @@ impl RawFile {
             _ => date,
         });
         let orientation = orientation.unwrap_or(1);
-        Ok(Self { file, jpegs, orientation, focus, captured, exif, adobe_rgb, size })
+        Ok(Self { file, jpegs, orientation, focus, captured, exif, adobe_rgb, size, developed })
+    }
+
+    /// The colour profile a JPEG on its own carries, if it has one: what
+    /// its colours are, whatever its Exif says.
+    pub fn icc(&self) -> Option<Vec<u8>> {
+        if !self.developed {
+            return None;
+        }
+        // In one or more segments, each numbered after the name.
+        let mut parts: Vec<(u8, Vec<u8>)> = jpeg_segments(&self.file, 0)
+            .filter(|&(marker, _, len)| marker == 0xe2 && len > 14)
+            .filter_map(|(_, at, len)| {
+                let mut bytes = vec![0; len as usize];
+                self.file.read_exact_at(&mut bytes, at).ok()?;
+                bytes.starts_with(b"ICC_PROFILE\0").then(|| (bytes[12], bytes.split_off(14)))
+            })
+            .collect();
+        parts.sort_by_key(|&(number, _)| number);
+        (!parts.is_empty()).then(|| parts.into_iter().flat_map(|(_, bytes)| bytes).collect())
     }
 
     /// What the loupe shows besides the pixels, upright.
@@ -450,8 +477,9 @@ fn nikon_preview(file: &File, offset: u64) -> Option<Embedded> {
 /// holds starts, and how long that is.
 fn jpeg_segments(file: &File, offset: u64) -> impl Iterator<Item = (u8, u64, u64)> + '_ {
     let mut at = offset + 2;
-    // A corrupt file could go on for ever.
-    (0..64).map_while(move |_| {
+    // A corrupt file could go on for ever; a phone's JPEG can have dozens
+    // before its picture.
+    (0..1024).map_while(move |_| {
         let mut head = [0; 4];
         file.read_exact_at(&mut head, at).ok()?;
         let len = u64::from(u16::from_be_bytes([head[2], head[3]]));
@@ -483,6 +511,27 @@ fn jpeg_exif(file: &File, offset: u64) -> Option<u64> {
         file.read_exact_at(&mut name, at).ok()?;
         (&name == b"Exif\0\0").then_some(at + 6)
     })
+}
+
+/// A JPEG on its own: the picture is the whole file. Its Exif, if it has
+/// one, holds the shooting settings, and a camera's has a thumbnail too.
+fn jpeg(file: &File, found: &mut Found) -> io::Result<()> {
+    // Exif that can't be read is no reason not to show the picture.
+    if let Some(exif) = jpeg_exif(file, 0)
+        && let Err(e) = Tiff::at(file, exif).and_then(|tiff| tiff.walk(found))
+    {
+        log::debug!("unreadable Exif in a JPEG: {e}");
+    }
+    found.jpegs.push(Embedded { offset: 0, len: file.metadata()?.len() });
+    let (width, height) = jpeg_size(file, 0).ok_or_else(|| invalid("a damaged JPEG"))?;
+    found.size = Some((width, height));
+    // An export keeps the camera's makernote, but once it's been turned or
+    // cropped to another shape the focus point isn't where that says.
+    found.focus = found.focus.filter(|f| {
+        let (a, b) = (u64::from(width) * u64::from(f.height), u64::from(height) * u64::from(f.width));
+        a.abs_diff(b) * 100 <= a.max(b)
+    });
+    Ok(())
 }
 
 /// Fuji's RAF: a header saying where its JPEG is, a whole JPEG file with
@@ -734,6 +783,48 @@ mod tests {
         let decoded = crate::image::Image::decode_jpeg(&raw.read(raw.preview().unwrap()).unwrap()).unwrap();
         assert_eq!((decoded.width, decoded.height), (1920, 1280), "and it's still a JPEG");
         assert!(open_bytes(&raf(&[])).is_err());
+    }
+
+    #[test]
+    fn reads_a_jpeg_on_its_own_through_its_exif() {
+        use crate::testing::{jpeg, with_icc};
+        let thumbnail = jpeg(160, 120, [9; 3]);
+        let camera = || Arw {
+            orientation: 6,
+            preview: jpeg(3000, 2000, [200, 120, 40]),
+            thumbnail: thumbnail.clone(),
+            focus: [6000, 4000, 1500, 400],
+            ..Arw::default()
+        };
+        let file = camera().jpeg();
+        let raw = open_bytes(&file).unwrap();
+        assert!(raw.developed);
+        assert_eq!(raw.read(raw.preview().unwrap()).unwrap(), file, "the picture is the whole file");
+        assert_eq!(raw.read(raw.thumbnail().unwrap()).unwrap(), thumbnail, "at its place in the Exif");
+        assert_eq!((raw.orientation, raw.exif.model.as_deref()), (6, Some("ILCE-7M3")));
+        assert_eq!(raw.captured.as_deref(), Some("2026:10:04 12:00:00.123"));
+        assert_eq!((raw.exif.exposure, raw.exif.iso), (Some((1, 250)), Some(400)));
+        // Its size is the picture's, not what the Exif says of the sensor.
+        assert_eq!((raw.size, raw.info().size), (Some((3000, 2000)), Some((2000, 3000))));
+        assert_eq!(raw.info().focus, Some([0.9, 0.25]), "Sony's focus point, as in its raws");
+        assert_eq!(raw.icc(), None);
+
+        // A profile, whole or in parts out of order, as big ones are.
+        assert_eq!(open_bytes(&with_icc(&file, b"a profile")).unwrap().icc().unwrap(), b"a profile");
+        let part = |n: u8, bytes: &[u8]| [&[0xff, 0xe2, 0, 16 + bytes.len() as u8][..], b"ICC_PROFILE\0", &[n, 2], bytes].concat();
+        let parts = [&file[..2], &part(2, b"file"), &part(1, b"pro"), &file[2..]].concat();
+        assert_eq!(open_bytes(&parts).unwrap().icc().unwrap(), b"profile");
+        assert_eq!(open(&camera()).unwrap().icc(), None, "a raw has none");
+
+        // Exported upright, the camera's focus point no longer fits it.
+        let turned = Arw { preview: jpeg(2000, 3000, [9; 3]), ..camera() }.jpeg();
+        assert_eq!(open_bytes(&turned).unwrap().focus, None);
+
+        // No Exif at all: still a picture, as it's stored.
+        let bare = open_bytes(&jpeg(64, 48, [9; 3])).unwrap();
+        assert_eq!((bare.jpegs.len(), bare.orientation, bare.size), (1, 1, Some((64, 48))));
+        assert_eq!((bare.captured.as_deref(), bare.info().summary().as_str()), (None, ""));
+        assert!(open_bytes(b"\xff\xd8 and nothing more").is_err());
     }
 
     #[test]

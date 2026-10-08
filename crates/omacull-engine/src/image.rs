@@ -11,13 +11,13 @@ use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
 
-use crate::color::Space;
+use crate::color::{self, Space};
 use crate::raw::{Info, RawFile};
 
 /// A preview is no bigger than this on its long edge: where a camera
-/// embeds only a full-size JPEG, that's shrunk to what the loupe shows
-/// whole.
-const LARGEST_PREVIEW: usize = 2048;
+/// embeds only a full-size JPEG, or the picture is a JPEG itself, that's
+/// shrunk to what the loupe shows whole.
+pub(crate) const LARGEST_PREVIEW: usize = 2048;
 
 /// 8-bit RGBA, row by row, as it's uploaded to the GPU.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -134,16 +134,28 @@ pub fn preview(raw: &Path) -> io::Result<Image> {
 }
 
 /// The preview, the colours it's in, and the rest of what the loupe shows.
+/// A JPEG's preview is the JPEG, shrunk.
 pub fn preview_with_info(raw: &Path) -> io::Result<(Image, Space, Info)> {
     let raw = RawFile::open(raw)?;
+    let (image, space) = picture(&raw, LARGEST_PREVIEW)?;
+    Ok((image, space, raw.info()))
+}
+
+/// The JPEG to look at a file by, upright and no bigger than `largest` on
+/// its long edge, and the colours it's in: a raw's embedded preview, or
+/// the whole of a JPEG on its own.
+pub(crate) fn picture(raw: &RawFile, largest: usize) -> io::Result<(Image, Space)> {
     let jpeg = raw.preview().ok_or_else(|| invalid("no preview in the raw"))?;
     let mut image = Image::decode_jpeg(&raw.read(jpeg)?)?;
-    if image.width.max(image.height) > LARGEST_PREVIEW {
-        image = image.shrunk(LARGEST_PREVIEW);
+    if image.width.max(image.height) > largest {
+        image = image.shrunk(largest);
     }
-    let image = image.oriented(raw.orientation);
-    let space = if raw.adobe_rgb { Space::AdobeRgb } else { Space::Srgb };
-    Ok((image, space, raw.info()))
+    let mut space = if raw.adobe_rgb { Space::AdobeRgb } else { Space::Srgb };
+    // A profile of its own says what a JPEG is in, whatever its Exif does.
+    if let Some(known) = raw.icc().and_then(|icc| color::tagged(&mut image, &icc)) {
+        space = known;
+    }
+    Ok((image.oriented(raw.orientation), space))
 }
 
 /// How many pixels have each level, red, green and blue.
@@ -354,5 +366,34 @@ mod tests {
         crate::testing::Arw { preview: full, thumbnail: Vec::new(), orientation: 8, ..Default::default() }.write(&path);
         let image = preview(&path).unwrap();
         assert_eq!((image.width, image.height), (1365, 2048));
+    }
+
+    #[test]
+    fn a_jpeg_is_its_own_preview_in_the_colours_its_profile_says() {
+        use crate::testing::{Arw, jpeg, with_icc};
+        let folder = crate::testing::Folder::new("image-jpeg");
+        let path = folder.0.join("DSC00001.JPG");
+        let camera = Arw { preview: jpeg(3000, 2000, [128, 128, 128]), orientation: 6, ..Default::default() }.jpeg();
+        std::fs::write(&path, &camera).unwrap();
+        let (image, space, info) = preview_with_info(&path).unwrap();
+        assert_eq!((image.width, image.height, space), (1365, 2048, Space::Srgb), "shrunk and upright");
+        assert_eq!((info.exif.iso, info.size), (Some(400), Some((2000, 3000))));
+
+        // Its Exif says sRGB; its profile says linear, and is believed.
+        let curve = lcms2::ToneCurve::new(1.0);
+        let white = lcms2::CIExyY { x: 0.3127, y: 0.3290, Y: 1.0 };
+        let point = |x, y| lcms2::CIExyY { x, y, Y: 1.0 };
+        let primaries = lcms2::CIExyYTRIPLE { Red: point(0.64, 0.33), Green: point(0.30, 0.60), Blue: point(0.15, 0.06) };
+        let linear = lcms2::Profile::new_rgb(&white, &primaries, &[&curve, &curve, &curve]).unwrap().icc().unwrap();
+        std::fs::write(&path, with_icc(&camera, &linear)).unwrap();
+        let (image, space, _) = preview_with_info(&path).unwrap();
+        assert_eq!(space, Space::Srgb);
+        assert!((185..=191).contains(&image.pixel(100, 100)[0]), "{:?}", image.pixel(100, 100));
+
+        // Adobe RGB by its profile, whatever the Exif says.
+        let adobe = crate::color::ColorProfile::adobe_rgb();
+        std::fs::write(&path, with_icc(&camera, adobe.icc())).unwrap();
+        let (image, space, _) = preview_with_info(&path).unwrap();
+        assert_eq!((space, image.pixel(100, 100)[0]), (Space::AdobeRgb, 128));
     }
 }

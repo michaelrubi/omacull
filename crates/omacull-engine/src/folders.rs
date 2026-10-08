@@ -1,17 +1,18 @@
 //! The folders round the one being culled, for the folder tree: each with
-//! how many raws it holds, and whether it has folders of its own.
+//! how many raws and JPEGs it holds, and whether it has folders of its own.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::cull::is_raw;
+use crate::cull::picture;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Folder {
     pub path: PathBuf,
     pub name: String,
-    pub raws: usize,
+    /// The raws and JPEGs in it.
+    pub pictures: usize,
     /// It has folders in it to open out.
     pub nested: bool,
 }
@@ -27,17 +28,17 @@ pub fn list(dir: &Path) -> io::Result<Vec<Folder>> {
         .map(|e| e.path())
         .filter(|p| p.is_dir() && !hidden(p))
         .map(|path| {
-            let (mut raws, mut nested) = (0, false);
+            let (mut pictures, mut nested) = (0, false);
             for entry in fs::read_dir(&path).into_iter().flatten().filter_map(Result::ok) {
                 let inner = entry.path();
-                if is_raw(&inner) {
-                    raws += 1;
+                if picture(&inner).is_some() {
+                    pictures += 1;
                 } else if !nested && inner.is_dir() && !hidden(&inner) {
                     nested = true;
                 }
             }
             let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            Folder { path, name, raws, nested }
+            Folder { path, name, pictures, nested }
         })
         .collect();
     folders.sort_by(|a, b| a.name.cmp(&b.name));
@@ -50,7 +51,7 @@ mod tests {
     use crate::testing::{Arw, Folder as Temp};
 
     #[test]
-    fn folders_are_listed_with_their_raws() {
+    fn folders_are_listed_with_their_pictures() {
         let root = Temp::new("folders");
         let shoot = root.0.join("2026-10-04 wedding");
         fs::create_dir_all(shoot.join("selects")).unwrap();
@@ -58,13 +59,14 @@ mod tests {
             Arw::default().write(&shoot.join(format!("DSC{i:05}.ARW")));
         }
         fs::write(shoot.join("DSC00001.ARW.xmp"), "").unwrap();
+        fs::write(shoot.join("DSC00001.JPG"), crate::testing::jpeg(8, 8, [0; 3])).unwrap();
         fs::create_dir_all(root.0.join("2026-09-01 empty")).unwrap();
         fs::create_dir_all(root.0.join(".thumbnails")).unwrap();
         fs::write(root.0.join("notes.txt"), "").unwrap();
 
         let listed = list(&root.0).unwrap();
-        let summary: Vec<_> = listed.iter().map(|f| (f.name.as_str(), f.raws, f.nested)).collect();
-        assert_eq!(summary, [("2026-09-01 empty", 0, false), ("2026-10-04 wedding", 3, true)]);
+        let summary: Vec<_> = listed.iter().map(|f| (f.name.as_str(), f.pictures, f.nested)).collect();
+        assert_eq!(summary, [("2026-09-01 empty", 0, false), ("2026-10-04 wedding", 4, true)]);
         assert!(list(&root.0.join("missing")).is_err());
     }
 }

@@ -35,6 +35,7 @@ Decided in the 2026-10-04 scoping interview.
 ### In
 
 - **Input:** raw-only shoots of 200 to 1000 frames, Sony ARW first.
+  Since M9, JPEGs too: a folder of them, or beside the raws.
 - **Marks:** reject, pick and 0 to 5 stars. Nothing else.
 - **Views:** loupe with filmstrip, compare (2-up, synced zoom and pan), and
   survey (3 or 4 side by side, more if they still fit usefully; knock out
@@ -241,6 +242,44 @@ now. The status bar has a switch for signals and one for suggestions.
   overridden is in the decision log (`suggested`), which is how to tell
   whether they're any good.
 
+M9's key: Shift+F goes round which of a folder's pictures are culled:
+all of them, only the raws, or only the JPEGs. It's in the status bar too,
+where a folder holds both.
+
+- **JPEGs** (`.jpg`, `.jpeg`) are culled as raws are. A JPEG is its own
+  preview, shrunk to 2048 pixels, and its own 100%: it's decoded whole
+  for each, nothing is developed. Its settings, orientation, capture time
+  and thumbnail come from its Exif, by the reader the raws use (a Fuji
+  RAF's are read the same way).
+- **Formats** is a setting, remembered: All (the default), RAW or JPEG.
+  What isn't asked for isn't in the cull at all: not counted, stacked,
+  measured, suggested for or given a thumbnail. As a filter on what's
+  shown, a raw and the JPEG the camera wrote beside it, taken at the same
+  moment, would be stacked together, and choosing the raw as the winner
+  would reject its own JPEG. So changing it reads the folder again,
+  opening on the frame it was on or the one named like it; marks made
+  before can no longer be undone. A folder with none of what's asked for
+  opens on what it has, and a picture that's opened is shown, with all
+  of its folder, whatever the setting.
+- **Each file has its own mark.** A raw's mark says nothing of the JPEG
+  beside it, and nothing is written for a picture that isn't in the cull.
+- **Colour:** a JPEG that carries a profile is in that, whatever its Exif
+  says: darktable's exports can be in anything (Michael's are Linear
+  ProPhoto RGB, with Exif that says sRGB). sRGB and Adobe RGB are taken as
+  they are; anything else is converted to sRGB as it's decoded, so the
+  histogram, clipping, faces and signals see what the picture looks like,
+  and colours outside sRGB are lost. Checked on a real export against
+  ImageMagick's conversion: the same to within a level.
+- **The focus point** is Sony's, where the JPEG has it, unless the JPEG
+  isn't the shape of the frame the camera focused in: an export keeps the
+  makernote, turned or cropped or not. One cropped to the same shape
+  still shows it in the wrong place.
+- **Speed**, on 24 real exports of 24 MP (18 MB each): 170 ms to decode
+  one, 230 ms with its colours converted for 100%, where a raw's preview
+  takes 10 ms. Stepping at a walk is still ahead of the cursor, on every
+  core; held down, the arrow shows enlarged thumbnails. A phone's 12 MP
+  takes 120 ms.
+
 ### Other raw developers
 
 `~/.config/omacull/config.toml` (M8; written with every setting commented
@@ -254,11 +293,14 @@ darktable. There are three settings and one for suggestions:
 | `developer` | `"darktable"` | The program Ctrl+E hands the folder to. |
 | `confidence` | `0.8` | How sure the model has to be to suggest a mark. |
 
-A reject is always a rating of -1, as Bridge writes it too.
+A reject is always a rating of -1, as Bridge writes it too. A JPEG's
+sidecar is `DSC01234.JPG.xmp` however `sidecar` is set: `DSC01234.xmp`
+would be the raw's too, where a camera wrote both.
 
 ### The sidecar
 
-- Sidecars are named the way darktable names them: `DSC01234.ARW.xmp`.
+- Sidecars are named the way darktable names them: `DSC01234.ARW.xmp`,
+  and `DSC01234.JPG.xmp` for a JPEG.
 - No sidecar yet: write a minimal one holding just the rating.
 - Sidecar exists: change the rating field and nothing else. darktable's
   history stack must survive byte-for-byte apart from that field.
@@ -289,6 +331,14 @@ Nothing there is undecided, so nothing is suggested, and the filters for
 picks say nothing. Culling before importing avoids it; so does setting
 darktable's rating on import to none.
 
+And for JPEGs, from M9: a JPEG can hold a rating itself (darktable's
+exports carry their raw's), which Omacull doesn't read. Such a JPEG
+opens undecided; darktable gives it the rating in its sidecar if it has
+one, and the one inside it if not. Checked against darktable 5.6.1 as in
+M0: a sidecar's 4 stars over 2 inside the JPEG arrived as 4, its -1 as
+rejected, and with no sidecar the 2. So what's left unmarked in a folder
+of exports shows in darktable with the stars it was exported with.
+
 ## Architecture
 
 Same stack and layout as Omapix: Rust, egui on wgpu, Little CMS 2, GPL-3.
@@ -297,7 +347,7 @@ Omapix, not shared as crates (revisit if the copies start to drift).
 
 ```
 crates/
-  omacull-engine   folder scan, raw preview extraction, EXIF and makernotes,
+  omacull-engine   folder scan, raw preview extraction, JPEGs, EXIF and makernotes,
                    XMP read/write, thumbnail cache, stacking, signals,
                    decision log and the model trained on it
                    (no UI or GPU dependencies; testable headless)

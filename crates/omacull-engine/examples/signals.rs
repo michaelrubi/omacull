@@ -9,13 +9,13 @@
 
 use std::path::PathBuf;
 
-use omacull_engine::cull::Cull;
+use omacull_engine::cull::{Cull, Formats};
 use omacull_engine::{faces, image, signals};
 use rayon::prelude::*;
 
 fn main() {
     let dir = PathBuf::from(std::env::args_os().nth(1).expect("usage: signals <folder>"));
-    let (cull, _) = Cull::open(&dir).expect("open the folder");
+    let (cull, _) = Cull::open(&dir, Formats::All).expect("open the folder");
     let cache = faces::default_dir();
     let measured: Vec<_> = cull
         .frames()

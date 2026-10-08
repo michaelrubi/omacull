@@ -1,8 +1,8 @@
 # AGENTS.md
 
-Omacull is a fast, keyboard-first photo culler for Omarchy: a folder of raws in, XMP ratings out, then on to darktable. It is the first stage of the workflow Omapix (`~/dev/omapix`) finishes.
+Omacull is a fast, keyboard-first photo culler for Omarchy: a folder of raws (or JPEGs) in, XMP ratings out, then on to darktable. It is the first stage of the workflow Omapix (`~/dev/omapix`) finishes.
 
-**Status:** M8 built, which is the whole roadmap: M1's culling (step, mark, filter, undo, sidecars, decision log), M2's inspection (100% zoom on a full development of the raw, histogram, clipping, focus peaking, focus point, shooting settings, colour management), compare and survey with multi-select, M4's folder tree, cull summary, darktable handoff and per-folder places, M5's face and eye detection (`omacull-ai`, YuNet on the system's ONNX Runtime) with zoom to the eyes and face close-ups, M6's stacks (by hand, by time, or by time and look) with a winner chosen in one key, M7's signals (sharpness, shut eyes, clipping), suggested stack winners and a model trained locally on the decision log, and M8's Arch package, NEF/CR3/RAF reading, `config.toml` and docs. Waiting on a hand test with a real shoot. Read [docs/DESIGN.md](docs/DESIGN.md) for scope and architecture and [docs/ROADMAP.md](docs/ROADMAP.md) for the milestones, what each still wants trying, and the "Later" lists.
+**Status:** M9 built, which is the whole roadmap: M1's culling (step, mark, filter, undo, sidecars, decision log), M2's inspection (100% zoom on a full development of the raw, histogram, clipping, focus peaking, focus point, shooting settings, colour management), compare and survey with multi-select, M4's folder tree, cull summary, darktable handoff and per-folder places, M5's face and eye detection (`omacull-ai`, YuNet on the system's ONNX Runtime) with zoom to the eyes and face close-ups, M6's stacks (by hand, by time, or by time and look) with a winner chosen in one key, M7's signals (sharpness, shut eyes, clipping), suggested stack winners and a model trained locally on the decision log, M8's Arch package, NEF/CR3/RAF reading, `config.toml` and docs, and M9's JPEGs (culled like raws, 100% from the JPEG itself, their own colour profile believed) and the format switch for folders that hold raws and JPEGs both. Waiting on a hand test with a real shoot. Read [docs/DESIGN.md](docs/DESIGN.md) for scope and architecture and [docs/ROADMAP.md](docs/ROADMAP.md) for the milestones, what each still wants trying, and the "Later" lists.
 
 ## Principles
 
@@ -18,7 +18,8 @@ Omacull is a fast, keyboard-first photo culler for Omarchy: a folder of raws in,
 - Keep diffs minimal and surgical. No speculative abstractions or unnecessary dependencies.
 - Sidecar writes must leave everything except the rating byte-for-byte intact. Test against real darktable-written sidecars.
 - Suggestions never mark anything: the user takes one or doesn't, and either way it's logged.
-- Only Sony ARW has been read from a real camera. NEF, CR3 and RAF are tested on made-up files (`omacull_engine::testing`); say so wherever they come up.
+- Only Sony ARW has been read from a real camera. NEF, CR3 and RAF are tested on made-up files (`omacull_engine::testing`); say so wherever they come up. JPEGs have been read from real darktable exports and a phone's, not from one straight out of a camera.
+- The format switch (All, RAW, JPEG) decides which files are in the `Cull`, not which are shown: a picture that isn't culled must not be counted, stacked, suggested for or marked.
 - Hand testing: Michael tests from the installed binary, not `cargo run`. After a change he'll try by hand, run `make install` and ask him to restart Omacull.
 - Whenever non-trivial UI or engine logic is added, write a headless test. In `omacull`, use the `Harness` in `app.rs` (driving egui with synthetic events). Fake raws with real embedded JPEGs come from `omacull_engine::testing` (the `testing` feature).
 

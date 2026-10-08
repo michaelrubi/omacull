@@ -278,6 +278,24 @@ mod tests {
     }
 
     #[test]
+    fn a_jpeg_loads_whole_for_100_percent_with_nothing_to_develop() {
+        let folder = Folder::new("loader-jpeg");
+        let path = folder.0.join("DSC00001.JPG");
+        let camera = Arw { preview: crate::testing::jpeg(3000, 2000, [200, 120, 40]), orientation: 6, ..Arw::default() };
+        std::fs::write(&path, camera.jpeg()).unwrap();
+        let loader = Loader::new(vec![path], Some(folder.0.join("cache")), Arc::new(Display::srgb()), || {});
+        let jobs = [Job::Full(0), Job::Preview(0), Job::Thumbnail(0)];
+        loader.want(jobs);
+        let mut loaded = wait(&loader, jobs.len());
+        loaded.sort_by_key(|l| format!("{:?}", l.job));
+        let sizes: Vec<_> = loaded.iter().map(|l| size(&l.result)).collect();
+        assert_eq!(sizes, [Some((2000, 3000)), Some((1365, 2048)), Some((213, 320))]);
+        let Ok(Output::Full(full)) = &loaded[0].result else { panic!("no full-size frame") };
+        assert_eq!(full.marks.len(), 2000 * 3000);
+        assert_eq!(full.info.exif.iso, Some(400));
+    }
+
+    #[test]
     fn what_was_converted_for_another_monitor_is_dropped() {
         let folder = Folder::with_raws("loader-display", 1, &Arw::default());
         let loader = Loader::with_threads(1, vec![folder.raw(1)], None, Arc::new(Display::srgb()), || {});

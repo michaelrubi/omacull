@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use egui::{Align2, FontId, RichText, Sense, Ui, pos2, vec2};
 use omacull_engine::color::Display;
-use omacull_engine::cull::{Change, Cull, Filter, Rating, Step};
+use omacull_engine::cull::{self, Change, Cull, Filter, Formats, Rating, Step};
 use omacull_engine::stacks::Stacking;
 use omacull_engine::disk::{self, Disk, How, Mark, Problem};
 use omacull_engine::learn::{self, Model};
@@ -47,7 +47,7 @@ pub struct Paths {
 /// A folder being read.
 struct Opening {
     dir: PathBuf,
-    /// The raw to start at, when a raw was opened rather than a folder.
+    /// The picture to start at, when one was opened rather than a folder.
     select: Option<PathBuf>,
     result: Receiver<io::Result<(Cull, Vec<String>)>>,
 }
@@ -310,18 +310,24 @@ impl App {
         file_name(Path::new(&self.paths.darktable))
     }
 
-    /// Open a folder of raws in the background, or the folder a raw is in,
-    /// starting at that raw.
+    /// Open a folder of pictures in the background, or the folder a
+    /// picture is in, starting at that picture.
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         let (dir, select) = match path.parent() {
             Some(parent) if path.is_file() => (parent.to_path_buf(), Some(path)),
             _ => (path, None),
         };
+        // A picture that was opened is shown, whichever are culled as a
+        // rule.
+        let formats = match select.as_deref().and_then(cull::kind) {
+            Some(kind) if !self.state.formats.takes(kind) => Formats::All,
+            _ => self.state.formats,
+        };
         let (tx, rx) = channel();
         let (ctx, target) = (ctx.clone(), dir.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(Cull::open(&target));
+            let _ = tx.send(Cull::open(&target, formats));
             ctx.request_repaint();
         });
         self.message = Some((format!("Opening {}…", dir.display()), false));
@@ -342,7 +348,14 @@ impl App {
                 self.remember_place();
                 // Where it was left, unless a raw in it was opened.
                 let place = self.state.place(cull.dir()).cloned();
-                let at = |name: &str| cull.frames().iter().position(|f| file_name(&f.path) == name);
+                // By name, or failing that the frame named like it: the
+                // raw a JPEG came with, when only raws are culled now.
+                let at = |name: &str| {
+                    let stem = Path::new(name).file_stem();
+                    let frames = cull.frames();
+                    let named = frames.iter().position(|f| file_name(&f.path) == name);
+                    named.or_else(|| frames.iter().position(|f| f.path.file_stem() == stem))
+                };
                 let start = match select {
                     Some(raw) => cull.frames().iter().position(|f| f.path == raw),
                     None => place.as_ref().and_then(|p| at(&p.frame)),
@@ -380,6 +393,26 @@ impl App {
                 self.message = Some((format!("Couldn't open {}: {e}", dir.display()), true));
             }
         }
+    }
+
+    /// Cull another of the folder's formats. Where it holds both, it's
+    /// read again, and opens on the frame it was on or the one named like
+    /// it; marks made so far can no longer be undone.
+    fn set_formats(&mut self, formats: Formats, ctx: &egui::Context) {
+        self.state.set_formats(formats);
+        let held = self.shoot.as_ref().map(|shoot| (shoot.cull.holds(), shoot.cull.dir().to_path_buf()));
+        let only = match held {
+            Some(((raws, jpegs), dir)) if raws > 0 && jpegs > 0 => {
+                // The marks on their way to the sidecars are read back from
+                // them.
+                self.disk.flush();
+                return self.open(dir, ctx);
+            }
+            Some(((0, _), _)) => " (this folder has only JPEGs)",
+            Some(_) => " (this folder has only raws)",
+            None => "",
+        };
+        self.message = Some((format!("Format: {}{only}", formats.label()), false));
     }
 
     /// Ask for a folder to open, with the system's picker.
@@ -430,6 +463,10 @@ impl App {
                 if let Some(tree) = &mut self.tree {
                     tree.refresh();
                 }
+            }
+            Command::Formats => {
+                let formats = self.shoot.as_ref().map_or(self.state.formats, |shoot| shoot.cull.formats());
+                return self.set_formats(formats.next(), ctx);
             }
             Command::Summary => self.summary = !self.summary,
             Command::Back if self.summary => {
@@ -689,12 +726,15 @@ impl App {
         let bar = egui::Frame::new()
             .fill(self.theme.dark_background)
             .inner_margin(egui::Margin::symmetric(8, 4));
-        let (command, stack_to) = egui::Panel::bottom("status")
+        let (command, stack_to, formats) = egui::Panel::bottom("status")
             .frame(bar)
             .show(ui, |ui| self.status_bar(ui))
             .inner;
         if let Some(command) = command {
             self.run(command, &ctx);
+        }
+        if let Some(formats) = formats {
+            self.set_formats(formats, &ctx);
         }
         if let (Some(stacking), Some(shoot)) = (stack_to, &mut self.shoot) {
             shoot.cull.set_stacking(stacking);
@@ -755,11 +795,11 @@ impl App {
         }
     }
 
-    /// Where the cull stands, and the filter, stacking and auto-advance
-    /// switches. Returns the command for a switch clicked, or the stacking
-    /// chosen.
-    fn status_bar(&self, ui: &mut Ui) -> (Option<Command>, Option<Stacking>) {
-        let (mut command, mut stack_to) = (None, None);
+    /// Where the cull stands, and the filter, format, stacking and
+    /// auto-advance switches. Returns the command for a switch clicked, or
+    /// the stacking or the formats chosen.
+    fn status_bar(&self, ui: &mut Ui) -> (Option<Command>, Option<Stacking>, Option<Formats>) {
+        let (mut command, mut stack_to, mut formats_to) = (None, None, None);
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(shoot) = &self.shoot {
@@ -774,6 +814,23 @@ impl App {
                                 }
                             }
                         });
+                    // Only where there's a choice: raws and JPEGs both.
+                    let (raws, jpegs) = shoot.cull.holds();
+                    if raws > 0 && jpegs > 0 {
+                        let formats = shoot.cull.formats();
+                        let tip = format!("{raws} raws, {jpegs} JPEGs ({})", shortcut(Command::Formats));
+                        egui::ComboBox::from_id_salt("formats")
+                            .selected_text(format!("Format: {}", formats.label()))
+                            .show_ui(ui, |ui| {
+                                for f in Formats::ALL {
+                                    if ui.selectable_label(f == formats, f.label()).clicked() {
+                                        formats_to = Some(f);
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(tip);
+                    }
                     let stacking = shoot.cull.stacking();
                     egui::ComboBox::from_id_salt("stacking")
                         .selected_text(format!("Stacks: {}", stacking.label()))
@@ -826,7 +883,7 @@ impl App {
                 });
             });
         });
-        (command, stack_to)
+        (command, stack_to, formats_to)
     }
 
     /// Where the cull stands: picks, rejects, undecided and each star, with
@@ -895,7 +952,7 @@ impl App {
             ui.add_space(ui.available_height() * space);
             ui.label(RichText::new("Omacull").size(28.0).color(self.theme.accent));
             ui.add_space(8.0);
-            let open = format!("Open a folder of raws with {}", shortcut(Command::Open));
+            let open = format!("Open a folder of raws or JPEGs with {}", shortcut(Command::Open));
             ui.label(RichText::new(open).color(self.theme.dark_foreground));
             ui.add_space(12.0);
             if ui.button("Open…").clicked() {
@@ -1076,6 +1133,7 @@ mod tests {
     use egui::{Event, Key, Modifiers, PointerButton};
     use omacull_engine::cull::PICK;
     use omacull_engine::cull::Filter;
+    use omacull_engine::cull::Formats;
     use omacull_engine::sidecar;
     use omacull_engine::testing::{Arw, Folder};
 
@@ -1581,12 +1639,126 @@ mod tests {
         assert!(h.cull().selection().is_empty(), "Escape leaves the survey, then the selection");
     }
 
+    /// The same frames as raws and as the JPEGs a camera writes beside
+    /// them, each pair a second after the last.
+    fn pairs(name: &str, count: usize) -> Folder {
+        let folder = Folder::new(name);
+        for i in 1..=count {
+            let captured: &'static str = Box::leak(format!("2026:10:04 12:00:{i:02}").into_boxed_str());
+            let frame = || Arw { captured: (captured, "0"), ..Arw::default() };
+            frame().write(&folder.raw(i));
+            std::fs::write(folder.raw(i).with_extension("JPG"), frame().jpeg()).unwrap();
+        }
+        folder
+    }
+
+    fn names(h: &Harness) -> Vec<String> {
+        h.cull().frames().iter().map(|f| file_name(&f.path)).collect()
+    }
+
+    #[test]
+    fn jpegs_are_culled_like_raws_and_zoom_without_developing() {
+        let folder = Folder::new("app-jpegs");
+        for i in 1..=3 {
+            let picture = omacull_engine::testing::jpeg(600, 400, [200, 120, 40]);
+            let camera = Arw { preview: picture, orientation: 6, ..Arw::default() };
+            std::fs::write(folder.0.join(format!("DSC{i:05}.JPG")), camera.jpeg()).unwrap();
+        }
+        let cache = folder.0.join("cache");
+        let mut h = Harness::open(&folder, Paths { cache: Some(cache.clone()), ..quiet() });
+        assert_eq!((h.cull().frames().len(), h.cull().holds()), (3, (0, 3)));
+        let settings = "1/250 s   f/2.8   ISO 400   85 mm   FE 85mm F1.8   2026-10-04 12:00:00";
+        assert_eq!(h.shoot().info().unwrap().summary(), settings, "from the JPEG's own Exif");
+        // 100% is the JPEG itself, decoded ahead like a raw's development.
+        h.wait("the full-size frame", |app| app.shoot.as_ref().unwrap().full_state(0).is_some());
+        h.press(NONE, Key::Z);
+        h.frame(vec![]);
+        assert!(h.shoot().view().zoomed);
+        assert!(h.shoot().full_state(0).unwrap().is_ok_and(|tiles| tiles > 0), "nothing to develop");
+        assert_eq!(h.shoot().full_size(1.0), vec2(400.0, 600.0), "upright");
+        h.press(NONE, Key::Z);
+
+        h.press(NONE, Key::Num4);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::X);
+        assert_eq!(status(h.cull()), "DSC00002.JPG   2 / 3   1 picks   1 rejects   1 undecided");
+        h.app.disk.finish();
+        let sidecar = |i: usize| folder.0.join(format!("DSC{i:05}.JPG.xmp"));
+        let rating = |i: usize| sidecar::rating(&std::fs::read_to_string(sidecar(i)).unwrap()).unwrap();
+        assert_eq!((rating(1), rating(2), sidecar(3).exists()), (Some(4), Some(REJECT), false));
+        h.wait("the thumbnails in the cache", |_| std::fs::read_dir(&cache).is_ok_and(|d| d.count() == 3));
+
+        // Only one format here, so there's nothing to switch between.
+        h.press(Modifiers::SHIFT, Key::F);
+        assert_eq!(h.app.state.formats, Formats::Raw);
+        assert_eq!(h.app.message.as_ref().unwrap().0, "Format: RAW (this folder has only JPEGs)");
+        assert_eq!((h.cull().frames().len(), h.ratings()), (3, vec![4, REJECT, 0]), "and nothing is read again");
+    }
+
+    #[test]
+    fn raws_and_jpegs_are_culled_together_or_one_format_at_a_time() {
+        let folder = pairs("app-formats", 3);
+        let mut h = Harness::open(&folder, quiet());
+        assert_eq!((h.cull().formats(), h.cull().holds()), (Formats::All, (3, 3)));
+        assert_eq!(names(&h)[..3], ["DSC00001.ARW", "DSC00001.JPG", "DSC00002.ARW"], "side by side");
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::Num3);
+        assert_eq!(status(h.cull()), "DSC00002.JPG   4 / 6   1 picks   0 rejects   5 undecided");
+
+        // Shift+F: only the raws, at the one that JPEG came with. Its mark
+        // is its own.
+        h.press(Modifiers::SHIFT, Key::F);
+        h.wait("the raws", |app| app.shoot.as_ref().is_some_and(|s| s.cull.formats() == Formats::Raw));
+        assert_eq!(names(&h), ["DSC00001.ARW", "DSC00002.ARW", "DSC00003.ARW"]);
+        assert_eq!((h.cull().current(), h.ratings(), h.cull().left_out()), (1, vec![0, 0, 0], 3));
+        assert_eq!(h.app.state.formats, Formats::Raw);
+        assert_eq!(status(h.cull()), "DSC00002.ARW   2 / 3   0 picks   0 rejects   3 undecided");
+        // What isn't culled isn't stacked or marked: a burst's winner
+        // rejects the other raws, and no JPEG.
+        h.press(Modifiers::SHIFT, Key::G);
+        h.press(Modifiers::SHIFT, Key::G);
+        assert_eq!(h.cull().stacks(), [vec![0, 1, 2]]);
+        h.press(NONE, Key::W);
+        assert_eq!(h.ratings(), [REJECT, PICK, REJECT]);
+
+        // Again: only the JPEGs, with the mark made before the raws were
+        // read, and none of the raws'.
+        h.press(Modifiers::SHIFT, Key::F);
+        h.wait("the JPEGs", |app| app.shoot.as_ref().is_some_and(|s| s.cull.formats() == Formats::Jpeg));
+        assert_eq!(names(&h), ["DSC00001.JPG", "DSC00002.JPG", "DSC00003.JPG"]);
+        assert_eq!((h.cull().current(), h.ratings()), (1, vec![0, 3, 0]));
+        h.press(Modifiers::SHIFT, Key::F);
+        h.wait("everything", |app| app.shoot.as_ref().is_some_and(|s| s.cull.formats() == Formats::All));
+        assert_eq!(h.ratings(), [REJECT, 0, PICK, 3, REJECT, 0]);
+        assert_eq!(file_name(&h.cull().frame().path), "DSC00002.JPG", "where it was");
+    }
+
+    #[test]
+    fn a_picture_thats_opened_is_shown_whatever_was_being_culled() {
+        let folder = pairs("app-formats-open", 2);
+        let mut h = Harness::with(quiet(), &[]);
+        h.app.state.set_formats(Formats::Raw);
+        h.app.open(folder.0.clone(), &h.ctx.clone());
+        h.wait("the raws", |app| app.shoot.is_some());
+        assert_eq!(names(&h), ["DSC00001.ARW", "DSC00002.ARW"]);
+        h.app.open(folder.raw(2).with_extension("JPG"), &h.ctx.clone());
+        h.wait("the JPEG", |app| app.shoot.as_ref().is_some_and(|s| s.cull.formats() == Formats::All));
+        assert_eq!((h.cull().frames().len(), file_name(&h.cull().frame().path)), (4, "DSC00002.JPG".to_owned()));
+        assert_eq!(h.app.state.formats, Formats::Raw, "for that once");
+        // And Shift+F goes on from what's shown.
+        h.press(Modifiers::SHIFT, Key::F);
+        h.wait("the raws again", |app| app.shoot.as_ref().is_some_and(|s| s.cull.formats() == Formats::Raw));
+        assert_eq!(file_name(&h.cull().frame().path), "DSC00002.ARW");
+    }
+
     fn quiet() -> Paths {
         Paths { cache: None, log: None, darktable: "darktable".into(), faces: None, signals: None, model: None }
     }
 
     #[test]
-    fn the_folder_tree_counts_raws_and_opens_folders() {
+    fn the_folder_tree_counts_pictures_and_opens_folders() {
         let root = Folder::new("app-tree");
         let (a, b) = (root.0.join("a shoot"), root.0.join("b shoot"));
         for (dir, count) in [(&a, 3), (&b, 2), (&b.join("selects"), 1)] {
