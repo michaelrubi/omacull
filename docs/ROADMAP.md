@@ -4,8 +4,9 @@ What's planned, in the order we plan to do it. [DESIGN.md](DESIGN.md)
 covers the scope and architecture.
 
 Status: M0 done on 2026-10-04 (scoped the same day). M1 to M8 built the
-same day, waiting to be tried on a real shoot. What each still wants
-trying is under its heading; what was left out is under "Later".
+same day, waiting to be tried on a real shoot. M9 (non-raw formats and
+filtering) planned. What each still wants trying is under its heading;
+what was left out is under "Later".
 
 Each milestone ends with something Michael can use on a real shoot. M1 is
 the point where Omacull replaces XnView MP for a basic cull; everything
@@ -190,6 +191,24 @@ Later:
 - 100% zoom straight from a full-size embedded JPEG, on cameras that have
   one.
 - The focus point from Nikon's, Canon's and Fuji's makernotes.
+
+## M9. Non-raw formats and format filtering (planned)
+
+Support culling shoots containing standalone JPEGs (and potentially PNGs),
+handling mixed RAW+JPEG folders without cluttering the filmstrip.
+
+- **Standalone JPEG decoding:** Read JPEGs directly with `zune-jpeg`.
+  Extract Exif metadata (shutter, aperture, ISO, orientation, capture time)
+  from the `APP1` marker using the existing TIFF IFD parser.
+- **100% zoom on JPEGs:** Instant 100% zoom directly from the full decoded
+  JPEG, bypassing `rawler` demosaicing and histogram matching.
+- **Sidecars:** darktable-compatible `.jpg.xmp` (or `.xmp`) sidecars
+  written and read identically to raws.
+- **Format filter toggle:** An orthogonal filter in the status bar (and
+  keyboard toggle) to view `All`, `RAW only`, or `JPEG only` so shoots with
+  RAW+JPEG pairs don't display duplicate frames side by side.
+- **PNG support (on demand):** Decoding via `zune-png` or `png` if
+  concrete culling workflows require non-camera graphic or scan files.
 
 ## Not planned
 
