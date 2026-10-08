@@ -1,7 +1,7 @@
 # Omacull
 
 A fast, keyboard-first photo culler for [Omarchy](https://omarchy.org).
-Open a folder of raws (or JPEGs), step through them without waiting, mark
+Open a folder of raws (or JPEGs, or PNGs), step through them without waiting, mark
 picks, rejects and stars, and hand the folder to darktable.
 
 > Omacull is an independent project. It is not made by or affiliated with
@@ -46,9 +46,9 @@ it, [say how it went](CONTRIBUTING.md).
   shown, and Y takes it. Once you've made a hundred or so decisions,
   Omacull learns from them, on your machine, and suggests marks it's sure
   of for you to take (Y) or leave. Nothing is ever marked on its own.
-- **JPEGs too:** a folder of JPEGs is culled the same way, with 100%
-  straight from the JPEG. Where raws and JPEGs sit together, Shift+F
-  culls them all, only the raws or only the JPEGs.
+- **JPEGs and PNGs too:** a folder of them is culled the same way, with
+  100% straight from the picture. Where raws sit with JPEGs or PNGs,
+  Shift+F culls them all, or one format alone.
 - **Getting around:** T a folder tree, M a summary of the cull, Shift+U
   the first undecided frame, Ctrl+E on to darktable.
 

@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use egui::{Align2, FontId, RichText, Sense, Ui, pos2, vec2};
 use omacull_engine::color::Display;
-use omacull_engine::cull::{self, Change, Cull, Filter, Formats, Rating, Step};
+use omacull_engine::cull::{self, Change, Cull, Filter, Formats, Kind, Rating, Step};
 use omacull_engine::stacks::Stacking;
 use omacull_engine::disk::{self, Disk, How, Mark, Problem};
 use omacull_engine::learn::{self, Model};
@@ -395,23 +395,23 @@ impl App {
         }
     }
 
-    /// Cull another of the folder's formats. Where it holds both, it's
-    /// read again, and opens on the frame it was on or the one named like
-    /// it; marks made so far can no longer be undone.
+    /// Cull another of the folder's formats. Where it holds more than
+    /// one, it's read again, and opens on the frame it was on or the one
+    /// named like it; marks made so far can no longer be undone.
     fn set_formats(&mut self, formats: Formats, ctx: &egui::Context) {
         self.state.set_formats(formats);
-        let held = self.shoot.as_ref().map(|shoot| (shoot.cull.holds(), shoot.cull.dir().to_path_buf()));
-        let only = match held {
-            Some(((raws, jpegs), dir)) if raws > 0 && jpegs > 0 => {
+        let mut only = String::new();
+        if let Some(shoot) = &self.shoot {
+            if !shoot.cull.choices().is_empty() {
+                let dir = shoot.cull.dir().to_path_buf();
                 // The marks on their way to the sidecars are read back from
                 // them.
                 self.disk.flush();
                 return self.open(dir, ctx);
             }
-            Some(((0, _), _)) => " (this folder has only JPEGs)",
-            Some(_) => " (this folder has only raws)",
-            None => "",
-        };
+            let held = Kind::ALL.into_iter().find(|&kind| shoot.cull.holds()[kind as usize] > 0);
+            only = held.map(|kind| format!(" (this folder has only {})", kind.plural())).unwrap_or_default();
+        }
         self.message = Some((format!("Format: {}{only}", formats.label()), false));
     }
 
@@ -465,8 +465,13 @@ impl App {
                 }
             }
             Command::Formats => {
-                let formats = self.shoot.as_ref().map_or(self.state.formats, |shoot| shoot.cull.formats());
-                return self.set_formats(formats.next(), ctx);
+                // Round what the folder holds, where there's a choice.
+                let choices = self.shoot.as_ref().map(|shoot| (shoot.cull.formats(), shoot.cull.choices()));
+                let next = match choices {
+                    Some((formats, choices)) if !choices.is_empty() => formats.next(&choices),
+                    _ => self.state.formats.next(&Formats::ALL),
+                };
+                return self.set_formats(next, ctx);
             }
             Command::Summary => self.summary = !self.summary,
             Command::Back if self.summary => {
@@ -814,15 +819,17 @@ impl App {
                                 }
                             }
                         });
-                    // Only where there's a choice: raws and JPEGs both.
-                    let (raws, jpegs) = shoot.cull.holds();
-                    if raws > 0 && jpegs > 0 {
+                    // Only where there's a choice: more than one kind.
+                    let choices = shoot.cull.choices();
+                    if !choices.is_empty() {
                         let formats = shoot.cull.formats();
-                        let tip = format!("{raws} raws, {jpegs} JPEGs ({})", shortcut(Command::Formats));
+                        let held = Kind::ALL.into_iter().zip(shoot.cull.holds()).filter(|&(_, held)| held > 0);
+                        let held: Vec<String> = held.map(|(kind, held)| format!("{held} {}", kind.plural())).collect();
+                        let tip = format!("{} ({})", held.join(", "), shortcut(Command::Formats));
                         egui::ComboBox::from_id_salt("formats")
                             .selected_text(format!("Format: {}", formats.label()))
                             .show_ui(ui, |ui| {
-                                for f in Formats::ALL {
+                                for f in choices {
                                     if ui.selectable_label(f == formats, f.label()).clicked() {
                                         formats_to = Some(f);
                                     }
@@ -952,7 +959,7 @@ impl App {
             ui.add_space(ui.available_height() * space);
             ui.label(RichText::new("Omacull").size(28.0).color(self.theme.accent));
             ui.add_space(8.0);
-            let open = format!("Open a folder of raws or JPEGs with {}", shortcut(Command::Open));
+            let open = format!("Open a folder of raws, JPEGs or PNGs with {}", shortcut(Command::Open));
             ui.label(RichText::new(open).color(self.theme.dark_foreground));
             ui.add_space(12.0);
             if ui.button("Open…").clicked() {
@@ -1666,7 +1673,7 @@ mod tests {
         }
         let cache = folder.0.join("cache");
         let mut h = Harness::open(&folder, Paths { cache: Some(cache.clone()), ..quiet() });
-        assert_eq!((h.cull().frames().len(), h.cull().holds()), (3, (0, 3)));
+        assert_eq!((h.cull().frames().len(), h.cull().holds()), (3, [0, 3, 0]));
         let settings = "1/250 s   f/2.8   ISO 400   85 mm   FE 85mm F1.8   2026-10-04 12:00:00";
         assert_eq!(h.shoot().info().unwrap().summary(), settings, "from the JPEG's own Exif");
         // 100% is the JPEG itself, decoded ahead like a raw's development.
@@ -1699,7 +1706,7 @@ mod tests {
     fn raws_and_jpegs_are_culled_together_or_one_format_at_a_time() {
         let folder = pairs("app-formats", 3);
         let mut h = Harness::open(&folder, quiet());
-        assert_eq!((h.cull().formats(), h.cull().holds()), (Formats::All, (3, 3)));
+        assert_eq!((h.cull().formats(), h.cull().holds()), (Formats::All, [3, 3, 0]));
         assert_eq!(names(&h)[..3], ["DSC00001.ARW", "DSC00001.JPG", "DSC00002.ARW"], "side by side");
         h.press(NONE, Key::ArrowRight);
         h.press(NONE, Key::ArrowRight);
@@ -1751,6 +1758,50 @@ mod tests {
         h.press(Modifiers::SHIFT, Key::F);
         h.wait("the raws again", |app| app.shoot.as_ref().is_some_and(|s| s.cull.formats() == Formats::Raw));
         assert_eq!(file_name(&h.cull().frame().path), "DSC00002.ARW");
+    }
+
+    #[test]
+    fn pngs_are_culled_too_with_a_format_of_their_own() {
+        use omacull_engine::testing::Png;
+        let folder = pairs("app-pngs", 2);
+        let export = Png { width: 600, height: 400, deep: true, ..Png::default() };
+        std::fs::write(folder.0.join("DSC00001.png"), export.bytes()).unwrap();
+        let mut h = Harness::open(&folder, quiet());
+        assert_eq!((h.cull().holds(), h.cull().choices()), ([2, 2, 1], Formats::ALL.to_vec()));
+        assert_eq!(names(&h)[..4], ["DSC00001.ARW", "DSC00001.JPG", "DSC00001.png", "DSC00002.ARW"]);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        // 100% is the PNG itself, as a JPEG's is the JPEG.
+        h.wait("the full-size frame", |app| app.shoot.as_ref().unwrap().full_state(2).is_some());
+        h.press(NONE, Key::Z);
+        h.frame(vec![]);
+        assert!(h.shoot().full_state(2).unwrap().is_ok_and(|tiles| tiles > 0), "nothing to develop");
+        assert_eq!(h.shoot().full_size(1.0), vec2(600.0, 400.0));
+        h.press(NONE, Key::Z);
+        // Its mark goes in a sidecar of its own.
+        h.press(NONE, Key::Num5);
+        h.app.disk.finish();
+        let sidecar = std::fs::read_to_string(folder.0.join("DSC00001.png.xmp")).unwrap();
+        assert_eq!(sidecar::rating(&sidecar).unwrap(), Some(5));
+        assert!(!folder.0.join("DSC00001.ARW.xmp").exists() && !folder.0.join("DSC00001.JPG.xmp").exists());
+
+        // Shift+F goes round what the folder holds: the PNGs come last.
+        for formats in [Formats::Raw, Formats::Jpeg, Formats::Png] {
+            h.press(Modifiers::SHIFT, Key::F);
+            h.wait("the next format", |app| app.shoot.as_ref().is_some_and(|s| s.cull.formats() == formats));
+        }
+        assert_eq!((names(&h), h.ratings(), h.cull().left_out()), (vec!["DSC00001.png".to_owned()], vec![5], 4));
+        assert_eq!(h.app.state.formats, Formats::Png);
+
+        // A folder with none is culled whole, and they aren't offered.
+        let other = pairs("app-pngs-none", 1);
+        h.app.open(other.0.clone(), &h.ctx.clone());
+        h.wait("the other folder", |app| app.shoot.as_ref().is_some_and(|s| s.cull.frames().len() == 2));
+        assert_eq!(h.cull().formats(), Formats::All);
+        assert_eq!(h.cull().choices(), [Formats::All, Formats::Raw, Formats::Jpeg]);
+        h.press(Modifiers::SHIFT, Key::F);
+        h.wait("its raws", |app| app.shoot.as_ref().is_some_and(|s| s.cull.formats() == Formats::Raw));
+        assert_eq!(names(&h), ["DSC00001.ARW"]);
     }
 
     fn quiet() -> Paths {

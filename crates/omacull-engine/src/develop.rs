@@ -9,7 +9,8 @@
 //! than each level as are in the preview. Shapes, noise and focus are the
 //! raw's; brightness, contrast and colour are near the camera's.
 //!
-//! A JPEG on its own is developed already: its 100% is the picture itself.
+//! A JPEG or a PNG on its own is developed already: its 100% is the
+//! picture itself.
 
 use std::io;
 use std::path::Path;
@@ -25,10 +26,11 @@ const STEPS: usize = 4096;
 
 /// A raw developed at full size, upright, its tones matched to the
 /// camera's preview, which is returned too, with the colours they're in
-/// and what else the loupe shows. A JPEG is decoded whole instead.
+/// and what else the loupe shows. A JPEG or a PNG is decoded whole
+/// instead.
 pub fn full(raw: &Path) -> io::Result<(Image, Image, Space, Info)> {
     let file = RawFile::open(raw)?;
-    if file.developed {
+    if file.developed.is_some() {
         let (full, space) = image::picture(&file, usize::MAX)?;
         let preview = full.shrunk(image::LARGEST_PREVIEW);
         return Ok((full, preview, space, file.info()));
@@ -141,6 +143,24 @@ mod tests {
         assert_eq!((preview.width, preview.height, space), (1365, 2048, Space::Srgb));
         assert_eq!(info.size, Some((2000, 3000)));
         assert!(image.pixel(1000, 1500)[0].abs_diff(200) < 4, "as the camera rendered it: {:?}", image.pixel(1000, 1500));
+    }
+
+    #[test]
+    fn a_png_at_full_size_is_the_png() {
+        use crate::testing::{Arw, Png};
+        let folder = crate::testing::Folder::new("develop-png");
+        let path = folder.0.join("export.png");
+        // Turned by its Exif, where it has one, as a JPEG is.
+        let exif = Arw { preview: Vec::new(), thumbnail: Vec::new(), orientation: 8, ..Arw::default() }.bytes();
+        let export = Png { width: 3000, height: 2000, deep: true, exif: Some(exif), ..Png::default() };
+        std::fs::write(&path, export.bytes()).unwrap();
+        let (image, preview, space, info) = full(&path).unwrap();
+        assert_eq!((image.width, image.height), (2000, 3000), "every pixel, upright");
+        assert_eq!((preview.width, preview.height, space), (1365, 2048, Space::Srgb));
+        assert_eq!((info.size, info.exif.iso), (Some((2000, 3000)), Some(400)));
+        assert_eq!(image.pixel(1000, 1500), [200, 120, 40, 255]);
+        // And it's its own preview.
+        assert_eq!(image::preview_with_info(&path).unwrap(), (preview, space, info));
     }
 
     #[test]

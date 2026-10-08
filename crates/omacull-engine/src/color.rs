@@ -6,9 +6,10 @@
 //! comes out too saturated unless it's converted to the monitor's profile
 //! first. Profiles and EDID reading as in Omapix.
 //!
-//! A JPEG on its own may carry a profile of its own, and be in anything:
-//! darktable exports in whatever it's told to. [`tagged`] brings those to
-//! sRGB as they're decoded, so the rest of Omacull only knows two spaces.
+//! A JPEG or a PNG on its own may carry a profile of its own, and be in
+//! anything: darktable exports in whatever it's told to. [`tagged`] brings
+//! those to sRGB as they're decoded, so the rest of Omacull only knows two
+//! spaces.
 
 use std::io::{self, ErrorKind};
 
@@ -127,7 +128,9 @@ impl ColorProfile {
     }
 }
 
-type Rgba = Transform<[u8; 4], [u8; 4], GlobalContext, DisallowCache>;
+pub(crate) type Rgba = Transform<[u8; 4], [u8; 4], GlobalContext, DisallowCache>;
+/// From 16 bits a channel to 8.
+pub(crate) type Deep = Transform<[u16; 4], [u8; 4], GlobalContext, DisallowCache>;
 
 /// Converts frames to the monitor's colours.
 pub struct Display {
@@ -151,38 +154,72 @@ fn transform(from: &Profile, to: &Profile) -> io::Result<Rgba> {
     .map_err(invalid)
 }
 
+/// What the profile a picture carries says it's in.
+pub(crate) enum Tagged {
+    /// One of the two the rest of Omacull knows.
+    Is(Space),
+    /// Something else, to be converted to sRGB.
+    Other(Profile),
+}
+
 /// What a picture that carries its own profile is in. If that's sRGB or
 /// Adobe RGB it's left as it is; from anything else it's converted to
 /// sRGB, in place, so it's measured and shown like any other. None if the
 /// profile can't be made sense of.
 pub fn tagged(image: &mut Image, icc: &[u8]) -> Option<Space> {
-    // Colours that come through unchanged only if the two are the same.
-    const PROBES: [[u8; 4]; 8] = [
-        [0, 0, 0, 255],
-        [255, 255, 255, 255],
-        [128, 128, 128, 255],
-        [255, 0, 0, 255],
-        [0, 255, 0, 255],
-        [0, 0, 255, 255],
-        [64, 128, 192, 255],
-        [200, 100, 50, 255],
-    ];
-    let profile = Profile::new_icc(icc).ok()?;
-    let same = |to: &Rgba| {
-        let mut probes = PROBES;
-        to.transform_in_place(&mut probes);
-        probes.iter().zip(&PROBES).all(|(got, sent)| got.iter().zip(sent).all(|(a, b)| a.abs_diff(*b) <= 2))
+    let profile = match Tagged::read(icc)? {
+        Tagged::Is(space) => return Some(space),
+        Tagged::Other(profile) => profile,
     };
-    let to_srgb = transform(&profile, &Profile::new_srgb()).ok()?;
-    if same(&to_srgb) {
-        return Some(Space::Srgb);
-    }
-    if same(&transform(&profile, &ColorProfile::adobe_rgb().lcms().ok()?).ok()?) {
-        return Some(Space::AdobeRgb);
-    }
+    let to_srgb = to_srgb(&profile).ok()?;
     // A few rows at a time, on every core: a full-size frame is 24 MP.
     image.rgba.par_chunks_mut(1 << 16).for_each(|part| to_srgb.transform_in_place(part.as_chunks_mut::<4>().0));
     Some(Space::Srgb)
+}
+
+/// The way to sRGB from a profile's colours.
+pub(crate) fn to_srgb(profile: &Profile) -> io::Result<Rgba> {
+    transform(profile, &Profile::new_srgb())
+}
+
+/// The way to sRGB, 8 bits a channel, from a profile's colours in 16: a
+/// PNG's are converted before they're cut to 8, or a linear picture's
+/// shadows would come out in steps. What's transparent stays so. Little
+/// CMS takes fifteen times as long over it as over 8 bits.
+pub(crate) fn deep(profile: &Profile) -> io::Result<Deep> {
+    let (from, to, flags) = (PixelFormat::RGBA_16, PixelFormat::RGBA_8, Flags::NO_CACHE | Flags::COPY_ALPHA);
+    Transform::new_flags_context(GlobalContext::new(), profile, from, &Profile::new_srgb(), to, Intent::Perceptual, flags)
+        .map_err(invalid)
+}
+
+impl Tagged {
+    /// None if the profile can't be made sense of.
+    pub(crate) fn read(icc: &[u8]) -> Option<Self> {
+        // Colours that come through unchanged only if the two are the same.
+        const PROBES: [[u8; 4]; 8] = [
+            [0, 0, 0, 255],
+            [255, 255, 255, 255],
+            [128, 128, 128, 255],
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [64, 128, 192, 255],
+            [200, 100, 50, 255],
+        ];
+        let profile = Profile::new_icc(icc).ok()?;
+        let same = |to: &Rgba| {
+            let mut probes = PROBES;
+            to.transform_in_place(&mut probes);
+            probes.iter().zip(&PROBES).all(|(got, sent)| got.iter().zip(sent).all(|(a, b)| a.abs_diff(*b) <= 2))
+        };
+        if same(&transform(&profile, &Profile::new_srgb()).ok()?) {
+            return Some(Tagged::Is(Space::Srgb));
+        }
+        if same(&transform(&profile, &ColorProfile::adobe_rgb().lcms().ok()?).ok()?) {
+            return Some(Tagged::Is(Space::AdobeRgb));
+        }
+        Some(Tagged::Other(profile))
+    }
 }
 
 impl Display {

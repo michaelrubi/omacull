@@ -25,6 +25,10 @@ use zune_jpeg::zune_core::options::DecoderOptions;
 
 /// Decode to RGBA, as it would be uploaded to the GPU.
 fn decode(jpeg: &[u8]) -> (usize, usize, Vec<u8>) {
+    if jpeg.starts_with(b"\x89PNG") {
+        let (image, _) = Image::decode_png(jpeg).expect("decode");
+        return (image.width, image.height, image.rgba);
+    }
     let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
     let mut decoder = JpegDecoder::new_with_options(ZCursor::new(jpeg), options);
     let pixels = decoder.decode().expect("decode");
@@ -33,6 +37,11 @@ fn decode(jpeg: &[u8]) -> (usize, usize, Vec<u8>) {
 }
 
 fn size(jpeg: &[u8]) -> (usize, usize) {
+    // A PNG's is in its first chunk.
+    if let Some(chunks) = jpeg.strip_prefix(b"\x89PNG\r\n\x1a\n") {
+        let side = |at: usize| u32::from_be_bytes([chunks[at], chunks[at + 1], chunks[at + 2], chunks[at + 3]]) as usize;
+        return (side(8), side(12));
+    }
     let mut decoder = JpegDecoder::new(ZCursor::new(jpeg));
     decoder.decode_headers().expect("headers");
     let info = decoder.info().expect("info");

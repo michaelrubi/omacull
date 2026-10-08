@@ -35,7 +35,7 @@ Decided in the 2026-10-04 scoping interview.
 ### In
 
 - **Input:** raw-only shoots of 200 to 1000 frames, Sony ARW first.
-  Since M9, JPEGs too: a folder of them, or beside the raws.
+  Since M9, JPEGs and PNGs too: a folder of them, or beside the raws.
 - **Marks:** reject, pick and 0 to 5 stars. Nothing else.
 - **Views:** loupe with filmstrip, compare (2-up, synced zoom and pan), and
   survey (3 or 4 side by side, more if they still fit usefully; knock out
@@ -243,15 +243,17 @@ now. The status bar has a switch for signals and one for suggestions.
   whether they're any good.
 
 M9's key: Shift+F goes round which of a folder's pictures are culled:
-all of them, only the raws, or only the JPEGs. It's in the status bar too,
-where a folder holds both.
+all of them, only the raws, only the JPEGs or only the PNGs, whichever of
+those it holds. It's in the status bar too, where a folder holds more
+than one kind.
 
 - **JPEGs** (`.jpg`, `.jpeg`) are culled as raws are. A JPEG is its own
   preview, shrunk to 2048 pixels, and its own 100%: it's decoded whole
   for each, nothing is developed. Its settings, orientation, capture time
   and thumbnail come from its Exif, by the reader the raws use (a Fuji
   RAF's are read the same way).
-- **Formats** is a setting, remembered: All (the default), RAW or JPEG.
+- **Formats** is a setting, remembered: All (the default), RAW, JPEG or
+  PNG.
   What isn't asked for isn't in the cull at all: not counted, stacked,
   measured, suggested for or given a thumbnail. As a filter on what's
   shown, a raw and the JPEG the camera wrote beside it, taken at the same
@@ -259,7 +261,7 @@ where a folder holds both.
   would reject its own JPEG. So changing it reads the folder again,
   opening on the frame it was on or the one named like it; marks made
   before can no longer be undone. A folder with none of what's asked for
-  opens on what it has, and a picture that's opened is shown, with all
+  opens on all it has, and a picture that's opened is shown, with all
   of its folder, whatever the setting.
 - **Each file has its own mark.** A raw's mark says nothing of the JPEG
   beside it, and nothing is written for a picture that isn't in the cull.
@@ -279,6 +281,28 @@ where a folder holds both.
   takes 10 ms. Stepping at a walk is still ahead of the cursor, on every
   core; held down, the arrow shows enlarged thumbnails. A phone's 12 MP
   takes 120 ms.
+- **PNGs** (`.png`), added after M9, are culled as JPEGs are: each is its
+  own preview and its own 100%, with a sidecar of its own, and PNG is a
+  format to cull alone like the others. darktable's exports carry a
+  profile and no Exif, so there are no settings or capture time to show,
+  and nothing to stack them by. Exif is read where a PNG has it, from a
+  chunk before the pixels, which is where exiftool writes it; after them
+  it isn't looked for, since that would mean reading through every big
+  file to open a folder.
+- **A PNG's colours:** its profile is believed, as a JPEG's is, and where
+  it has 16 bits a channel they're converted before they're cut to 8: a
+  linear export's shadows would come out in steps otherwise. Without a
+  profile it's taken for sRGB, whatever its gamma or cICP chunks say.
+  What's transparent is shown on mid grey, which neither clipping overlay
+  lights up over. Checked on darktable 5.6.1's exports of a real raw (8
+  and 16 bits; sRGB, Adobe RGB, linear Rec. 2020 and linear ProPhoto)
+  against ImageMagick's conversion: a fiftieth of a level apart on
+  average, where unconverted is 39 levels out. The 28 PNGs on Michael's
+  machine, screenshots and logos, all decode.
+- **A PNG's speed:** a 24 MP export takes 200 ms to decode at 8 bits,
+  500 ms at 16, and 900 ms at 16 in a profile to convert from: Little CMS
+  takes fifteen times as long from 16 bits as from 8. That's for each
+  step and again for 100%.
 
 ### Other raw developers
 
@@ -294,13 +318,14 @@ darktable. There are three settings and one for suggestions:
 | `confidence` | `0.8` | How sure the model has to be to suggest a mark. |
 
 A reject is always a rating of -1, as Bridge writes it too. A JPEG's
-sidecar is `DSC01234.JPG.xmp` however `sidecar` is set: `DSC01234.xmp`
-would be the raw's too, where a camera wrote both.
+sidecar is `DSC01234.JPG.xmp` however `sidecar` is set, and a PNG's
+`DSC01234.png.xmp`: `DSC01234.xmp` would be the raw's too, where they're
+in a folder together.
 
 ### The sidecar
 
 - Sidecars are named the way darktable names them: `DSC01234.ARW.xmp`,
-  and `DSC01234.JPG.xmp` for a JPEG.
+  `DSC01234.JPG.xmp` for a JPEG and `DSC01234.png.xmp` for a PNG.
 - No sidecar yet: write a minimal one holding just the rating.
 - Sidecar exists: change the rating field and nothing else. darktable's
   history stack must survive byte-for-byte apart from that field.
@@ -337,7 +362,9 @@ opens undecided; darktable gives it the rating in its sidecar if it has
 one, and the one inside it if not. Checked against darktable 5.6.1 as in
 M0: a sidecar's 4 stars over 2 inside the JPEG arrived as 4, its -1 as
 rejected, and with no sidecar the 2. So what's left unmarked in a folder
-of exports shows in darktable with the stars it was exported with.
+of exports shows in darktable with the stars it was exported with. A PNG
+is the same, checked the same way: 5 stars in its sidecar over 2 inside
+it arrived as 5.
 
 ## Architecture
 
@@ -347,7 +374,7 @@ Omapix, not shared as crates (revisit if the copies start to drift).
 
 ```
 crates/
-  omacull-engine   folder scan, raw preview extraction, JPEGs, EXIF and makernotes,
+  omacull-engine   folder scan, raw preview extraction, JPEGs and PNGs, EXIF and makernotes,
                    XMP read/write, thumbnail cache, stacking, signals,
                    decision log and the model trained on it
                    (no UI or GPU dependencies; testable headless)
@@ -527,6 +554,7 @@ Building blocks, settled in M0:
 - **JPEG decode:** `zune-jpeg`. libjpeg-turbo was about 20% faster on the
   previews (8.5 ms against 10.5 ms), not enough to take on a C library
   when prefetching hides the decode anyway.
+- **PNG decode:** `png`, which rawler brings in already.
 - **XMP:** `quick-xml` to find the rating, then the bytes are spliced; the
   sidecar is never serialised back out.
 - **Raw decode for 100% zoom:** `rawler`, added when M2 needs it.

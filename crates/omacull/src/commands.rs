@@ -266,7 +266,7 @@ impl Command {
             Command::Unstack => "Unstack",
             Command::ToggleStack => "Open Out or Close Up the Stack",
             Command::Stacking => "How Frames Are Stacked",
-            Command::Formats => "Which Formats Are Culled: All, RAW or JPEG",
+            Command::Formats => "Which Formats Are Culled: All, RAW, JPEG or PNG",
             Command::Winner => "Winner: Pick It, Reject the Rest",
             Command::Signals => "Signals: Sharpness, Shut Eyes, Clipping",
             Command::Suggestions => "Suggestions",

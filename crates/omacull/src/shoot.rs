@@ -985,16 +985,21 @@ impl Shoot {
                 other => {
                     // The preview, enlarged, until the raw is developed.
                     painter.image(texture.id(), rect, uv, Color32::WHITE);
-                    let jpeg = cull::kind(&frame.path) == Some(Kind::Jpeg);
-                    let (text, colour) = match other {
+                    // A JPEG or a PNG has nothing to develop.
+                    let whole = match cull::kind(&frame.path) {
+                        Some(Kind::Jpeg) => Some("JPEG"),
+                        Some(Kind::Png) => Some("PNG"),
+                        _ => None,
+                    };
+                    let (text, colour) = match (other, whole) {
                         // rawler's reasons run long; they're in the log.
-                        Some(Slot::Failed(_)) if jpeg => {
-                            ("Can't decode this JPEG at full size: showing it enlarged".to_owned(), theme.red)
+                        (Some(Slot::Failed(_)), Some(whole)) => {
+                            (format!("Can't decode this {whole} at full size: showing it enlarged"), theme.red)
                         }
-                        Some(Slot::Failed(_)) => {
+                        (Some(Slot::Failed(_)), None) => {
                             ("Can't develop this raw: showing the preview enlarged".to_owned(), theme.red)
                         }
-                        _ if jpeg => ("Decoding the JPEG…".to_owned(), theme.foreground),
+                        (_, Some(whole)) => (format!("Decoding the {whole}…"), theme.foreground),
                         _ => ("Developing the raw…".to_owned(), theme.foreground),
                     };
                     let at = area.center_top() + vec2(0.0, 12.0);
