@@ -60,6 +60,7 @@ pub enum Command {
     Unstack,
     ToggleStack,
     Stacking,
+    Formats,
     Winner,
     Signals,
     Suggestions,
@@ -132,6 +133,7 @@ impl Command {
         Command::Unstack,
         Command::ToggleStack,
         Command::Stacking,
+        Command::Formats,
         Command::Winner,
         Command::Signals,
         Command::Suggestions,
@@ -170,6 +172,7 @@ impl Command {
         Command::FaceStrip,
         Command::StackSelection,
         Command::Stacking,
+        Command::Formats,
         Command::Suggestions,
         Command::Learn,
         Command::Quit,
@@ -263,6 +266,7 @@ impl Command {
             Command::Unstack => "Unstack",
             Command::ToggleStack => "Open Out or Close Up the Stack",
             Command::Stacking => "How Frames Are Stacked",
+            Command::Formats => "Which Formats Are Culled: All, RAW or JPEG",
             Command::Winner => "Winner: Pick It, Reject the Rest",
             Command::Signals => "Signals: Sharpness, Shut Eyes, Clipping",
             Command::Suggestions => "Suggestions",
@@ -332,6 +336,7 @@ impl Command {
             Command::Unstack => s(CMD_SHIFT, Key::G),
             Command::ToggleStack => s(Modifiers::NONE, Key::G),
             Command::Stacking => s(Modifiers::SHIFT, Key::G),
+            Command::Formats => s(Modifiers::SHIFT, Key::F),
             Command::Winner => s(Modifiers::NONE, Key::W),
             // Q for the quality of a frame; Y to say yes to a suggestion.
             Command::Signals => s(Modifiers::NONE, Key::Q),
@@ -490,6 +495,9 @@ mod tests {
         assert_eq!(press(&ctx, CMD, Key::L), [Command::Learn]);
         assert_eq!(press(&ctx, Modifiers::NONE, Key::L), [Command::Lock]);
         assert_eq!(press(&ctx, Modifiers::SHIFT, Key::Q), [Command::Suggestions]);
+        // Nor the formats for the focus point.
+        assert_eq!(press(&ctx, Modifiers::SHIFT, Key::F), [Command::Formats]);
+        assert_eq!(press(&ctx, Modifiers::NONE, Key::F), [Command::FocusPoint]);
         assert_eq!(press(&ctx, Modifiers::NONE, Key::Q), [Command::Signals]);
         assert_eq!(press(&ctx, Modifiers::NONE, Key::Y), [Command::Accept]);
     }

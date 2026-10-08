@@ -16,7 +16,7 @@ use egui::{
 };
 use omacull_engine::color::Display;
 use omacull_engine::faces::Face;
-use omacull_engine::cull::{Cull, PICK, Rating};
+use omacull_engine::cull::{self, Cull, Kind, PICK, Rating};
 use omacull_engine::learn::Model;
 use omacull_engine::loader::{Decoded, Job, Loaded, Loader, Output};
 use omacull_engine::raw::Info;
@@ -985,11 +985,16 @@ impl Shoot {
                 other => {
                     // The preview, enlarged, until the raw is developed.
                     painter.image(texture.id(), rect, uv, Color32::WHITE);
+                    let jpeg = cull::kind(&frame.path) == Some(Kind::Jpeg);
                     let (text, colour) = match other {
                         // rawler's reasons run long; they're in the log.
+                        Some(Slot::Failed(_)) if jpeg => {
+                            ("Can't decode this JPEG at full size: showing it enlarged".to_owned(), theme.red)
+                        }
                         Some(Slot::Failed(_)) => {
                             ("Can't develop this raw: showing the preview enlarged".to_owned(), theme.red)
                         }
+                        _ if jpeg => ("Decoding the JPEG…".to_owned(), theme.foreground),
                         _ => ("Developing the raw…".to_owned(), theme.foreground),
                     };
                     let at = area.center_top() + vec2(0.0, 12.0);

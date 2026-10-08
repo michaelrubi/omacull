@@ -8,6 +8,8 @@
 //! picture's levels are mapped so that as many of its pixels are darker
 //! than each level as are in the preview. Shapes, noise and focus are the
 //! raw's; brightness, contrast and colour are near the camera's.
+//!
+//! A JPEG on its own is developed already: its 100% is the picture itself.
 
 use std::io;
 use std::path::Path;
@@ -16,15 +18,21 @@ use rayon::prelude::*;
 
 use crate::color::Space;
 use crate::image::{self, Image};
-use crate::raw::Info;
+use crate::raw::{Info, RawFile};
 
 /// Levels the developed picture's values are counted in.
 const STEPS: usize = 4096;
 
 /// A raw developed at full size, upright, its tones matched to the
 /// camera's preview, which is returned too, with the colours they're in
-/// and what else the loupe shows.
+/// and what else the loupe shows. A JPEG is decoded whole instead.
 pub fn full(raw: &Path) -> io::Result<(Image, Image, Space, Info)> {
+    let file = RawFile::open(raw)?;
+    if file.developed {
+        let (full, space) = image::picture(&file, usize::MAX)?;
+        let preview = full.shrunk(image::LARGEST_PREVIEW);
+        return Ok((full, preview, space, file.info()));
+    }
     let (preview, space, info) = image::preview_with_info(raw)?;
     let other = |e: rawler::RawlerError| io::Error::other(e.to_string());
     // rawler panics on some files it can't make sense of, which would take
@@ -37,8 +45,7 @@ pub fn full(raw: &Path) -> io::Result<(Image, Image, Space, Info)> {
     let rawler::imgop::develop::Intermediate::ThreeColor(rgb) = developed else {
         return Err(io::Error::other("the raw didn't develop to colour"));
     };
-    let orientation = crate::raw::RawFile::open(raw)?.orientation;
-    let image = matched(&rgb.data, rgb.width, rgb.height, &preview).oriented(orientation);
+    let image = matched(&rgb.data, rgb.width, rgb.height, &preview).oriented(file.orientation);
     Ok((image, preview, space, info))
 }
 
@@ -120,6 +127,20 @@ mod tests {
     fn with_nothing_to_match_levels_are_kept() {
         let out = matched(&[[0.0, 0.5, 1.0]], 1, 1, &Image::default());
         assert_eq!(out.rgba, [0, 127, 255, 255]);
+    }
+
+    #[test]
+    fn a_jpeg_at_full_size_is_the_jpeg() {
+        let folder = crate::testing::Folder::new("develop-jpeg");
+        let path = folder.0.join("DSC00001.JPG");
+        let picture = crate::testing::jpeg(3000, 2000, [200, 120, 40]);
+        let camera = crate::testing::Arw { preview: picture, orientation: 8, ..Default::default() };
+        std::fs::write(&path, camera.jpeg()).unwrap();
+        let (image, preview, space, info) = full(&path).unwrap();
+        assert_eq!((image.width, image.height), (2000, 3000), "every pixel, upright");
+        assert_eq!((preview.width, preview.height, space), (1365, 2048, Space::Srgb));
+        assert_eq!(info.size, Some((2000, 3000)));
+        assert!(image.pixel(1000, 1500)[0].abs_diff(200) < 4, "as the camera rendered it: {:?}", image.pixel(1000, 1500));
     }
 
     #[test]

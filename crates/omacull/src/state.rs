@@ -1,11 +1,11 @@
 //! What Omacull remembers between sessions (`~/.config/omacull/state.toml`):
 //! the folders opened recently, where each was left, whether marks
-//! auto-advance, what the loupe shows over a frame, and whether the folder
-//! tree is open.
+//! auto-advance, what the loupe shows over a frame, how frames are stacked,
+//! which formats are culled, and whether the folder tree is open.
 
 use std::path::{Path, PathBuf};
 
-use omacull_engine::cull::Filter;
+use omacull_engine::cull::{Filter, Formats};
 use omacull_engine::stacks::Stacking;
 
 const MAX_RECENT: usize = 10;
@@ -73,6 +73,10 @@ pub struct State {
     /// How frames are stacked.
     #[serde(default)]
     pub stacking: Stacking,
+    /// Which of a folder's pictures are culled, where it holds raws and
+    /// JPEGs both.
+    #[serde(default)]
+    pub formats: Formats,
     /// Most recent first.
     #[serde(default)]
     pub recent: Vec<PathBuf>,
@@ -142,6 +146,11 @@ impl State {
         self.save();
     }
 
+    pub fn set_formats(&mut self, formats: Formats) {
+        self.formats = formats;
+        self.save();
+    }
+
     pub fn set_folders(&mut self, on: bool) {
         self.folders = on;
         self.save();
@@ -183,12 +192,14 @@ mod tests {
         state.add_recent(&a);
         state.set_auto_advance(true);
         state.set_show(Show { histogram: true, ..Show::default() });
+        state.set_formats(Formats::Raw);
 
         let (a, b) = (std::fs::canonicalize(a).unwrap(), std::fs::canonicalize(b).unwrap());
         let loaded = State::load_from(path.clone());
         assert_eq!(loaded.recent, [a.clone(), b.clone()], "most recent first, once each");
         assert!(loaded.auto_advance);
         assert!(loaded.show.histogram && loaded.show.info);
+        assert_eq!(loaded.formats, Formats::Raw);
 
         // Where each folder was left, and the filter it had.
         let mut state = loaded;

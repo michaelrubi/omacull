@@ -1,6 +1,7 @@
 //! Raws for tests: small TIFFs shaped like a Sony ARW, with whatever
 //! embedded JPEGs, orientation, focus and shooting settings a test needs;
-//! and the same wrapped up as Nikon, Canon and Fuji wrap theirs.
+//! the same wrapped up as Nikon, Canon and Fuji wrap theirs; and as a JPEG
+//! on its own.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -202,6 +203,13 @@ impl Arw {
     pub fn write(&self, path: &Path) {
         fs::write(path, self.bytes()).unwrap();
     }
+
+    /// The same frame as a JPEG on its own, as a camera writes one beside
+    /// the raw: the preview is the picture, and the rest is its Exif.
+    pub fn jpeg(mut self) -> Vec<u8> {
+        let picture = std::mem::take(&mut self.preview);
+        with_exif(&picture, &self.bytes())
+    }
 }
 
 /// A JPEG of one colour.
@@ -238,6 +246,12 @@ pub fn nikon_makernote(jpeg: &[u8]) -> Vec<u8> {
 pub fn with_exif(jpeg: &[u8], tiff: &[u8]) -> Vec<u8> {
     let len = (tiff.len() + 8) as u16;
     [&jpeg[..2], &[0xff, 0xe1], &len.to_be_bytes(), b"Exif\0\0", tiff, &jpeg[2..]].concat()
+}
+
+/// A JPEG carrying a colour profile, in one segment.
+pub fn with_icc(jpeg: &[u8], icc: &[u8]) -> Vec<u8> {
+    let len = (icc.len() + 16) as u16;
+    [&jpeg[..2], &[0xff, 0xe2], &len.to_be_bytes(), b"ICC_PROFILE\0\x01\x01", icc, &jpeg[2..]].concat()
 }
 
 /// A Fuji RAF holding `jpeg`, a whole JPEG file with its own Exif.

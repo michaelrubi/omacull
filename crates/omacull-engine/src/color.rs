@@ -5,6 +5,10 @@
 //! draws for sRGB, so on a wide-gamut monitor that isn't sRGB every colour
 //! comes out too saturated unless it's converted to the monitor's profile
 //! first. Profiles and EDID reading as in Omapix.
+//!
+//! A JPEG on its own may carry a profile of its own, and be in anything:
+//! darktable exports in whatever it's told to. [`tagged`] brings those to
+//! sRGB as they're decoded, so the rest of Omacull only knows two spaces.
 
 use std::io::{self, ErrorKind};
 
@@ -12,6 +16,8 @@ use lcms2::{
     CIExyY, CIExyYTRIPLE, DisallowCache, Flags, GlobalContext, InfoType, Intent, Locale, MLU, PixelFormat, Profile,
     Tag, TagSignature, ToneCurve, Transform,
 };
+
+use rayon::prelude::*;
 
 use crate::image::Image;
 
@@ -145,6 +151,40 @@ fn transform(from: &Profile, to: &Profile) -> io::Result<Rgba> {
     .map_err(invalid)
 }
 
+/// What a picture that carries its own profile is in. If that's sRGB or
+/// Adobe RGB it's left as it is; from anything else it's converted to
+/// sRGB, in place, so it's measured and shown like any other. None if the
+/// profile can't be made sense of.
+pub fn tagged(image: &mut Image, icc: &[u8]) -> Option<Space> {
+    // Colours that come through unchanged only if the two are the same.
+    const PROBES: [[u8; 4]; 8] = [
+        [0, 0, 0, 255],
+        [255, 255, 255, 255],
+        [128, 128, 128, 255],
+        [255, 0, 0, 255],
+        [0, 255, 0, 255],
+        [0, 0, 255, 255],
+        [64, 128, 192, 255],
+        [200, 100, 50, 255],
+    ];
+    let profile = Profile::new_icc(icc).ok()?;
+    let same = |to: &Rgba| {
+        let mut probes = PROBES;
+        to.transform_in_place(&mut probes);
+        probes.iter().zip(&PROBES).all(|(got, sent)| got.iter().zip(sent).all(|(a, b)| a.abs_diff(*b) <= 2))
+    };
+    let to_srgb = transform(&profile, &Profile::new_srgb()).ok()?;
+    if same(&to_srgb) {
+        return Some(Space::Srgb);
+    }
+    if same(&transform(&profile, &ColorProfile::adobe_rgb().lcms().ok()?).ok()?) {
+        return Some(Space::AdobeRgb);
+    }
+    // A few rows at a time, on every core: a full-size frame is 24 MP.
+    image.rgba.par_chunks_mut(1 << 16).for_each(|part| to_srgb.transform_in_place(part.as_chunks_mut::<4>().0));
+    Some(Space::Srgb)
+}
+
 impl Display {
     /// For a monitor with this profile; None for sRGB.
     pub fn new(monitor: Option<ColorProfile>) -> io::Result<Self> {
@@ -219,6 +259,28 @@ mod tests {
         display.convert(&mut adobe, Space::AdobeRgb);
         assert_eq!(adobe.rgba[..3], [255, 0, 0], "Adobe RGB on an Adobe RGB monitor is unchanged");
         assert_eq!(display.monitor().unwrap().description(), "Adobe RGB (1998)");
+    }
+
+    #[test]
+    fn a_picture_with_its_own_profile_is_brought_to_srgb() {
+        let pixel = [128, 128, 128];
+        let mut image = one(pixel);
+        let srgb = Profile::new_srgb().icc().unwrap();
+        assert_eq!(tagged(&mut image, &srgb), Some(Space::Srgb));
+        assert_eq!(tagged(&mut image, ColorProfile::adobe_rgb().icc()), Some(Space::AdobeRgb));
+        assert_eq!(image, one(pixel), "sRGB and Adobe RGB are left as they are");
+
+        // Linear, as darktable exports when it's told to: mid-grey is far
+        // brighter once it's sRGB.
+        let (red, green, blue) = (point((0.64, 0.33)), point((0.30, 0.60)), point((0.15, 0.06)));
+        let primaries = CIExyYTRIPLE { Red: red, Green: green, Blue: blue };
+        let curve = ToneCurve::new(1.0);
+        let linear = Profile::new_rgb(&point((0.3127, 0.3290)), &primaries, &[&curve, &curve, &curve]).unwrap();
+        assert_eq!(tagged(&mut image, &linear.icc().unwrap()), Some(Space::Srgb));
+        let [r, g, b, a] = image.rgba[..] else { unreachable!() };
+        assert!((186..=190).contains(&g) && r.abs_diff(g) <= 1 && g.abs_diff(b) <= 1 && a == 255, "{:?}", image.rgba);
+
+        assert_eq!(tagged(&mut image, b"not a profile"), None);
     }
 
     /// An EDID header and chromaticities, as a monitor reports them.

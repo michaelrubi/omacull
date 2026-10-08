@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use omacull_engine::cull::RAW_EXTENSIONS;
+use omacull_engine::cull::kind;
 use omacull_engine::develop;
 use omacull_engine::image::{self, Image};
 use omacull_engine::raw::RawFile;
@@ -56,7 +56,7 @@ fn main() {
     let mut raws: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("read folder")
         .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| RAW_EXTENSIONS.iter().any(|raw| e.eq_ignore_ascii_case(raw))))
+        .filter(|p| kind(p).is_some())
         .collect();
     raws.sort();
     raws.truncate(frames);

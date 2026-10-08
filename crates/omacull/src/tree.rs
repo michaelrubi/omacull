@@ -1,5 +1,5 @@
 //! The folder tree beside the loupe: the folders round the open one, with
-//! how many raws each holds, read in the background as they're opened out.
+//! how many pictures each holds, read in the background as they're opened out.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -164,19 +164,19 @@ impl Tree {
             }
             let colour = match () {
                 () if here => theme.accent,
-                () if folder.raws > 0 => theme.foreground,
+                () if folder.pictures > 0 => theme.foreground,
                 () => theme.dark_foreground,
             };
             let name_at = pos2(arrow.right() + 2.0, rect.center().y);
             painter.text(name_at, Align2::LEFT_CENTER, &folder.name, FontId::proportional(13.0), colour);
-            if folder.raws > 0 {
+            if folder.pictures > 0 {
                 let count_at = pos2(rect.right() - 6.0, rect.center().y);
-                let count = folder.raws.to_string();
+                let count = folder.pictures.to_string();
                 painter.text(count_at, Align2::RIGHT_CENTER, count, FontId::proportional(11.0), theme.dark_foreground);
             }
             if response.clicked() {
                 let on_arrow = response.interact_pointer_pos().is_some_and(|p| p.x < arrow.right());
-                if folder.nested && (on_arrow || folder.raws == 0) {
+                if folder.nested && (on_arrow || folder.pictures == 0) {
                     if !self.expanded.remove(&folder.path) {
                         self.expanded.insert(folder.path.clone());
                     }

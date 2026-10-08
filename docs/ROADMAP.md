@@ -4,9 +4,9 @@ What's planned, in the order we plan to do it. [DESIGN.md](DESIGN.md)
 covers the scope and architecture.
 
 Status: M0 done on 2026-10-04 (scoped the same day). M1 to M8 built the
-same day, waiting to be tried on a real shoot. M9 (non-raw formats and
-filtering) planned. What each still wants trying is under its heading;
-what was left out is under "Later".
+same day, and M9 (JPEGs, and culling one format of a mixed folder) on
+2026-10-08, all waiting to be tried on a real shoot. What each still
+wants trying is under its heading; what was left out is under "Later".
 
 Each milestone ends with something Michael can use on a real shoot. M1 is
 the point where Omacull replaces XnView MP for a basic cull; everything
@@ -192,23 +192,44 @@ Later:
   one.
 - The focus point from Nikon's, Canon's and Fuji's makernotes.
 
-## M9. Non-raw formats and format filtering (planned)
+## M9. JPEGs and one format at a time (built, to be tried on a real shoot)
 
-Support culling shoots containing standalone JPEGs (and potentially PNGs),
-handling mixed RAW+JPEG folders without cluttering the filmstrip.
+In and tested headless, and read from real files: 24 of Michael's
+darktable exports (24 MP, from the ILCE-7M3's raws, in Linear ProPhoto
+RGB) and two phone JPEGs (a Pixel 10 Pro XL's, progressive). No JPEG
+straight out of a camera has been opened, nor a real folder of raws with
+the JPEGs the camera wrote beside them: those are tested on made-up files.
+The sidecars were checked against darktable 5.6.1 as in M0. Still to
+check by hand: how stepping through 24 MP JPEGs feels (each takes about
+170 ms to decode, where a raw's preview takes 10), how long the first
+open of a big folder of them takes, and Shift+F on a real RAW+JPEG shoot.
+How it works is in DESIGN.md.
 
-- **Standalone JPEG decoding:** Read JPEGs directly with `zune-jpeg`.
-  Extract Exif metadata (shutter, aperture, ISO, orientation, capture time)
-  from the `APP1` marker using the existing TIFF IFD parser.
-- **100% zoom on JPEGs:** Instant 100% zoom directly from the full decoded
-  JPEG, bypassing `rawler` demosaicing and histogram matching.
-- **Sidecars:** darktable-compatible `.jpg.xmp` (or `.xmp`) sidecars
-  written and read identically to raws.
-- **Format filter toggle:** An orthogonal filter in the status bar (and
-  keyboard toggle) to view `All`, `RAW only`, or `JPEG only` so shoots with
-  RAW+JPEG pairs don't display duplicate frames side by side.
-- **PNG support (on demand):** Decoding via `zune-png` or `png` if
-  concrete culling workflows require non-camera graphic or scan files.
+- **JPEGs are culled like raws:** `.jpg` and `.jpeg`, read with
+  `zune-jpeg`, their settings, orientation and capture time from their
+  Exif by the reader the raws use.
+- **100% zoom** is the JPEG itself, decoded whole: nothing to develop.
+- **Colour:** a JPEG's own profile is believed over its Exif. This wasn't
+  in the plan, and had to be: the exports are Linear ProPhoto RGB with
+  Exif that says sRGB, and came out dark and dull without it.
+- **Sidecars:** `DSC01234.JPG.xmp`, as darktable names them, written and
+  read as a raw's are. The JPEG is never written to.
+- **Formats** (Shift+F, and in the status bar where a folder holds both):
+  All, RAW or JPEG. Planned as a filter on what's shown; built as which
+  pictures are in the cull at all, so that a raw and the JPEG beside it
+  aren't stacked together, and a stack's winner doesn't reject its own
+  JPEG.
+
+Later:
+
+- PNG and other pictures that aren't from a camera, if a cull wants them.
+- A raw and its JPEG as one frame, marked together.
+- A quicker preview of a big JPEG: it's decoded whole to step to it and
+  again for 100%. Sony's JPEGs carry a 1616×1080 one that isn't read.
+- Colours outside sRGB in a JPEG with a wide profile of its own: they're
+  clipped to sRGB, on a wide-gamut monitor too.
+- The rating inside a JPEG, which darktable reads when there's no
+  sidecar.
 
 ## Not planned
 
