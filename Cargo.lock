@@ -2447,6 +2447,7 @@ dependencies = [
  "jpeg-encoder",
  "lcms2",
  "log",
+ "png",
  "quick-xml 0.42.0",
  "rawler",
  "rayon",

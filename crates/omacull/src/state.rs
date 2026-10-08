@@ -73,8 +73,8 @@ pub struct State {
     /// How frames are stacked.
     #[serde(default)]
     pub stacking: Stacking,
-    /// Which of a folder's pictures are culled, where it holds raws and
-    /// JPEGs both.
+    /// Which of a folder's pictures are culled, where it holds more than
+    /// one kind.
     #[serde(default)]
     pub formats: Formats,
     /// Most recent first.

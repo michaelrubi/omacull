@@ -1,5 +1,5 @@
-//! Pixels: decoding the camera's JPEGs, turning them upright, making
-//! filmstrip thumbnails of them, and measuring them for the loupe's
+//! Pixels: decoding the camera's JPEGs (and PNGs), turning them upright,
+//! making filmstrip thumbnails of them, and measuring them for the loupe's
 //! histogram, clipping and focus peaking.
 
 use std::io::{self, ErrorKind};
@@ -11,12 +11,12 @@ use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
 
-use crate::color::{self, Space};
-use crate::raw::{Info, RawFile};
+use crate::color::{self, Space, Tagged};
+use crate::raw::{Developed, Info, RawFile};
 
 /// A preview is no bigger than this on its long edge: where a camera
-/// embeds only a full-size JPEG, or the picture is a JPEG itself, that's
-/// shrunk to what the loupe shows whole.
+/// embeds only a full-size JPEG, or the picture is a JPEG or a PNG itself,
+/// that's shrunk to what the loupe shows whole.
 pub(crate) const LARGEST_PREVIEW: usize = 2048;
 
 /// 8-bit RGBA, row by row, as it's uploaded to the GPU.
@@ -42,6 +42,69 @@ impl Image {
             return Err(invalid("JPEG decoded to the wrong size"));
         }
         Ok(Self { width, height, rgba })
+    }
+
+    /// A PNG's pixels and the colours they're in. The profile it carries
+    /// is believed, as a JPEG's is, and anything but sRGB and Adobe RGB
+    /// converted to sRGB. Without one it's taken for sRGB. What's
+    /// transparent is shown on grey.
+    pub fn decode_png(png: &[u8]) -> io::Result<(Self, Space)> {
+        /// Pixels converted at a time, on every core.
+        const PART: usize = 1 << 14;
+        let mut decoder = png::Decoder::new(io::Cursor::new(png));
+        // A palette's colours as colours, and no fewer than 8 bits.
+        decoder.set_transformations(png::Transformations::EXPAND);
+        let mut reader = decoder.read_info().map_err(invalid)?;
+        // A few bytes can claim to be a picture of any size. No bigger
+        // than a JPEG is decoded.
+        let size = reader.output_buffer_size().filter(|_| reader.info().width.max(reader.info().height) <= 1 << 14);
+        let mut samples = vec![0; size.ok_or_else(|| invalid("PNG too big to decode"))?];
+        let frame = reader.next_frame(&mut samples).map_err(invalid)?;
+        let (width, height) = (frame.width as usize, frame.height as usize);
+        // Grey or colour, with or without alpha, in 8 bits or 16.
+        let channels = frame.color_type.samples();
+        let wide = frame.bit_depth == png::BitDepth::Sixteen;
+        let step = channels * if wide { 2 } else { 1 };
+        if frame.buffer_size() != width * height * step || samples.len() < frame.buffer_size() {
+            return Err(invalid("PNG decoded to the wrong size"));
+        }
+        let pixel = |px: &[u8]| -> [u16; 4] {
+            let sample = |c: usize| match wide {
+                true => u16::from_be_bytes([px[c * 2], px[c * 2 + 1]]),
+                false => u16::from(px[c]) * 257,
+            };
+            let alpha = if channels % 2 == 0 { sample(channels - 1) } else { u16::MAX };
+            if channels < 3 { [sample(0), sample(0), sample(0), alpha] } else { [sample(0), sample(1), sample(2), alpha] }
+        };
+        let (space, profile) = match reader.info().icc_profile.as_deref().and_then(Tagged::read) {
+            Some(Tagged::Is(space)) => (space, None),
+            Some(Tagged::Other(profile)) => (Space::Srgb, Some(profile)),
+            None => (Space::Srgb, None),
+        };
+        // Colours of its own are converted before 16 bits are cut to 8,
+        // which is slow, or as a JPEG's are where there are only 8.
+        let deep_to_srgb = profile.as_ref().filter(|_| wide).and_then(|profile| color::deep(profile).ok());
+        let to_srgb = profile.as_ref().filter(|_| !wide).and_then(|profile| color::to_srgb(profile).ok());
+        let mut rgba = vec![0; width * height * 4];
+        let parts = rgba.par_chunks_mut(PART * 4).zip(samples[..frame.buffer_size()].par_chunks(PART * step));
+        parts.for_each(|(rgba, samples)| {
+            let deep: Vec<[u16; 4]> = samples.chunks_exact(step).map(pixel).collect();
+            let (rgba, _) = rgba.as_chunks_mut::<4>();
+            let cut = |deep: &[u16; 4]| deep.map(|v| ((u32::from(v) + 128) / 257) as u8);
+            match &deep_to_srgb {
+                Some(to_srgb) => to_srgb.transform_pixels(&deep, rgba),
+                None => rgba.iter_mut().zip(&deep).for_each(|(px, deep)| *px = cut(deep)),
+            }
+            if let Some(to_srgb) = &to_srgb {
+                to_srgb.transform_in_place(rgba);
+            }
+            for px in rgba.iter_mut().filter(|px| px[3] < 255) {
+                let alpha = u32::from(px[3]);
+                *px = px.map(|v| ((u32::from(v) * alpha + 128 * (255 - alpha) + 127) / 255) as u8);
+                px[3] = 255;
+            }
+        });
+        Ok((Self { width, height, rgba }, space))
     }
 
     pub fn encode_jpeg(&self, quality: u8) -> io::Result<Vec<u8>> {
@@ -134,23 +197,26 @@ pub fn preview(raw: &Path) -> io::Result<Image> {
 }
 
 /// The preview, the colours it's in, and the rest of what the loupe shows.
-/// A JPEG's preview is the JPEG, shrunk.
+/// A JPEG's preview is the JPEG, shrunk, and a PNG's the PNG.
 pub fn preview_with_info(raw: &Path) -> io::Result<(Image, Space, Info)> {
     let raw = RawFile::open(raw)?;
     let (image, space) = picture(&raw, LARGEST_PREVIEW)?;
     Ok((image, space, raw.info()))
 }
 
-/// The JPEG to look at a file by, upright and no bigger than `largest` on
-/// its long edge, and the colours it's in: a raw's embedded preview, or
-/// the whole of a JPEG on its own.
+/// The picture to look at a file by, upright and no bigger than `largest`
+/// on its long edge, and the colours it's in: a raw's embedded preview, or
+/// the whole of a JPEG or a PNG on its own.
 pub(crate) fn picture(raw: &RawFile, largest: usize) -> io::Result<(Image, Space)> {
-    let jpeg = raw.preview().ok_or_else(|| invalid("no preview in the raw"))?;
-    let mut image = Image::decode_jpeg(&raw.read(jpeg)?)?;
+    let bytes = raw.read(raw.preview().ok_or_else(|| invalid("no preview in the raw"))?)?;
+    let (mut image, mut space) = match raw.developed {
+        // A PNG's colours are its own business, not its Exif's.
+        Some(Developed::Png) => Image::decode_png(&bytes)?,
+        _ => (Image::decode_jpeg(&bytes)?, if raw.adobe_rgb { Space::AdobeRgb } else { Space::Srgb }),
+    };
     if image.width.max(image.height) > largest {
         image = image.shrunk(largest);
     }
-    let mut space = if raw.adobe_rgb { Space::AdobeRgb } else { Space::Srgb };
     // A profile of its own says what a JPEG is in, whatever its Exif does.
     if let Some(known) = raw.icc().and_then(|icc| color::tagged(&mut image, &icc)) {
         space = known;
@@ -311,6 +377,58 @@ mod tests {
         let [r, g, b, a] = back.pixel(3, 3);
         assert!(r.abs_diff(90) < 4 && g.abs_diff(160) < 4 && b.abs_diff(30) < 4 && a == 255, "{:?}", back.pixel(3, 3));
         assert!(Image::decode_jpeg(b"not a jpeg").is_err());
+    }
+
+    #[test]
+    fn a_png_decodes_whatever_its_made_of() {
+        use crate::testing::Png;
+        let decode = |png: Png| Image::decode_png(&png.bytes()).unwrap();
+        // 8 bits a channel and no profile: sRGB, as it is.
+        let (image, space) = decode(Png::default());
+        assert_eq!((image.width, image.height, image.pixel(5, 5), space), (48, 32, [200, 120, 40, 255], Space::Srgb));
+        // 16 bits are cut to 8.
+        assert_eq!(decode(Png { deep: true, ..Png::default() }).0, image);
+        // What's transparent is shown on grey.
+        let see_through = |alpha: u16| decode(Png { rgba: [u16::MAX, 0, 0, alpha], alpha: true, ..Png::default() }).0;
+        assert_eq!(see_through(0x8080).pixel(5, 5), [192, 64, 64, 255]);
+        assert_eq!(see_through(0).pixel(5, 5), [128, 128, 128, 255]);
+
+        // A profile of its own is believed. Linear: mid-grey is far brighter
+        // once it's sRGB, and a shadow that 8 bits of linear would have
+        // lost is still there.
+        let curve = lcms2::ToneCurve::new(1.0);
+        let white = lcms2::CIExyY { x: 0.3127, y: 0.3290, Y: 1.0 };
+        let point = |x, y| lcms2::CIExyY { x, y, Y: 1.0 };
+        let primaries = lcms2::CIExyYTRIPLE { Red: point(0.64, 0.33), Green: point(0.30, 0.60), Blue: point(0.15, 0.06) };
+        let linear = lcms2::Profile::new_rgb(&white, &primaries, &[&curve, &curve, &curve]).unwrap().icc().unwrap();
+        let grey = |level: u16, deep: bool, icc: &[u8]| {
+            let (image, space) = decode(Png { rgba: [level; 4], deep, icc: Some(icc.to_vec()), ..Png::default() });
+            (image.pixel(5, 5)[0], image.pixel(5, 5)[3], space)
+        };
+        let (mid, alpha, space) = grey(128 * 257, false, &linear);
+        assert!((185..=191).contains(&mid) && alpha == 255 && space == Space::Srgb, "{mid} {alpha} {space:?}");
+        let (shadow, alpha, _) = grey(200, true, &linear);
+        assert!((9..=11).contains(&shadow) && alpha == 255, "{shadow} {alpha}");
+        // Adobe RGB by its profile is left as it is.
+        let adobe = crate::color::ColorProfile::adobe_rgb();
+        assert_eq!(grey(128 * 257, true, adobe.icc()), (128, 255, Space::AdobeRgb));
+
+        // A palette of four colours, one of them transparent.
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, 2, 1);
+        encoder.set_color(png::ColorType::Indexed);
+        encoder.set_depth(png::BitDepth::Two);
+        encoder.set_palette(vec![10, 20, 30, 200, 100, 50]);
+        encoder.set_trns(vec![255, 0]);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[0b0001_0000]).unwrap();
+        writer.finish().unwrap();
+        let (image, _) = Image::decode_png(&out).unwrap();
+        assert_eq!((image.pixel(0, 0), image.pixel(1, 0)), ([10, 20, 30, 255], [128, 128, 128, 255]));
+
+        assert!(Image::decode_png(b"not a png").is_err());
+        assert!(Image::decode_png(&Png::default().bytes()[..60]).is_err());
+        assert!(Image::decode_png(&Png { width: 20_000, height: 1, ..Png::default() }.bytes()).is_err(), "too big");
     }
 
     #[test]

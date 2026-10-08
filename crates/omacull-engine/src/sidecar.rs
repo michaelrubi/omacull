@@ -7,9 +7,10 @@
 //! Other raw developers name the sidecar `DSC01234.xmp`: [`set_naming`]
 //! switches to that, for the whole program.
 //!
-//! A JPEG's sidecar is `DSC01234.JPG.xmp` either way: `DSC01234.xmp` is
-//! the raw's, where a camera wrote both. The JPEG itself is never written
-//! to, nor is a rating inside it read.
+//! A JPEG's sidecar is `DSC01234.JPG.xmp` either way, and a PNG's
+//! `DSC01234.png.xmp`: `DSC01234.xmp` is the raw's, where they're in a
+//! folder together. The picture itself is never written to, nor is a
+//! rating inside it read.
 
 use std::fs;
 use std::io::{self, ErrorKind, Write};
@@ -49,11 +50,11 @@ pub fn set_naming(naming: Naming) {
     ADOBE.store(naming == Naming::Adobe, Ordering::Relaxed);
 }
 
-/// A raw's sidecar, named one way or the other; a JPEG's, always
-/// darktable's way, so it's never the sidecar of a raw beside it.
+/// A raw's sidecar, named one way or the other; a JPEG's or a PNG's,
+/// always darktable's way, so it's never the sidecar of a raw beside it.
 pub fn named(raw: &Path, naming: Naming) -> PathBuf {
     match naming {
-        Naming::Adobe if kind(raw) != Some(Kind::Jpeg) => raw.with_extension("xmp"),
+        Naming::Adobe if !matches!(kind(raw), Some(Kind::Jpeg | Kind::Png)) => raw.with_extension("xmp"),
         _ => {
             let mut name = raw.as_os_str().to_owned();
             name.push(".xmp");
@@ -245,9 +246,10 @@ mod tests {
         let raw = Path::new("/shoot/DSC01234.ARW");
         assert_eq!(named(raw, Naming::Darktable), path_for(raw));
         assert_eq!(named(raw, Naming::Adobe), Path::new("/shoot/DSC01234.xmp"), "and as the others do");
-        // A JPEG beside it never shares that one.
+        // A JPEG or a PNG beside it never shares that one.
         for naming in [Naming::Darktable, Naming::Adobe] {
             assert_eq!(named(Path::new("/shoot/DSC01234.JPG"), naming), Path::new("/shoot/DSC01234.JPG.xmp"));
+            assert_eq!(named(Path::new("/shoot/DSC01234.png"), naming), Path::new("/shoot/DSC01234.png.xmp"));
         }
     }
 

@@ -1,7 +1,7 @@
 //! Raws for tests: small TIFFs shaped like a Sony ARW, with whatever
 //! embedded JPEGs, orientation, focus and shooting settings a test needs;
 //! the same wrapped up as Nikon, Canon and Fuji wrap theirs; and as a JPEG
-//! on its own.
+//! on its own. PNGs too.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -252,6 +252,49 @@ pub fn with_exif(jpeg: &[u8], tiff: &[u8]) -> Vec<u8> {
 pub fn with_icc(jpeg: &[u8], icc: &[u8]) -> Vec<u8> {
     let len = (icc.len() + 16) as u16;
     [&jpeg[..2], &[0xff, 0xe2], &len.to_be_bytes(), b"ICC_PROFILE\0\x01\x01", icc, &jpeg[2..]].concat()
+}
+
+/// A PNG of one colour.
+pub struct Png {
+    pub width: u32,
+    pub height: u32,
+    /// Red, green, blue and alpha, of 65535.
+    pub rgba: [u16; 4],
+    /// 16 bits a channel, not 8.
+    pub deep: bool,
+    /// With an alpha channel.
+    pub alpha: bool,
+    /// The colour profile it carries.
+    pub icc: Option<Vec<u8>>,
+    /// Its Exif: a TIFF, as [`Arw::bytes`] makes one.
+    pub exif: Option<Vec<u8>>,
+}
+
+impl Default for Png {
+    fn default() -> Self {
+        let rgba = [200 * 257, 120 * 257, 40 * 257, u16::MAX];
+        Self { width: 48, height: 32, rgba, deep: false, alpha: false, icc: None, exif: None }
+    }
+}
+
+impl Png {
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut info = png::Info::with_size(self.width, self.height);
+        info.color_type = if self.alpha { png::ColorType::Rgba } else { png::ColorType::Rgb };
+        info.bit_depth = if self.deep { png::BitDepth::Sixteen } else { png::BitDepth::Eight };
+        info.icc_profile = self.icc.clone().map(Into::into);
+        info.exif_metadata = self.exif.clone().map(Into::into);
+        let samples = &self.rgba[..if self.alpha { 4 } else { 3 }];
+        let pixel: Vec<u8> = match self.deep {
+            true => samples.iter().flat_map(|v| v.to_be_bytes()).collect(),
+            false => samples.iter().map(|v| (v >> 8) as u8).collect(),
+        };
+        let mut out = Vec::new();
+        let mut writer = png::Encoder::with_info(&mut out, info).unwrap().write_header().unwrap();
+        writer.write_image_data(&pixel.repeat((self.width * self.height) as usize)).unwrap();
+        writer.finish().unwrap();
+        out
+    }
 }
 
 /// A Fuji RAF holding `jpeg`, a whole JPEG file with its own Exif.

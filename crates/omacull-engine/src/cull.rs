@@ -1,5 +1,5 @@
-//! A folder being culled: its raws and JPEGs and their marks, which one
-//! is current, which are shown, and the marks to undo and redo.
+//! A folder being culled: its raws, JPEGs and PNGs and their marks, which
+//! one is current, which are shown, and the marks to undo and redo.
 //!
 //! This is only the model. Marks reach the sidecars through
 //! [`crate::disk::Disk`], which the app hands every [`Change`].
@@ -21,12 +21,27 @@ use crate::stacks::{self, Signature, Stacking};
 pub const RAW_EXTENSIONS: &[&str] = &["arw", "nef", "cr3", "raf"];
 /// And the pictures that are developed already.
 pub const JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg"];
+pub const PNG_EXTENSIONS: &[&str] = &["png"];
 
 /// What a picture is, going by its name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Raw,
     Jpeg,
+    Png,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 3] = [Kind::Raw, Kind::Jpeg, Kind::Png];
+
+    /// What several of them are called.
+    pub fn plural(self) -> &'static str {
+        match self {
+            Kind::Raw => "raws",
+            Kind::Jpeg => "JPEGs",
+            Kind::Png => "PNGs",
+        }
+    }
 }
 
 /// What kind of picture a path names, if it names one.
@@ -36,13 +51,15 @@ pub fn kind(path: &Path) -> Option<Kind> {
     match () {
         () if among(RAW_EXTENSIONS) => Some(Kind::Raw),
         () if among(JPEG_EXTENSIONS) => Some(Kind::Jpeg),
+        () if among(PNG_EXTENSIONS) => Some(Kind::Png),
         () => None,
     }
 }
 
 /// Which of a folder's pictures are culled. The others aren't in the cull
 /// at all: not counted, stacked or suggested for, so a raw and the JPEG
-/// the camera wrote beside it are never weighed against each other.
+/// the camera wrote beside it (or the PNG exported from it) are never
+/// weighed against each other.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Formats {
@@ -50,32 +67,41 @@ pub enum Formats {
     All,
     Raw,
     Jpeg,
+    Png,
 }
 
 impl Formats {
-    pub const ALL: [Formats; 3] = [Formats::All, Formats::Raw, Formats::Jpeg];
+    pub const ALL: [Formats; 4] = [Formats::All, Formats::Raw, Formats::Jpeg, Formats::Png];
 
     pub fn label(self) -> &'static str {
         match self {
             Formats::All => "All",
             Formats::Raw => "RAW",
             Formats::Jpeg => "JPEG",
+            Formats::Png => "PNG",
         }
     }
 
-    /// The next one round, for the key that cycles them.
-    pub fn next(self) -> Self {
-        let at = Self::ALL.iter().position(|&f| f == self).unwrap_or(0);
-        Self::ALL[(at + 1) % Self::ALL.len()]
+    /// The one after this of `among`, round and round, for the key that
+    /// cycles them.
+    pub fn next(self, among: &[Formats]) -> Self {
+        let at = among.iter().position(|&f| f == self).map_or(0, |at| at + 1);
+        among.get(at % among.len().max(1)).copied().unwrap_or(self)
+    }
+
+    /// The one kind of picture that's culled, unless all are.
+    pub fn only(self) -> Option<Kind> {
+        match self {
+            Formats::All => None,
+            Formats::Raw => Some(Kind::Raw),
+            Formats::Jpeg => Some(Kind::Jpeg),
+            Formats::Png => Some(Kind::Png),
+        }
     }
 
     /// Whether pictures of this kind are culled.
     pub fn takes(self, kind: Kind) -> bool {
-        match self {
-            Formats::All => true,
-            Formats::Raw => kind == Kind::Raw,
-            Formats::Jpeg => kind == Kind::Jpeg,
-        }
+        self.only().is_none_or(|only| only == kind)
     }
 }
 
@@ -199,11 +225,10 @@ pub struct Cull {
     stack_of: Vec<Option<usize>>,
     /// Stacks opened out in the filmstrip; the rest show one frame.
     expanded: BTreeSet<usize>,
-    /// Which of the folder's pictures were asked for.
+    /// Which of the folder's pictures are in it.
     formats: Formats,
-    /// How many raws and how many JPEGs the folder holds, in the cull or
-    /// not.
-    holds: (usize, usize),
+    /// How many raws, JPEGs and PNGs the folder holds, in the cull or not.
+    holds: [usize; 3],
 }
 
 /// The kind of picture a file is, if it's one to cull: not a hidden file,
@@ -216,7 +241,7 @@ pub(crate) fn picture(path: &Path) -> Option<Kind> {
 impl Cull {
     /// The pictures in a folder that `formats` takes, in name order, with
     /// the marks their sidecars hold. A folder with none of the kind asked
-    /// for is opened on what it has. Also returns the sidecars that
+    /// for is opened on all it has. Also returns the sidecars that
     /// couldn't be read, which count as unmarked (and won't be written
     /// over: writing them fails too).
     pub fn open(dir: &Path, formats: Formats) -> io::Result<(Self, Vec<String>)> {
@@ -226,13 +251,12 @@ impl Cull {
             .filter_map(|p| picture(&p).map(|kind| (p, kind)))
             .collect();
         if pictures.is_empty() {
-            return Err(io::Error::new(ErrorKind::NotFound, format!("no raws or JPEGs in {}", dir.display())));
+            return Err(io::Error::new(ErrorKind::NotFound, format!("no raws, JPEGs or PNGs in {}", dir.display())));
         }
-        let raws = pictures.iter().filter(|(_, kind)| *kind == Kind::Raw).count();
-        let holds = (raws, pictures.len() - raws);
-        let wanted = pictures.iter().any(|&(_, kind)| formats.takes(kind));
+        let holds = Kind::ALL.map(|kind| pictures.iter().filter(|(_, k)| *k == kind).count());
+        let formats = if pictures.iter().any(|&(_, kind)| formats.takes(kind)) { formats } else { Formats::All };
         let mut paths: Vec<PathBuf> =
-            pictures.into_iter().filter(|&(_, kind)| !wanted || formats.takes(kind)).map(|(p, _)| p).collect();
+            pictures.into_iter().filter(|&(_, kind)| formats.takes(kind)).map(|(p, _)| p).collect();
         paths.sort();
         // Each raw's mark, and its capture time and look for stacking: a
         // few small reads each, so on every core.
@@ -278,7 +302,7 @@ impl Cull {
             stack_of,
             expanded: BTreeSet::new(),
             formats: Formats::All,
-            holds: (0, 0),
+            holds: [0; 3],
         }
     }
 
@@ -286,21 +310,30 @@ impl Cull {
         &self.dir
     }
 
-    /// Which of the folder's pictures were asked for.
+    /// Which of the folder's pictures are being culled: the kind asked
+    /// for, or all of them if it has none of that kind.
     pub fn formats(&self) -> Formats {
         self.formats
     }
 
-    /// How many raws and how many JPEGs the folder holds, whichever of
-    /// them are being culled.
-    pub fn holds(&self) -> (usize, usize) {
+    /// How many raws, JPEGs and PNGs the folder holds, whichever of them
+    /// are being culled.
+    pub fn holds(&self) -> [usize; 3] {
         self.holds
     }
 
+    /// The formats there are to choose between: all, and each kind the
+    /// folder holds. None where it holds one kind only.
+    pub fn choices(&self) -> Vec<Formats> {
+        let held = |f: &Formats| f.only().is_none_or(|kind| self.holds[kind as usize] > 0);
+        let choices: Vec<Formats> = Formats::ALL.into_iter().filter(held).collect();
+        if choices.len() > 2 { choices } else { Vec::new() }
+    }
+
     /// The pictures of the folder left out of the cull: of the other
-    /// format, when it holds both and one was asked for.
+    /// formats, when it holds more than one and one was asked for.
     pub fn left_out(&self) -> usize {
-        (self.holds.0 + self.holds.1).saturating_sub(self.frames.len())
+        self.holds.iter().sum::<usize>().saturating_sub(self.frames.len())
     }
 
     pub fn frames(&self) -> &[Frame] {
@@ -743,7 +776,7 @@ mod tests {
         fs::write(folder.0.join("DSC00002.jpeg"), camera("2026:10:04 12:00:07")).unwrap();
         fs::write(folder.0.join("phone.jpg"), jpeg(64, 48, [9; 3])).unwrap();
         fs::write(folder.0.join(".DSC00003.JPG"), jpeg(64, 48, [9; 3])).unwrap();
-        fs::write(folder.0.join("scan.png"), b"").unwrap();
+        fs::write(folder.0.join("scan.tif"), b"").unwrap();
         // Each has a sidecar of its own.
         sidecar::write(&folder.raw(1), 3).unwrap();
         sidecar::write(&folder.0.join("DSC00001.JPG"), REJECT).unwrap();
@@ -754,7 +787,7 @@ mod tests {
         let (all, problems) = Cull::open(&folder.0, Formats::All).unwrap();
         assert_eq!(names(&all), ["DSC00001.ARW", "DSC00001.JPG", "DSC00002.ARW", "DSC00002.jpeg", "phone.jpg"]);
         assert_eq!(all.frames().iter().map(|f| f.rating).collect::<Vec<_>>(), [3, REJECT, 0, 0, 0]);
-        assert_eq!((problems.len(), all.holds(), all.left_out()), (0, (2, 3), 0));
+        assert_eq!((problems.len(), all.holds(), all.left_out()), (0, [2, 3, 0], 0));
         // A JPEG's capture time is read like a raw's, where it has one.
         let captured: Vec<_> = all.frames().iter().map(|f| f.captured).collect();
         assert_eq!(captured[1].unwrap() + 7.0, captured[3].unwrap());
@@ -762,18 +795,53 @@ mod tests {
         assert!(all.frames()[1].signature.is_some(), "and its look, from the thumbnail in its Exif");
 
         let (raws, _) = Cull::open(&folder.0, Formats::Raw).unwrap();
-        assert_eq!((names(&raws), raws.holds(), raws.left_out()), (vec!["DSC00001.ARW".into(), "DSC00002.ARW".into()], (2, 3), 3));
+        assert_eq!((names(&raws), raws.holds(), raws.left_out()), (vec!["DSC00001.ARW".into(), "DSC00002.ARW".into()], [2, 3, 0], 3));
         assert_eq!(raws.counts(), Counts { picks: 1, undecided: 1, stars: [0, 0, 1, 0, 0], ..Counts::default() });
         let (jpegs, _) = Cull::open(&folder.0, Formats::Jpeg).unwrap();
         assert_eq!((names(&jpegs).len(), jpegs.left_out(), jpegs.counts().rejects), (3, 2, 1));
 
-        // A folder with none of what was asked for opens on what it has.
+        // There's a choice between what it holds, and no more.
+        assert_eq!(jpegs.choices(), [Formats::All, Formats::Raw, Formats::Jpeg]);
+        assert_eq!(Formats::Jpeg.next(&jpegs.choices()), Formats::All);
+        assert_eq!((Formats::Jpeg.next(&Formats::ALL), Formats::Png.next(&Formats::ALL)), (Formats::Png, Formats::All));
+        // A folder with none of what was asked for opens on all it has.
+        let (all, _) = Cull::open(&folder.0, Formats::Png).unwrap();
+        assert_eq!((all.frames().len(), all.formats(), all.left_out()), (5, Formats::All, 0));
         for name in ["DSC00001.ARW", "DSC00002.ARW"] {
             fs::remove_file(folder.0.join(name)).unwrap();
         }
         let (only, _) = Cull::open(&folder.0, Formats::Raw).unwrap();
-        assert_eq!((only.frames().len(), only.holds(), only.left_out()), (3, (0, 3), 0));
-        assert_eq!((Formats::All.next(), Formats::Jpeg.next()), (Formats::Raw, Formats::All));
+        assert_eq!((only.frames().len(), only.holds(), only.left_out()), (3, [0, 3, 0], 0));
+        assert_eq!((only.formats(), only.choices()), (Formats::All, vec![]));
+    }
+
+    #[test]
+    fn pngs_are_culled_too_or_alone() {
+        use crate::testing::{Png, jpeg};
+        let folder = Folder::with_raws("cull-pngs", 1, &Arw::default());
+        fs::write(folder.0.join("DSC00001.JPG"), jpeg(64, 48, [9; 3])).unwrap();
+        // As darktable exports one, and one with a capture time.
+        fs::write(folder.0.join("DSC00001.png"), Png::default().bytes()).unwrap();
+        let exif = Arw { preview: Vec::new(), ..Arw::default() }.bytes();
+        fs::write(folder.0.join("DSC00002.PNG"), Png { exif: Some(exif), ..Png::default() }.bytes()).unwrap();
+        // Its sidecar is its own, not the raw's or the JPEG's.
+        sidecar::write(&folder.0.join("DSC00001.png"), 4).unwrap();
+        assert!(folder.0.join("DSC00001.png.xmp").exists());
+
+        let (all, problems) = Cull::open(&folder.0, Formats::All).unwrap();
+        assert_eq!((all.frames().len(), all.holds(), problems.len()), (4, [1, 1, 2], 0));
+        assert_eq!(all.frames().iter().map(|f| f.rating).collect::<Vec<_>>(), [0, 0, 4, 0]);
+        assert_eq!(all.choices(), Formats::ALL);
+        let (pngs, _) = Cull::open(&folder.0, Formats::Png).unwrap();
+        let names: Vec<_> = pngs.frames().iter().map(|f| f.path.file_name().unwrap().to_str().unwrap()).collect();
+        assert_eq!((names, pngs.formats(), pngs.left_out()), (vec!["DSC00001.png", "DSC00002.PNG"], Formats::Png, 2));
+        assert_eq!(pngs.counts(), Counts { picks: 1, undecided: 1, stars: [0, 0, 0, 1, 0], ..Counts::default() });
+        let captured: Vec<bool> = pngs.frames().iter().map(|f| f.captured.is_some()).collect();
+        assert_eq!(captured, [false, true], "from its Exif, where it has one");
+        for frame in pngs.frames() {
+            let image = crate::image::preview(&frame.path).unwrap();
+            assert_eq!((image.width, image.height), (48, 32), "{}", frame.path.display());
+        }
     }
 
     #[test]

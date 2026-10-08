@@ -8,6 +8,7 @@ license.workspace = true
 jpeg-encoder = "0.7.1"
 lcms2 = "6.2.0"
 log = "0.4.34"
+png = "0.18.1"
 quick-xml = "0.42.0"
 rawler = "0.8.0"
 rayon = "1.12.0"

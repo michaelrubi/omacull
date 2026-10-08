@@ -1,5 +1,5 @@
 //! The folders round the one being culled, for the folder tree: each with
-//! how many raws and JPEGs it holds, and whether it has folders of its own.
+//! how many pictures it holds, and whether it has folders of its own.
 
 use std::fs;
 use std::io;
@@ -11,7 +11,7 @@ use crate::cull::picture;
 pub struct Folder {
     pub path: PathBuf,
     pub name: String,
-    /// The raws and JPEGs in it.
+    /// The raws, JPEGs and PNGs in it.
     pub pictures: usize,
     /// It has folders in it to open out.
     pub nested: bool,

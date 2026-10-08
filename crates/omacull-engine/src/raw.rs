@@ -10,7 +10,8 @@
 //! is only read from Sony's.
 //!
 //! A JPEG on its own is read the same way: the picture is the whole file,
-//! and its Exif holds the settings and, from a camera, a thumbnail.
+//! and its Exif holds the settings and, from a camera, a thumbnail. So is
+//! a PNG, whose Exif, where it has any, is in a chunk of its own.
 
 use std::fs::File;
 use std::io::{self, ErrorKind};
@@ -110,9 +111,17 @@ pub fn upright(orientation: u16, [u, v]: [f32; 2]) -> [f32; 2] {
     }
 }
 
+/// A picture that isn't a raw: the whole file is the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Developed {
+    Jpeg,
+    Png,
+}
+
 pub struct RawFile {
     file: File,
-    /// Every embedded JPEG, in the order the file lists them.
+    /// Every embedded JPEG, in the order the file lists them. A JPEG or a
+    /// PNG on its own is the last of them, whole.
     pub jpegs: Vec<Embedded>,
     /// The TIFF orientation (1 to 8); 1 if the file doesn't say.
     pub orientation: u16,
@@ -127,8 +136,8 @@ pub struct RawFile {
     pub adobe_rgb: bool,
     /// The largest image in the file, the raw data, as stored.
     pub size: Option<(u32, u32)>,
-    /// Not a raw: a JPEG on its own, the picture itself.
-    pub developed: bool,
+    /// Not a raw: a JPEG or a PNG on its own, the picture itself.
+    pub developed: Option<Developed>,
 }
 
 pub(crate) const MAKE: u16 = 0x010f;
@@ -355,9 +364,13 @@ impl RawFile {
         let mut header = [0; 16];
         file.read_exact_at(&mut header, 0)?;
         let mut found = Found::default();
-        let developed = header.starts_with(&[0xff, 0xd8]);
-        if developed {
+        let mut developed = None;
+        if header.starts_with(&[0xff, 0xd8]) {
+            developed = Some(Developed::Jpeg);
             jpeg(&file, &mut found)?;
+        } else if header.starts_with(b"\x89PNG\r\n\x1a\n") {
+            developed = Some(Developed::Png);
+            png(&file, &mut found)?;
         } else if header.starts_with(b"FUJIFILMCCD-RAW") {
             raf(&file, &mut found)?;
         } else if &header[4..8] == b"ftyp" {
@@ -378,9 +391,10 @@ impl RawFile {
     }
 
     /// The colour profile a JPEG on its own carries, if it has one: what
-    /// its colours are, whatever its Exif says.
+    /// its colours are, whatever its Exif says. (A PNG's is squeezed, and
+    /// read as the PNG is decoded.)
     pub fn icc(&self) -> Option<Vec<u8>> {
-        if !self.developed {
+        if self.developed != Some(Developed::Jpeg) {
             return None;
         }
         // In one or more segments, each numbered after the name.
@@ -414,8 +428,9 @@ impl RawFile {
     /// loupe, or failing that the biggest. Sony embeds one of 1616×1080;
     /// other cameras a full-size one as well, too slow to step through.
     pub fn preview(&self) -> Option<Embedded> {
-        if self.jpegs.len() < 2 {
-            return self.jpegs.first().copied();
+        // A PNG is the picture; a JPEG in its Exif is only a thumbnail.
+        if self.jpegs.len() < 2 || self.developed == Some(Developed::Png) {
+            return self.jpegs.last().copied();
         }
         let sized = self.jpegs.iter().map(|&j| (jpeg_size(&self.file, j.offset).map_or(0, |(w, h)| w.max(h)), j));
         let sized: Vec<(u32, Embedded)> = sized.collect();
@@ -522,8 +537,45 @@ fn jpeg(file: &File, found: &mut Found) -> io::Result<()> {
     {
         log::debug!("unreadable Exif in a JPEG: {e}");
     }
+    whole(file, found, jpeg_size(file, 0).ok_or_else(|| invalid("a damaged JPEG"))?)
+}
+
+/// A PNG on its own: the picture is the whole file. Its size is in its
+/// first chunk, and its Exif, if it has any, in one of its own. That's
+/// looked for before the pixels, where it's usually written: they're in
+/// thousands of chunks, and after them is the far end of a big file.
+fn png(file: &File, found: &mut Found) -> io::Result<()> {
+    let (mut at, mut size) = (8, None);
+    // A corrupt file could go on for ever.
+    for _ in 0..1024 {
+        // Each chunk: how long it is, its name, that many bytes and a
+        // checksum.
+        let mut head = [0; 16];
+        if file.read_exact_at(&mut head, at).is_err() {
+            break;
+        }
+        let number = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        match &head[4..8] {
+            b"IHDR" => size = Some((number(&head[8..]), number(&head[12..]))),
+            b"eXIf" => {
+                // Exif that can't be read is no reason not to show the
+                // picture.
+                if let Err(e) = Tiff::at(file, at + 8).and_then(|tiff| tiff.walk(found)) {
+                    log::debug!("unreadable Exif in a PNG: {e}");
+                }
+            }
+            b"IDAT" | b"IEND" => break,
+            _ => {}
+        }
+        at += 12 + u64::from(number(&head));
+    }
+    whole(file, found, size.filter(|&(w, h)| w > 0 && h > 0).ok_or_else(|| invalid("a damaged PNG"))?)
+}
+
+/// A picture on its own, `width` × `height`: the whole file, whatever
+/// size its Exif says the camera's frame was.
+fn whole(file: &File, found: &mut Found, (width, height): (u32, u32)) -> io::Result<()> {
     found.jpegs.push(Embedded { offset: 0, len: file.metadata()?.len() });
-    let (width, height) = jpeg_size(file, 0).ok_or_else(|| invalid("a damaged JPEG"))?;
     found.size = Some((width, height));
     // An export keeps the camera's makernote, but once it's been turned or
     // cropped to another shape the focus point isn't where that says.
@@ -798,7 +850,7 @@ mod tests {
         };
         let file = camera().jpeg();
         let raw = open_bytes(&file).unwrap();
-        assert!(raw.developed);
+        assert_eq!(raw.developed, Some(Developed::Jpeg));
         assert_eq!(raw.read(raw.preview().unwrap()).unwrap(), file, "the picture is the whole file");
         assert_eq!(raw.read(raw.thumbnail().unwrap()).unwrap(), thumbnail, "at its place in the Exif");
         assert_eq!((raw.orientation, raw.exif.model.as_deref()), (6, Some("ILCE-7M3")));
@@ -825,6 +877,40 @@ mod tests {
         assert_eq!((bare.jpegs.len(), bare.orientation, bare.size), (1, 1, Some((64, 48))));
         assert_eq!((bare.captured.as_deref(), bare.info().summary().as_str()), (None, ""));
         assert!(open_bytes(b"\xff\xd8 and nothing more").is_err());
+    }
+
+    #[test]
+    fn reads_a_png_on_its_own_and_the_exif_it_carries() {
+        use crate::testing::{Png, jpeg};
+        // As darktable exports them: no Exif at all.
+        let file = Png { width: 300, height: 200, ..Png::default() }.bytes();
+        let raw = open_bytes(&file).unwrap();
+        assert_eq!(raw.developed, Some(Developed::Png));
+        assert_eq!(raw.read(raw.preview().unwrap()).unwrap(), file, "the picture is the whole file");
+        assert_eq!((raw.orientation, raw.size, raw.captured.as_deref()), (1, Some((300, 200)), None));
+        assert_eq!((raw.info().summary().as_str(), raw.focus, raw.icc()), ("", None, None));
+
+        // With Exif, in a chunk of its own, it's read as a JPEG's is.
+        let thumbnail = jpeg(160, 120, [9; 3]);
+        let exif = Arw {
+            orientation: 6,
+            preview: Vec::new(),
+            thumbnail: thumbnail.clone(),
+            focus: [6000, 4000, 1500, 400],
+            ..Arw::default()
+        };
+        let file = Png { width: 300, height: 200, exif: Some(exif.bytes()), ..Png::default() }.bytes();
+        let raw = open_bytes(&file).unwrap();
+        assert_eq!(raw.read(raw.preview().unwrap()).unwrap(), file, "not the thumbnail in its Exif");
+        assert_eq!(raw.read(raw.thumbnail().unwrap()).unwrap(), thumbnail);
+        assert_eq!((raw.orientation, raw.exif.iso), (6, Some(400)));
+        assert_eq!(raw.captured.as_deref(), Some("2026:10:04 12:00:00.123"));
+        // Its size is the picture's, not what the Exif says of the sensor.
+        assert_eq!((raw.size, raw.info().size), (Some((300, 200)), Some((200, 300))));
+        assert_eq!(raw.info().focus, Some([0.9, 0.25]));
+
+        // Cut short of its first chunk, there's no telling its size.
+        assert!(open_bytes(&file[..20]).is_err());
     }
 
     #[test]

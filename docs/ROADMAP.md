@@ -5,7 +5,7 @@ covers the scope and architecture.
 
 Status: M0 done on 2026-10-04 (scoped the same day). M1 to M8 built the
 same day, and M9 (JPEGs, and culling one format of a mixed folder) on
-2026-10-08, all waiting to be tried on a real shoot. What each still
+2026-10-08, with PNGs after it, all waiting to be tried on a real shoot. What each still
 wants trying is under its heading; what was left out is under "Later".
 
 Each milestone ends with something Michael can use on a real shoot. M1 is
@@ -214,18 +214,32 @@ How it works is in DESIGN.md.
   Exif that says sRGB, and came out dark and dull without it.
 - **Sidecars:** `DSC01234.JPG.xmp`, as darktable names them, written and
   read as a raw's are. The JPEG is never written to.
-- **Formats** (Shift+F, and in the status bar where a folder holds both):
-  All, RAW or JPEG. Planned as a filter on what's shown; built as which
+- **PNGs**, asked for once the rest was in: culled as JPEGs are, with
+  `DSC01234.png.xmp` for a sidecar and a format of their own. Read from
+  darktable 5.6.1's exports of a real raw, at 8 and 16 bits and in four
+  profiles, and from the screenshots and logos on Michael's machine. An
+  export of 16 bits a channel takes half a second to decode, and nearer
+  one in a profile that has to be converted: to try by hand, whether
+  that's bearable to step through. A PNG has Exif only if something put
+  it there: darktable doesn't, so its exports show no settings and can't
+  be stacked by time.
+- **Formats** (Shift+F, and in the status bar where a folder holds more
+  than one): All, RAW, JPEG or PNG, of those the folder holds. Planned as a filter on what's shown; built as which
   pictures are in the cull at all, so that a raw and the JPEG beside it
   aren't stacked together, and a stack's winner doesn't reject its own
   JPEG.
 
 Later:
 
-- PNG and other pictures that aren't from a camera, if a cull wants them.
+- Other pictures that aren't from a camera (TIFF, WebP, HEIF), if a cull
+  wants them.
 - A raw and its JPEG as one frame, marked together.
-- A quicker preview of a big JPEG: it's decoded whole to step to it and
-  again for 100%. Sony's JPEGs carry a 1616×1080 one that isn't read.
+- A quicker preview of a big JPEG or PNG: it's decoded whole to step to
+  it and again for 100%. Sony's JPEGs carry a 1616×1080 one that isn't
+  read, and a 16-bit PNG could be shrunk before its colours are
+  converted.
+- Exif written after a PNG's pixels, and a PNG's colours from its gamma
+  or cICP chunks where it has no profile.
 - Colours outside sRGB in a JPEG with a wide profile of its own: they're
   clipped to sRGB, on a wide-gamut monitor too.
 - The rating inside a JPEG, which darktable reads when there's no

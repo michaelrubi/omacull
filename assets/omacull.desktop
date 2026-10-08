@@ -2,7 +2,7 @@
 Type=Application
 Name=Omacull
 GenericName=Photo Culler
-Comment=Step through a folder of raws or JPEGs and mark picks, rejects and stars
+Comment=Step through a folder of raws, JPEGs or PNGs and mark picks, rejects and stars
 Exec=omacull %f
 Icon=omacull
 Terminal=false
