@@ -5,7 +5,8 @@ covers the scope and architecture.
 
 Status: M0 done on 2026-10-04 (scoped the same day). M1 to M8 built the
 same day, and M9 (JPEGs, and culling one format of a mixed folder) on
-2026-10-08, with PNGs after it, all waiting to be tried on a real shoot. What each still
+2026-10-08, with PNGs after it, and copies of what's shown and LightCraft
+on 2026-10-09, all waiting to be tried on a real shoot. What each still
 wants trying is under its heading; what was left out is under "Later".
 
 Each milestone ends with something Michael can use on a real shoot. M1 is
@@ -244,6 +245,32 @@ Later:
   clipped to sRGB, on a wide-gamut monitor too.
 - The rating inside a JPEG, which darktable reads when there's no
   sidecar.
+
+## Since: copies, and LightCraft (built, to be tried on a real shoot)
+
+Asked for on 2026-10-09. In and tested headless; LightCraft 0.4.0 was
+checked through `lightcraft-cli` on copies of real raws, not in its
+window. How both work is in DESIGN.md.
+
+- **Copy what's shown** (Ctrl+Shift+E, and in the summary): every picture
+  the filter lets through goes to a folder that's asked for, with its
+  sidecar. Copied, not moved; nothing there is replaced.
+- **LightCraft** as the raw developer: `developer = "lightcraft"`, with
+  `sidecar = "adobe"` so that Omacull and LightCraft keep one sidecar
+  between them. Stars arrive as stars and a reject as its reject flag.
+- **Ctrl+E hands LightCraft only what's shown:** the pictures the filter
+  lets through, by name, where they are. darktable still gets the folder:
+  it takes one, or one file.
+
+Still to check by hand: the handoff in LightCraft's window, and with
+LightCraft already open; how long a few hundred raws take to copy to
+another disk.
+
+Later:
+
+- Other developers that take several files handed what's shown too:
+  LightCraft is told by its name.
+- Copying the selection, and remembering where the last copies went.
 
 ## Not planned
 

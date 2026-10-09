@@ -13,6 +13,7 @@ use omacull_engine::color::Display;
 use omacull_engine::cull::{self, Change, Cull, Filter, Formats, Kind, Rating, Step};
 use omacull_engine::stacks::Stacking;
 use omacull_engine::disk::{self, Disk, How, Mark, Problem};
+use omacull_engine::export;
 use omacull_engine::learn::{self, Model};
 use omacull_engine::sidecar::{self, REJECT};
 use omacull_engine::{signals, thumbs};
@@ -52,6 +53,44 @@ struct Opening {
     result: Receiver<io::Result<(Cull, Vec<String>)>>,
 }
 
+/// What a folder is picked for.
+#[derive(Clone, Copy, PartialEq)]
+enum Picking {
+    /// To cull.
+    Open,
+    /// To copy what's shown to.
+    Copies,
+}
+
+/// Pictures being copied to another folder, and how it's gone so far.
+struct Copying {
+    to: PathBuf,
+    total: usize,
+    copied: usize,
+    /// There already, and left as they were.
+    there: usize,
+    /// Those that couldn't be copied, and why.
+    failed: Vec<String>,
+    /// Whether each was copied, as it's dealt with.
+    results: Receiver<Result<bool, String>>,
+}
+
+impl Copying {
+    /// How it went, and whether that's a problem.
+    fn said(&self) -> (String, bool) {
+        let to = file_name(&self.to);
+        if let Some(first) = self.failed.first() {
+            return (format!("Couldn't copy {} of {} to {to}, e.g. {first}", self.failed.len(), self.total), true);
+        }
+        let there = match self.there {
+            0 => String::new(),
+            1 => "; 1 was there already".to_owned(),
+            n => format!("; {n} were there already"),
+        };
+        (format!("Copied {} to {to}{there}", pictures(self.copied)), false)
+    }
+}
+
 pub struct App {
     theme: Theme,
     theme_rx: Receiver<Theme>,
@@ -65,8 +104,10 @@ pub struct App {
     paths: Paths,
     shoot: Option<Shoot>,
     opening: Option<Opening>,
-    /// The folder picker, while it's open.
-    picking: Option<Receiver<Option<PathBuf>>>,
+    /// The folder picker, while it's open, and what it's picking for.
+    picking: Option<(Receiver<Option<PathBuf>>, Picking)>,
+    /// What's shown, while it's copied to another folder.
+    copying: Option<Copying>,
     disk: Disk,
     /// The last thing to tell the user, and whether it's a problem.
     message: Option<(String, bool)>,
@@ -176,6 +217,7 @@ impl App {
             shoot: None,
             opening: None,
             picking: None,
+            copying: None,
             disk,
             message: None,
             title: String::new(),
@@ -283,13 +325,25 @@ impl App {
         }
     }
 
-    /// Hand the open folder to darktable, once every mark is in its sidecar.
+    /// Hand the cull to the raw developer, once every mark is in its
+    /// sidecar: the open folder to darktable, which takes one, and to
+    /// LightCraft, which takes pictures, only those shown.
     fn darktable(&mut self) {
         let Some(shoot) = &self.shoot else { return };
-        self.disk.flush();
         let dir = shoot.cull.dir().to_path_buf();
+        let (given, what) = if self.developer() == "lightcraft" {
+            let shown = self.shown();
+            if shown.is_empty() {
+                return self.message = Some(("Nothing is shown to open".into(), false));
+            }
+            let what = pictures(shown.len());
+            (shown, what)
+        } else {
+            (vec![dir.clone()], file_name(&dir))
+        };
+        self.disk.flush();
         let started = std::process::Command::new(&self.paths.darktable)
-            .arg(&dir)
+            .args(&given)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -298,7 +352,7 @@ impl App {
             Ok(mut child) => {
                 // Reaped when it's closed.
                 std::thread::spawn(move || child.wait());
-                (format!("Opened {} in {}", file_name(&dir), self.developer()), false)
+                (format!("Opened {what} in {}", self.developer()), false)
             }
             Err(e) => (format!("Couldn't start {}: {e}", self.paths.darktable), true),
         });
@@ -415,14 +469,79 @@ impl App {
         self.message = Some((format!("Format: {}{only}", formats.label()), false));
     }
 
-    /// Ask for a folder to open, with the system's picker.
-    fn pick(&mut self, ctx: &egui::Context) {
+    /// The pictures the filter lets through: what's copied, and what
+    /// LightCraft is handed.
+    fn shown(&self) -> Vec<PathBuf> {
+        let Some(shoot) = &self.shoot else { return Vec::new() };
+        let filter = shoot.cull.filter();
+        shoot.cull.frames().iter().filter(|f| filter.matches(f)).map(|f| f.path.clone()).collect()
+    }
+
+    /// Ask for the folder to copy what's shown to, if anything is.
+    fn export(&mut self, ctx: &egui::Context) {
+        if let Some(copying) = &self.copying {
+            self.message = Some((format!("Still copying to {}", file_name(&copying.to)), false));
+        } else if self.shoot.is_some() && self.shown().is_empty() {
+            self.message = Some(("Nothing is shown to copy".into(), false));
+        } else if self.shoot.is_some() {
+            self.pick(ctx, Picking::Copies);
+        }
+    }
+
+    /// Copy what's shown to a folder, each picture with its sidecar, in
+    /// the background, once every mark is in its sidecar.
+    fn copy_to(&mut self, to: PathBuf, ctx: &egui::Context) {
+        let pictures = self.shown();
+        if pictures.is_empty() || self.copying.is_some() {
+            return;
+        }
+        self.disk.flush();
+        let (tx, rx) = channel();
+        let (ctx, target) = (ctx.clone(), to.clone());
+        self.message = Some((format!("Copying {} to {}…", pictures.len(), file_name(&to)), false));
+        self.copying = Some(Copying { to, total: pictures.len(), copied: 0, there: 0, failed: Vec::new(), results: rx });
+        std::thread::spawn(move || {
+            for picture in pictures {
+                let copied = export::copy(&picture, &target).map_err(|e| format!("{}: {e}", file_name(&picture)));
+                if tx.send(copied).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn finish_copying(&mut self) {
+        let Some(copying) = &mut self.copying else { return };
+        let mut more = false;
+        loop {
+            match copying.results.try_recv() {
+                Ok(Ok(true)) => copying.copied += 1,
+                Ok(Ok(false)) => copying.there += 1,
+                Ok(Err(why)) => copying.failed.push(why),
+                Err(TryRecvError::Empty) if more => {
+                    let done = copying.copied + copying.there + copying.failed.len();
+                    let text = format!("Copying {done} of {} to {}…", copying.total, file_name(&copying.to));
+                    return self.message = Some((text, false));
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => break,
+            }
+            more = true;
+        }
+        self.message = self.copying.take().map(|copying| copying.said());
+    }
+
+    /// Ask for a folder, with the system's picker: one to open, or one to
+    /// copy what's shown to.
+    fn pick(&mut self, ctx: &egui::Context, picking: Picking) {
         if self.picking.is_some() {
             return;
         }
         let open = self.shoot.as_ref().map(|s| s.cull.dir().to_path_buf());
         let start = open.or_else(|| self.state.recent.first().cloned());
-        let mut dialog = rfd::FileDialog::new().set_title("Open Folder");
+        let title = if picking == Picking::Open { "Open Folder" } else { "Copy What's Shown To" };
+        let mut dialog = rfd::FileDialog::new().set_title(title);
         if let Some(dir) = start {
             dialog = dialog.set_directory(dir);
         }
@@ -432,17 +551,21 @@ impl App {
             let _ = tx.send(dialog.pick_folder());
             ctx.request_repaint();
         });
-        self.picking = Some(rx);
+        self.picking = Some((rx, picking));
     }
 
     fn finish_picking(&mut self, ctx: &egui::Context) {
-        let Some(picking) = &self.picking else { return };
-        match picking.try_recv() {
+        let Some((picked, picking)) = &self.picking else { return };
+        let picking = *picking;
+        match picked.try_recv() {
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) | Ok(None) => self.picking = None,
             Ok(Some(dir)) => {
                 self.picking = None;
-                self.open(dir, ctx);
+                match picking {
+                    Picking::Open => self.open(dir, ctx),
+                    Picking::Copies => self.copy_to(dir, ctx),
+                }
             }
         }
     }
@@ -450,7 +573,7 @@ impl App {
     fn run(&mut self, command: Command, ctx: &egui::Context) {
         match command {
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            Command::Open => self.pick(ctx),
+            Command::Open => self.pick(ctx, Picking::Open),
             Command::AutoAdvance => {
                 let on = !self.state.auto_advance;
                 self.state.set_auto_advance(on);
@@ -479,6 +602,7 @@ impl App {
                 return;
             }
             Command::Darktable => self.darktable(),
+            Command::Export => self.export(ctx),
             Command::Learn => self.learn(ctx, true),
             Command::Histogram
             | Command::Info
@@ -678,6 +802,7 @@ impl App {
         }
         self.finish_picking(ctx);
         self.finish_opening(ctx);
+        self.finish_copying();
         self.finish_learning();
         self.disk_problems();
         // Nothing in Omacull takes typing, so no widget keeps the keyboard:
@@ -894,8 +1019,8 @@ impl App {
     }
 
     /// Where the cull stands: picks, rejects, undecided and each star, with
-    /// the way to what's left and on to darktable. Returns a command for a
-    /// button clicked.
+    /// the way to what's left, on to darktable and to a folder of copies.
+    /// Returns a command for a button clicked.
     fn summary_window(&mut self, ctx: &egui::Context) -> Option<Command> {
         let shoot = self.shoot.as_ref()?;
         let counts = shoot.cull.counts();
@@ -933,6 +1058,10 @@ impl App {
                     let open = format!("Open in {}", self.developer());
                     if ui.button(open).on_hover_text(shortcut(Command::Darktable)).clicked() {
                         command = Some(Command::Darktable);
+                    }
+                    let copy = ui.add_enabled(self.copying.is_none(), egui::Button::new("Copy what's shown…"));
+                    if copy.on_hover_text(shortcut(Command::Export)).clicked() {
+                        command = Some(Command::Export);
                     }
                 });
                 ui.add_space(8.0);
@@ -1043,6 +1172,11 @@ fn win(disk: &Disk, shoot: &mut Shoot, marks: &[(usize, Rating)], auto_advance: 
     if auto_advance {
         shoot.cull.step(Step::Next);
     }
+}
+
+/// How many pictures, in words.
+fn pictures(n: usize) -> String {
+    if n == 1 { "1 picture".to_owned() } else { format!("{n} pictures") }
 }
 
 fn file_name(path: &Path) -> String {
@@ -1897,6 +2031,8 @@ mod tests {
         let paths = Paths { darktable: script.display().to_string(), ..quiet() };
         let mut h = Harness::open(&folder, paths);
         h.press(NONE, Key::P);
+        // The folder, whatever is shown of it: it takes one, or one file.
+        h.press(CMD_ALT, Key::Num1);
         h.press(Modifiers::COMMAND, Key::E);
         let started = Instant::now();
         while !said.exists() {
@@ -1909,6 +2045,104 @@ mod tests {
         let mut h = Harness::open(&folder, Paths { darktable: "/nowhere/darktable".into(), ..quiet() });
         h.press(Modifiers::COMMAND, Key::E);
         assert!(h.app.message.as_ref().is_some_and(|(m, problem)| *problem && m.contains("Couldn't start")));
+    }
+
+    #[test]
+    fn lightcraft_is_handed_only_whats_shown() {
+        let folder = Folder::with_raws("app-lightcraft", 3, &Arw::default());
+        // A stand-in for LightCraft, in a folder it would take in whole,
+        // that says what it was given.
+        std::fs::create_dir(folder.0.join("bin")).unwrap();
+        let script = folder.0.join("bin/lightcraft");
+        let said = folder.0.join("bin/said");
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}.part' && mv '{0}.part' '{0}'\n", said.display()))
+            .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let mut h = Harness::open(&folder, Paths { darktable: script.display().to_string(), ..quiet() });
+        let given = |h: &mut Harness| {
+            let _ = std::fs::remove_file(&said);
+            h.press(Modifiers::COMMAND, Key::E);
+            let started = Instant::now();
+            while !said.exists() {
+                assert!(started.elapsed() < Duration::from_secs(10), "LightCraft wasn't started");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::fs::read_to_string(&said).unwrap().lines().map(PathBuf::from).collect::<Vec<_>>()
+        };
+        let dir = std::fs::canonicalize(&folder.0).unwrap();
+        let raw = |i: usize| dir.join(format!("DSC{i:05}.ARW"));
+        h.press(NONE, Key::P);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::X);
+        h.press(NONE, Key::End);
+        h.press(NONE, Key::Num4);
+        // The picks and up, and their marks are in their sidecars by then.
+        h.press(CMD_ALT, Key::Num1);
+        assert_eq!(given(&mut h), [raw(1), raw(3)]);
+        assert_eq!(h.app.message.clone().unwrap(), ("Opened 2 pictures in lightcraft".to_owned(), false));
+        assert_eq!(sidecar::read(&raw(3)).unwrap(), Some(4));
+        // Everything is the pictures culled, not the folder and what's
+        // under it.
+        h.press(CMD_ALT, Key::A);
+        assert_eq!(given(&mut h), [raw(1), raw(2), raw(3)]);
+        // And nothing shown, nothing: the frame the cursor is on isn't
+        // let through.
+        let _ = std::fs::remove_file(&said);
+        h.press(CMD_ALT, Key::Num5);
+        h.press(Modifiers::COMMAND, Key::E);
+        assert_eq!(h.app.message.clone().unwrap().0, "Nothing is shown to open");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!said.exists());
+    }
+
+    #[test]
+    fn whats_shown_is_copied_with_its_marks_and_nothing_there_replaced() {
+        let folder = Folder::with_raws("app-copies", 4, &Arw::default());
+        let mut h = Harness::open(&folder, quiet());
+        let to = folder.0.join("selects");
+        let copies = |to: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(to).unwrap().map(|e| file_name(&e.unwrap().path())).collect();
+            names.sort();
+            names
+        };
+        let copy = |h: &mut Harness, to: &Path| {
+            h.app.copy_to(to.to_path_buf(), &h.ctx.clone());
+            h.wait("the copies", |app| app.copying.is_none());
+            h.app.message.clone().unwrap()
+        };
+        h.press(NONE, Key::Num3);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::X);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::P);
+        // The picks and up: the mark just made is in its sidecar by then.
+        h.press(CMD_ALT, Key::Num1);
+        assert_eq!(copy(&mut h, &to), ("Copied 2 pictures to selects".to_owned(), false));
+        assert_eq!(copies(&to), ["DSC00001.ARW", "DSC00001.ARW.xmp", "DSC00003.ARW", "DSC00003.ARW.xmp"]);
+        assert_eq!(sidecar::read(&to.join("DSC00001.ARW")).unwrap(), Some(3));
+        assert_eq!(sidecar::read(&to.join("DSC00003.ARW")).unwrap(), Some(PICK));
+        assert_eq!(std::fs::read(to.join("DSC00003.ARW")).unwrap(), std::fs::read(folder.raw(3)).unwrap());
+        assert!((1..=4).all(|i| folder.raw(i).exists()), "copied, not moved");
+
+        // Everything, later: the copies made before are left as they've
+        // become, and an unmarked frame goes without a sidecar.
+        sidecar::write(&to.join("DSC00001.ARW"), 5).unwrap();
+        h.press(CMD_ALT, Key::A);
+        assert_eq!(copy(&mut h, &to), ("Copied 2 pictures to selects; 2 were there already".to_owned(), false));
+        assert_eq!(sidecar::read(&to.join("DSC00001.ARW")).unwrap(), Some(5));
+        assert_eq!(sidecar::read(&to.join("DSC00002.ARW")).unwrap(), Some(REJECT));
+        assert_eq!(copies(&to).len(), 7);
+        assert!(!to.join("DSC00004.ARW.xmp").exists());
+
+        // A filter that shows nothing has nothing to copy, and doesn't ask
+        // where to; nor can a folder that can't be made be copied to.
+        h.press(CMD_ALT, Key::Num5);
+        h.press(CMD_SHIFT, Key::E);
+        assert!(h.app.picking.is_none() && h.app.copying.is_none());
+        assert_eq!(h.app.message.clone().unwrap().0, "Nothing is shown to copy");
+        h.press(CMD_ALT, Key::Num1);
+        let (said, problem) = copy(&mut h, &folder.raw(4).join("selects"));
+        assert!(problem && said.starts_with("Couldn't copy 2 of 2 to selects, e.g. DSC00001.ARW: "), "{said}");
     }
 
     #[test]
