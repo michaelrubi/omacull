@@ -54,6 +54,7 @@ pub enum Command {
     Summary,
     FirstUndecided,
     Darktable,
+    Export,
     Eyes,
     FaceStrip,
     StackSelection,
@@ -127,6 +128,7 @@ impl Command {
         Command::Summary,
         Command::FirstUndecided,
         Command::Darktable,
+        Command::Export,
         Command::Eyes,
         Command::FaceStrip,
         Command::StackSelection,
@@ -168,6 +170,7 @@ impl Command {
         Command::SelectAll,
         Command::SelectNone,
         Command::FirstUndecided,
+        Command::Export,
         Command::Darktable,
         Command::FaceStrip,
         Command::StackSelection,
@@ -260,6 +263,7 @@ impl Command {
             Command::Summary => "Cull Summary",
             Command::FirstUndecided => "First Undecided Frame",
             Command::Darktable => "Open in the Raw Developer",
+            Command::Export => "Copy What's Shown to a Folder…",
             Command::Eyes => "Zoom to the Eyes (Again: the Next Face)",
             Command::FaceStrip => "Face Close-Ups",
             Command::StackSelection => "Stack the Selection",
@@ -327,8 +331,9 @@ impl Command {
             Command::Folders => s(Modifiers::NONE, Key::T),
             Command::Summary => s(Modifiers::NONE, Key::M),
             Command::FirstUndecided => s(Modifiers::SHIFT, Key::U),
-            // Lightroom's Edit In.
+            // Lightroom's Edit In, and its Export.
             Command::Darktable => s(CMD, Key::E),
+            Command::Export => s(CMD_SHIFT, Key::E),
             Command::Eyes => s(Modifiers::NONE, Key::E),
             Command::FaceStrip => s(Modifiers::SHIFT, Key::E),
             // Lightroom's Ctrl+G groups into a stack, and G-ish opens it.
@@ -495,6 +500,11 @@ mod tests {
         assert_eq!(press(&ctx, CMD, Key::L), [Command::Learn]);
         assert_eq!(press(&ctx, Modifiers::NONE, Key::L), [Command::Lock]);
         assert_eq!(press(&ctx, Modifiers::SHIFT, Key::Q), [Command::Suggestions]);
+        // Nor copying for the raw developer, the eyes or their close-ups.
+        assert_eq!(press(&ctx, CMD_SHIFT, Key::E), [Command::Export]);
+        assert_eq!(press(&ctx, CMD, Key::E), [Command::Darktable]);
+        assert_eq!(press(&ctx, Modifiers::SHIFT, Key::E), [Command::FaceStrip]);
+        assert_eq!(press(&ctx, Modifiers::NONE, Key::E), [Command::Eyes]);
         // Nor the formats for the focus point.
         assert_eq!(press(&ctx, Modifiers::SHIFT, Key::F), [Command::Formats]);
         assert_eq!(press(&ctx, Modifiers::NONE, Key::F), [Command::FocusPoint]);

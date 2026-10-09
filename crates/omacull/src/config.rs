@@ -92,10 +92,12 @@ const TEMPLATE: &str = "\
 # pick = 1
 #
 # How sidecars are named: \"darktable\" for DSC01234.ARW.xmp, or \"adobe\" for
-# DSC01234.xmp, which Lightroom, Bridge, Capture One and most others read.
+# DSC01234.xmp, which Lightroom, Bridge, Capture One and most others read,
+# and LightCraft writes.
 # sidecar = \"darktable\"
 #
 # The program the folder is handed to (Ctrl+E), as `program folder`.
+# \"lightcraft\" is handed the pictures shown instead, not the folder.
 # developer = \"darktable\"
 
 # How sure the model trained on your decisions has to be before it suggests
