@@ -10,6 +10,7 @@ use omacull_engine::sidecar::REJECT;
 pub enum Command {
     Quit,
     Open,
+    Close,
     Undo,
     Redo,
     Previous,
@@ -84,6 +85,7 @@ impl Command {
     pub const ALL: &[Command] = &[
         Command::Quit,
         Command::Open,
+        Command::Close,
         Command::Undo,
         Command::Redo,
         Command::Previous,
@@ -180,6 +182,7 @@ impl Command {
         Command::Learn,
         Command::Quit,
         Command::Open,
+        Command::Close,
         Command::Undo,
         Command::Previous,
         Command::Next,
@@ -219,6 +222,7 @@ impl Command {
         match self {
             Command::Quit => "Quit",
             Command::Open => "Open Folder…",
+            Command::Close => "Close Folder",
             Command::Undo => "Undo",
             Command::Redo => "Redo",
             Command::Previous => "Previous Frame",
@@ -285,6 +289,7 @@ impl Command {
         match self {
             Command::Quit => s(CMD, Key::Q),
             Command::Open => s(CMD, Key::O),
+            Command::Close => s(CMD, Key::W),
             Command::Undo => s(CMD, Key::Z),
             Command::Redo => s(CMD_SHIFT, Key::Z),
             Command::Previous => s(Modifiers::NONE, Key::ArrowLeft),
@@ -510,5 +515,8 @@ mod tests {
         assert_eq!(press(&ctx, Modifiers::NONE, Key::F), [Command::FocusPoint]);
         assert_eq!(press(&ctx, Modifiers::NONE, Key::Q), [Command::Signals]);
         assert_eq!(press(&ctx, Modifiers::NONE, Key::Y), [Command::Accept]);
+        // Nor closing the folder for a stack's winner.
+        assert_eq!(press(&ctx, CMD, Key::W), [Command::Close]);
+        assert_eq!(press(&ctx, Modifiers::NONE, Key::W), [Command::Winner]);
     }
 }
