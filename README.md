@@ -52,6 +52,9 @@ it, [say how it went](CONTRIBUTING.md).
 - **Getting around:** T a folder tree, M a summary of the cull, Shift+U
   the first undecided frame, Ctrl+E on to darktable, Ctrl+W closes the
   folder.
+- **The keepers on their own:** Ctrl+Shift+E copies what's shown (the
+  picks, say, of a folder of 500) to another folder, each with its
+  sidecar. Nothing is moved, and nothing already there is replaced.
 
 ![Surveying a stack: the signals under each frame, and which one they favour](docs/screenshots/survey.jpg)
 
@@ -143,6 +146,12 @@ pick = 3                   # the stars a pick is written as
 sidecar = "adobe"          # DSC01234.xmp, as Lightroom and Capture One name it
 developer = "rawtherapee"  # the program Ctrl+E hands the folder to
 ```
+
+For [LightCraft](https://github.com/storytold/lightcraft), `sidecar =
+"adobe"` and `developer = "lightcraft"`: it reads the stars as stars and
+a reject as its reject flag (checked against 0.4.0). Ctrl+E hands it only
+the pictures shown, so with the picks showing, the rest never reach its
+library.
 
 ## Other cameras
 

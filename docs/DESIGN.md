@@ -48,8 +48,9 @@ Decided in the 2026-10-04 scoping interview.
 - **Navigation:** `omacull <dir>`, a folder picker, recent folders, and a
   folder tree sidebar.
 - **Handoff:** sidecars darktable reads, a cull summary (picks, rejects,
-  undecided, with a jump to what's undecided), and a key that opens the
-  folder in darktable.
+  undecided, with a jump to what's undecided), a key that opens the
+  folder in darktable, and one that copies what's shown to a folder of
+  its own.
 - **Auto-cull:** signals measured of every frame, the best of a stack
   suggested from them, and a model each user trains on their own
   decisions. It suggests; it never marks. Every decision is logged from
@@ -130,7 +131,25 @@ folder in darktable.
   their share, and buttons for the first undecided frame and darktable.
 - **darktable:** every mark still queued is written first, then
   `darktable <folder>` is started, which imports the folder and reads the
-  sidecars.
+  sidecars. LightCraft is handed the pictures shown instead (below).
+- **Copies:** Ctrl+Shift+E (Lightroom's Export; "Copy what's shown…" in
+  the summary) asks for a folder and copies there every picture the
+  filter lets through, each with its sidecar: 500 frames culled to ten and
+  the picks shown is those ten, in a folder to hand on. Under Show: All
+  it's the whole cull, so of a folder of raws and JPEGs, only the format
+  being culled. Frames inside a closed stack count if the filter lets
+  them through, as they do in the status bar's "shown"; a frame marked
+  out of the filter and still on screen doesn't. The pictures are copied,
+  not moved, in the background (`omacull_engine::export`), with the
+  count in the status bar; every mark still queued is written first. The
+  sidecar goes over whole, byte for byte, so an edit in it comes too, and
+  a frame with no mark goes without one. Nothing in the folder is ever
+  replaced: a picture already there is left as it is, with whatever has
+  been done to its sidecar since, and counted as there already. Each
+  file is copied under another name and renamed, so a copy that's cut
+  short isn't taken for a whole one, and keeps its date. Where the
+  filesystem can share the data (btrfs, as Omarchy's is) the copies take
+  no room until they're changed.
 - **Places:** each folder's frame (by name) and filter are remembered in
   `state.toml` when another folder is opened and when Omacull closes, for
   the 200 most recent folders, and come back when it's opened again
@@ -315,13 +334,59 @@ darktable. There are three settings and one for suggestions:
 |---------|---------|---|
 | `pick` | `1` | The stars a pick (P, and a winner) is written as. |
 | `sidecar` | `"darktable"` | `"adobe"` names sidecars `DSC01234.xmp`, as Lightroom, Bridge, Capture One and most others read them. |
-| `developer` | `"darktable"` | The program Ctrl+E hands the folder to. |
+| `developer` | `"darktable"` | The program Ctrl+E hands the folder to; `"lightcraft"` is handed the pictures shown. |
 | `confidence` | `0.8` | How sure the model has to be to suggest a mark. |
 
 A reject is always a rating of -1, as Bridge writes it too. A JPEG's
 sidecar is `DSC01234.JPG.xmp` however `sidecar` is set, and a PNG's
 `DSC01234.png.xmp`: `DSC01234.xmp` would be the raw's too, where they're
 in a folder together.
+
+### LightCraft
+
+`developer = "lightcraft"` hands the folder to LightCraft, which Michael
+uses until there's an OmaLux; `sidecar = "adobe"` goes with it. Checked
+against LightCraft 0.4.0 on copies of six real raws and two of
+darktable's JPEGs, by importing into scratch libraries with
+`lightcraft-cli run --library <scratch> --import <folder> catalog.query`.
+Not looked at in its window, nor what starting it does when LightCraft
+is already open.
+
+- **What it's handed:** the pictures shown, not the folder: `lightcraft
+  DSC01234.ARW DSC01240.ARW …`, every picture the filter lets through,
+  as for a copy. So 500 frames culled to ten and the picks shown is ten
+  pictures in LightCraft's library, where they are, and the rejects never
+  reach it. Under Show: All it's every picture in the cull, still by
+  name: LightCraft takes a folder in with everything under it (a
+  subfolder's raw arrived with the rest), which would bring the other
+  format of a mixed folder and any copies kept inside it. With nothing
+  shown, nothing is started. It's told by its name, `lightcraft`:
+  darktable takes one file or one folder, so it and every other
+  developer get the folder as before. Checked by starting LightCraft's
+  own interface without a window (`lightcraft-cli snapshot --library
+  <scratch> a.ARW b.ARW`): two raws of four arrived, with their stars.
+- **What it reads:** stars arrive as stars and -1 as its reject flag, from
+  `DSC01234.ARW.xmp` and from `DSC01234.xmp` alike, and from a JPEG's
+  `DSC01234.jpg.xmp`. A pick is a star, not its pick flag: XMP has
+  nowhere to say so. A rating inside a JPEG isn't read, so an unmarked
+  export arrives unrated (in darktable it arrives with the stars it was
+  exported with). Importing adds the pictures where they are and leaves
+  the sidecars as we wrote them. What isn't handed over can be later: a
+  picture it has already is passed over, not taken twice.
+- **What it writes:** `DSC01234.xmp`, unless its library is set to name
+  them in full, and where both are there that's the one it reads: 5
+  stars in `B.xmp` over 3 in `B.ARW.xmp` arrived as 5. So with
+  darktable's naming, a frame LightCraft has written a sidecar for no
+  longer hears from Omacull. Hence `sidecar = "adobe"`: one sidecar, in
+  which Omacull changes the rating and nothing else (checked on three
+  that LightCraft wrote).
+- **Culling again after importing** is as with darktable: its library
+  wins until it's told to read the metadata from the files, which brought
+  a changed rating in. And its flags are its own (`lc:flag`), written with
+  a rating of 0, not -1: what LightCraft rejected opens undecided in
+  Omacull, or with the stars it had, and a sidecar whose `lc:flag` says
+  pick stays a pick in LightCraft whatever rating Omacull gives it. Cull,
+  then import, and none of it arises.
 
 ### The sidecar
 
