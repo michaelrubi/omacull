@@ -80,7 +80,8 @@ A pick is one star. In darktable, "rated 1 or more" is the keepers.
 
 The rest of M1's keys: arrows, Home and End step; Ctrl+Z and Ctrl+Shift+Z
 undo and redo marks; A turns auto-advance after a mark on and off
-(remembered); Ctrl+O opens a folder. The filmstrip's filters are Bridge's
+(remembered); Ctrl+O opens a folder and Ctrl+W closes it, back to the
+recent ones. The filmstrip's filters are Bridge's
 Ctrl+Alt keys: Ctrl+Alt+A all, Ctrl+Alt+0 undecided, Ctrl+Alt+1 picks and
 up, Ctrl+Alt+2 to 5 that many stars and up, and Ctrl+Alt+X rejects. A
 frame marked out of the filter stays on screen until the cursor leaves it.

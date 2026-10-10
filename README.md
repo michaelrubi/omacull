@@ -50,7 +50,8 @@ it, [say how it went](CONTRIBUTING.md).
   100% straight from the picture. Where raws sit with JPEGs or PNGs,
   Shift+F culls them all, or one format alone.
 - **Getting around:** T a folder tree, M a summary of the cull, Shift+U
-  the first undecided frame, Ctrl+E on to darktable.
+  the first undecided frame, Ctrl+E on to darktable, Ctrl+W closes the
+  folder.
 
 ![Surveying a stack: the signals under each frame, and which one they favour](docs/screenshots/survey.jpg)
 

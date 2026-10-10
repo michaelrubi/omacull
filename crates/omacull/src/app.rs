@@ -415,6 +415,18 @@ impl App {
         self.message = Some((format!("Format: {}{only}", formats.label()), false));
     }
 
+    /// Close the open folder, back to the recent ones: its place is
+    /// remembered, as when another is opened.
+    fn close(&mut self) {
+        self.log_passes();
+        self.remember_place();
+        self.shoot = None;
+        // Nor is one on its way opened.
+        self.opening = None;
+        self.summary = false;
+        self.message = None;
+    }
+
     /// Ask for a folder to open, with the system's picker.
     fn pick(&mut self, ctx: &egui::Context) {
         if self.picking.is_some() {
@@ -451,6 +463,7 @@ impl App {
         match command {
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Command::Open => self.pick(ctx),
+            Command::Close => self.close(),
             Command::AutoAdvance => {
                 let on = !self.state.auto_advance;
                 self.state.set_auto_advance(on);
@@ -961,6 +974,8 @@ impl App {
             ui.add_space(8.0);
             let open = format!("Open a folder of raws, JPEGs or PNGs with {}", shortcut(Command::Open));
             ui.label(RichText::new(open).color(self.theme.dark_foreground));
+            let tree = format!("or find one in the folder tree with {}", shortcut(Command::Folders));
+            ui.label(RichText::new(tree).color(self.theme.dark_foreground));
             ui.add_space(12.0);
             if ui.button("Open…").clicked() {
                 clicked = Some(None);
@@ -1860,6 +1875,26 @@ mod tests {
         assert_eq!(h.cull().current(), 0);
         open(&mut h, &a);
         assert_eq!((h.cull().current(), h.cull().filter()), (3, Filter::Undecided));
+    }
+
+    #[test]
+    fn ctrl_w_closes_the_folder_and_its_place_is_kept() {
+        let folder = Folder::with_raws("app-close", 5, &Arw::default());
+        let mut h = Harness::open(&folder, quiet());
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::M);
+        let output = h.press(Modifiers::COMMAND, Key::W);
+        // The folder, not the window.
+        assert!(!closes(&output));
+        assert!(h.app.shoot.is_none() && !h.app.summary);
+        // With nothing open it does nothing, and the tree still browses.
+        h.press(Modifiers::COMMAND, Key::W);
+        h.press(NONE, Key::T);
+        h.wait("the tree", |app| app.tree.as_ref().is_some_and(|t| !t.reading()));
+        h.app.open(folder.0.clone(), &h.ctx.clone());
+        h.wait("the folder", |app| app.opening.is_none() && app.shoot.is_some());
+        assert_eq!(h.cull().current(), 2);
     }
 
     #[test]
