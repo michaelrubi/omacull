@@ -682,6 +682,13 @@ impl Shoot {
     }
 
     #[cfg(test)]
+    /// A frame as if its preview and thumbnail hadn't loaded yet.
+    pub fn forget_preview(&mut self, index: usize) {
+        self.previews.remove(&index);
+        self.thumbnails.remove(&index);
+    }
+
+    #[cfg(test)]
     /// The current preview's pixel at (`x`, `y`) as uploaded.
     pub fn preview_bake(&self) -> Option<Bake> {
         match self.previews.get(&self.cull.current()) {
@@ -965,16 +972,19 @@ impl Shoot {
             (_, Some(Slot::Ready(t))) => Some(t),
             _ => None,
         };
-        let Some(texture) = texture else {
+        // Zoomed in, a frame developed ahead needs neither: it can land
+        // before its preview does.
+        let zoomed = view.zoomed;
+        let developed = zoomed && matches!(self.full.get(&index), Some(Slot::Ready(_)));
+        if texture.is_none() && !developed {
             if let Some(Slot::Failed(e)) = self.previews.get(&index) {
                 let name = frame.path.file_name().unwrap_or_default().to_string_lossy();
                 let text = format!("Can't show {name}: {e}");
                 painter.text(area.center(), Align2::CENTER_CENTER, text, FontId::proportional(14.0), theme.red);
             }
             return;
-        };
+        }
 
-        let zoomed = view.zoomed;
         let drawn = if zoomed {
             let rect = view.zoomed_rect(size, ppp);
             match self.full.get_mut(&index) {
@@ -984,7 +994,9 @@ impl Shoot {
                 }
                 other => {
                     // The preview, enlarged, until the raw is developed.
-                    painter.image(texture.id(), rect, uv, Color32::WHITE);
+                    if let Some(texture) = texture {
+                        painter.image(texture.id(), rect, uv, Color32::WHITE);
+                    }
                     // A JPEG or a PNG has nothing to develop.
                     let whole = match cull::kind(&frame.path) {
                         Some(Kind::Jpeg) => Some("JPEG"),
@@ -1007,10 +1019,12 @@ impl Shoot {
                 }
             }
             rect
-        } else {
+        } else if let Some(texture) = texture {
             let rect = fit(texture.size_vec2(), area);
             painter.image(texture.id(), rect, uv, Color32::WHITE);
             rect
+        } else {
+            return;
         };
 
         let frame = &self.cull.frames()[index];
