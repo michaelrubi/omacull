@@ -1644,6 +1644,8 @@ mod tests {
             info: Default::default(),
         };
         h.app.shoot.as_mut().unwrap().insert_full(0, decoded);
+        // Even before the preview: a PNG's can land first.
+        h.app.shoot.as_mut().unwrap().forget_preview(0);
         h.frame(vec![]);
         let tiles = h.shoot().full_state(0).unwrap().unwrap();
         // The loupe is 800 points wide: two or three tiles across, and as
@@ -1924,7 +1926,8 @@ mod tests {
         h.wait("the full-size frame", |app| app.shoot.as_ref().unwrap().full_state(2).is_some());
         h.press(NONE, Key::Z);
         h.frame(vec![]);
-        assert!(h.shoot().full_state(2).unwrap().is_ok_and(|tiles| tiles > 0), "nothing to develop");
+        let state = h.shoot().full_state(2).unwrap();
+        assert!(state.as_ref().is_ok_and(|&tiles| tiles > 0), "nothing to develop: {state:?}");
         assert_eq!(h.shoot().full_size(1.0), vec2(600.0, 400.0));
         h.press(NONE, Key::Z);
         // Its mark goes in a sidecar of its own.
