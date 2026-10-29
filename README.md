@@ -58,10 +58,12 @@ it, [say how it went](CONTRIBUTING.md).
 
 ![Surveying a stack: the signals under each frame, and which one they favour](docs/screenshots/survey.jpg)
 
-Every shortcut can be changed in `~/.config/omacull/hotkeys.toml`, which
-lists them all. [docs/DESIGN.md](docs/DESIGN.md) has the design and every
-key; [docs/ROADMAP.md](docs/ROADMAP.md) what's built and what's still to
-be tried.
+Right-click a frame, or the filmstrip, for a menu of what can be done,
+each with its key. Every shortcut can be changed in
+`~/.config/omacull/hotkeys.toml`, which lists them all.
+[docs/DESIGN.md](docs/DESIGN.md) has the design and every key;
+[docs/ROADMAP.md](docs/ROADMAP.md) what's built and what's still to be
+tried.
 
 ## Install
 

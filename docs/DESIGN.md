@@ -95,6 +95,11 @@ The mouse does the same as Z on the loupe: click to toggle, press and hold
 for a look, drag to pan; the wheel pans. Which overlays are on is
 remembered. The status bar has a switch for each, its key in the tooltip.
 
+A right-click on a frame, in any view, or on the filmstrip opens a menu of
+the commands, grouped, each with its shortcut, for keys not yet learnt.
+It's for the frame right-clicked: it becomes the current one, unless it's
+one of the selection, which is kept.
+
 M3's keys: C compares two frames, N surveys several, Escape goes back to
 the loupe (and then clears the selection). Ctrl+click and Shift+click in
 the filmstrip select, as do Shift+arrows, Ctrl+A and Ctrl+D. In both views

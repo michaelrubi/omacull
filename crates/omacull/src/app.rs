@@ -885,16 +885,18 @@ impl App {
         }
         let theme = self.theme.clone();
         let show = self.state.show;
+        let mut strip = None;
         if let Some(shoot) = &mut self.shoot {
-            let strip = egui::Frame::new().fill(theme.darker_background);
-            let clicked = egui::Panel::bottom("filmstrip")
-                .frame(strip)
+            let frame = egui::Frame::new().fill(theme.darker_background);
+            let (clicked, response) = egui::Panel::bottom("filmstrip")
+                .frame(frame)
                 .resizable(false)
                 .show(ui, |ui| shoot.filmstrip(ui, &theme, show))
                 .inner;
             if let Some((index, click)) = clicked {
                 shoot.clicked(index, click);
             }
+            strip = Some(response);
         }
         if self.state.show.faces
             && let Some(shoot) = &mut self.shoot
@@ -927,10 +929,20 @@ impl App {
         }
         let pasteboard = egui::Frame::new().fill(self.theme.pasteboard());
         let mut clicked = None;
+        let mut panes = Vec::new();
         egui::CentralPanel::no_frame().frame(pasteboard).show(ui, |ui| match &mut self.shoot {
-            Some(shoot) => shoot.loupe(ui, &theme, show),
+            Some(shoot) => panes = shoot.loupe(ui, &theme, show),
             None => clicked = self.empty_state(ui),
         });
+        // A right-click on a frame, or on the filmstrip, for the menu.
+        let mode = self.shoot.as_ref().map_or(Mode::Loupe, |s| s.mode);
+        let mut chosen = None;
+        for response in panes.iter().chain(&strip) {
+            response.context_menu(|ui| chosen = chosen.or(context_menu(ui, mode)));
+        }
+        if let Some(command) = chosen {
+            self.run(command, &ctx);
+        }
         match clicked {
             Some(Some(dir)) => self.open(dir, &ctx),
             Some(None) => self.run(Command::Open, &ctx),
@@ -1225,6 +1237,70 @@ fn shortcut(command: Command) -> String {
     hotkeys::current().command(command).map_or_else(|| "No shortcut".into(), |s| format_shortcut(&s))
 }
 
+/// What a right-click on a frame offers, each with its shortcut, for the
+/// keys not yet learnt. Returns the command chosen.
+fn context_menu(ui: &mut Ui, mode: Mode) -> Option<Command> {
+    let mut chosen = None;
+    let mut item = |ui: &mut Ui, command: Command| {
+        let keys = hotkeys::current().command(command).map(|s| format_shortcut(&s)).unwrap_or_default();
+        if ui.add(egui::Button::new(command.label()).shortcut_text(keys)).clicked() {
+            chosen = Some(command);
+        }
+    };
+    for command in [Command::Pick, Command::Reject, Command::Unmark] {
+        item(ui, command);
+    }
+    ui.menu_button("Stars", |ui| {
+        for command in [Command::Star1, Command::Star2, Command::Star3, Command::Star4, Command::Star5] {
+            item(ui, command);
+        }
+    });
+    item(ui, Command::Accept);
+    ui.separator();
+    ui.menu_button("Zoom", |ui| {
+        for command in [Command::Zoom, Command::ZoomToFocus, Command::Eyes] {
+            item(ui, command);
+        }
+    });
+    ui.menu_button("Compare and Survey", |ui| {
+        let mut commands = vec![Command::Compare, Command::Survey];
+        if mode != Mode::Loupe {
+            commands.extend([Command::Back, Command::KnockOut, Command::Lock, Command::NextPane]);
+        }
+        commands.extend([Command::SelectPrevious, Command::SelectNext, Command::SelectAll, Command::SelectNone]);
+        for command in commands {
+            item(ui, command);
+        }
+    });
+    ui.menu_button("Stacks", |ui| {
+        let commands = [Command::Winner, Command::StackSelection, Command::Unstack, Command::ToggleStack];
+        for command in commands.into_iter().chain([Command::Stacking]) {
+            item(ui, command);
+        }
+    });
+    ui.menu_button("Show", |ui| {
+        for filter in Filter::ALL {
+            item(ui, Command::show(filter));
+        }
+        item(ui, Command::Formats);
+    });
+    ui.menu_button("Overlays", |ui| {
+        let commands = [Command::Histogram, Command::Info, Command::Clipping, Command::Peaking, Command::FocusPoint];
+        for command in commands.into_iter().chain([Command::FaceStrip, Command::Signals, Command::Suggestions]) {
+            item(ui, command);
+        }
+    });
+    ui.separator();
+    for command in [Command::Export, Command::Darktable, Command::Summary, Command::Folders] {
+        item(ui, command);
+    }
+    ui.separator();
+    for command in [Command::Undo, Command::Redo] {
+        item(ui, command);
+    }
+    chosen
+}
+
 /// The current frame, its place in the folder, and the cull so far.
 /// The status line: the view, the selection, and the cull.
 fn status_line(shoot: &Shoot) -> String {
@@ -1377,6 +1453,27 @@ mod tests {
                 |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: NONE };
             self.frame(vec![Event::PointerMoved(at), button(true)]);
             self.frame(vec![button(false)]);
+        }
+
+        fn right_click(&mut self, at: egui::Pos2) {
+            let button =
+                |pressed| Event::PointerButton { pos: at, button: PointerButton::Secondary, pressed, modifiers: NONE };
+            self.frame(vec![Event::PointerMoved(at), button(true)]);
+            self.frame(vec![button(false)]);
+        }
+
+        /// Click the words `text` where they're drawn, as in a menu.
+        fn click_text(&mut self, text: &str) {
+            let output = self.frame(vec![]);
+            let rect = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{text:?} isn't drawn"));
+            self.click(rect.center());
         }
 
         /// Run frames until `done`, as the background threads finish.
@@ -1765,6 +1862,50 @@ mod tests {
         h.press(NONE, Key::Slash);
         assert_eq!((h.shoot().mode, h.cull().current()), (Mode::Loupe, 1), "one left: the loupe");
         assert_eq!(h.ratings(), [0, 0, 3, 0, 0, 0], "knocking out doesn't mark");
+    }
+
+    #[test]
+    fn a_right_click_offers_the_commands() {
+        let folder = Folder::with_raws("app-context-menu", 6, &Arw::default());
+        let mut h = Harness::open(&folder, quiet());
+        let centre = h.shoot().view().area.center();
+        h.right_click(centre);
+        h.click_text("Pick");
+        assert_eq!(h.ratings(), [PICK, 0, 0, 0, 0, 0]);
+        assert!(!h.shoot().view().zoomed, "a right-click doesn't zoom");
+
+        // On the filmstrip, the frame right-clicked is the one marked.
+        h.frame(vec![]);
+        let cells = h.shoot().cells.clone();
+        let (_, rect) = cells.iter().copied().find(|&(i, _)| i == 2).unwrap();
+        h.right_click(rect.center());
+        assert_eq!(h.cull().current(), 2);
+        h.click_text("Stars");
+        h.click_text("3 Stars");
+        assert_eq!(h.ratings(), [PICK, 0, 3, 0, 0, 0]);
+
+        // What's shown, for the copies.
+        h.right_click(centre);
+        h.click_text("Show");
+        h.click_text("Show 2 Stars and Up");
+        assert_eq!(h.cull().filter(), Filter::AtLeast(2));
+        assert_eq!(h.cull().shown_indices(), [2]);
+    }
+
+    #[test]
+    fn a_right_click_keeps_the_selection() {
+        let folder = Folder::with_raws("app-context-selection", 6, &Arw::default());
+        let mut h = Harness::open(&folder, quiet());
+        h.press(Modifiers::SHIFT, Key::ArrowRight);
+        h.press(Modifiers::SHIFT, Key::ArrowRight);
+        h.frame(vec![]);
+        let cells = h.shoot().cells.clone();
+        let (_, rect) = cells.iter().copied().find(|&(i, _)| i == 1).unwrap();
+        h.right_click(rect.center());
+        assert_eq!(h.cull().selection(), [0, 1, 2]);
+        h.click_text("Compare and Survey");
+        h.click_text("Survey");
+        assert_eq!(panes(&h), [0, 1, 2]);
     }
 
     #[test]
