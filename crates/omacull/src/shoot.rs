@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{
-    Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, pos2,
+    Align2, Color32, FontId, Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, pos2,
     vec2,
 };
 use omacull_engine::color::Display;
@@ -914,8 +914,9 @@ impl Shoot {
     }
 
     /// The frames on screen, each in its pane, whole or at 100%, with
-    /// what's to be shown over it.
-    pub fn loupe(&mut self, ui: &mut Ui, theme: &Theme, show: Show) {
+    /// what's to be shown over it. Returns each pane's response, for its
+    /// right-click menu.
+    pub fn loupe(&mut self, ui: &mut Ui, theme: &Theme, show: Show) -> Vec<Response> {
         let whole_area = ui.max_rect();
         let areas = match self.mode {
             Mode::Loupe => vec![whole_area],
@@ -929,12 +930,13 @@ impl Shoot {
         };
         let active = self.active();
         let pressed = ui.input(|i| i.pointer.primary_pressed());
+        let mut responses = Vec::new();
         for (k, area) in areas.into_iter().enumerate() {
             let response = ui.interact(area, egui::Id::new(("pane", k)), Sense::click_and_drag());
             // A press on another pane makes it the active one, and does no
-            // more.
+            // more; so does a right-click, so that its menu is for that frame.
             let activates = k != active && pressed && response.is_pointer_button_down_on();
-            if activates {
+            if activates || (k != active && response.secondary_clicked()) {
                 self.cull.go_to(self.panes[k].frame);
             }
             self.panes[k].view.area = area.shrink(8.0);
@@ -949,7 +951,9 @@ impl Shoot {
                 }
             }
             self.pane(ui, k, area, theme, show);
+            responses.push(response);
         }
+        responses
     }
 
     /// One pane: its frame, and what's shown over it.
@@ -1071,7 +1075,7 @@ impl Shoot {
 
     /// The shown frames in a strip, the current one in the middle. Returns
     /// the frame clicked, and how.
-    pub fn filmstrip(&mut self, ui: &mut Ui, theme: &Theme, show: Show) -> Option<(usize, Click)> {
+    pub fn filmstrip(&mut self, ui: &mut Ui, theme: &Theme, show: Show) -> (Option<(usize, Click)>, Response) {
         let (strip, response) = ui.allocate_exact_size(vec2(ui.available_width(), STRIP_HEIGHT), Sense::click());
         let painter = ui.painter_at(strip);
         let cell = vec2(STRIP_HEIGHT * 1.5, STRIP_HEIGHT);
@@ -1140,14 +1144,20 @@ impl Shoot {
                 None => {}
             }
         }
-        let pointer = response.interact_pointer_pos().filter(|_| response.clicked())?;
+        let right = response.secondary_clicked();
         let modifiers = ui.input(|i| i.modifiers);
         let click = match () {
+            () if right => Click::Plain,
             () if modifiers.command => Click::Toggle,
             () if modifiers.shift => Click::Range,
             () => Click::Plain,
         };
-        self.cells.iter().find(|(_, rect)| rect.contains(pointer)).map(|&(i, _)| (i, click))
+        let pointer = response.interact_pointer_pos().filter(|_| response.clicked() || right);
+        let hit = pointer.and_then(|p| self.cells.iter().find(|(_, rect)| rect.contains(p)));
+        // A right-click on a frame of the selection keeps the selection, for
+        // the menu to act on.
+        let clicked = hit.filter(|&&(i, _)| !(right && self.cull.is_selected(i))).map(|&(i, _)| (i, click));
+        (clicked, response)
     }
 }
 
