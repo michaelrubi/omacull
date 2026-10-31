@@ -10,6 +10,7 @@ pub mod folders;
 pub mod image;
 pub mod learn;
 pub mod loader;
+pub mod query;
 pub mod raw;
 pub mod sidecar;
 pub mod signals;

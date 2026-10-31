@@ -69,6 +69,8 @@ pub enum Command {
     Accept,
     ShowSuggested,
     Learn,
+    Search,
+    ClearSearch,
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -144,6 +146,8 @@ impl Command {
         Command::Accept,
         Command::ShowSuggested,
         Command::Learn,
+        Command::Search,
+        Command::ClearSearch,
     ];
 
     /// Look a command up by its name in code, e.g. "Reject".
@@ -173,7 +177,9 @@ impl Command {
         Command::SelectNone,
         Command::FirstUndecided,
         Command::Export,
+        Command::ClearSearch,
         Command::Darktable,
+        Command::Search,
         Command::FaceStrip,
         Command::StackSelection,
         Command::Stacking,
@@ -281,6 +287,8 @@ impl Command {
             Command::Accept => "Take the Suggestion",
             Command::ShowSuggested => "Show Suggested",
             Command::Learn => "Learn from My Decisions",
+            Command::Search => "Search by Setting or Measure…",
+            Command::ClearSearch => "Clear Search",
         }
     }
 
@@ -354,6 +362,9 @@ impl Command {
             Command::Accept => s(Modifiers::NONE, Key::Y),
             Command::ShowSuggested => s(CMD_ALT, Key::Y),
             Command::Learn => s(CMD, Key::L),
+            // Lightroom's Find.
+            Command::Search => s(CMD, Key::F),
+            Command::ClearSearch => s(CMD_SHIFT, Key::F),
         }
     }
 

@@ -15,6 +15,7 @@ use omacull_engine::stacks::Stacking;
 use omacull_engine::disk::{self, Disk, How, Mark, Problem};
 use omacull_engine::export;
 use omacull_engine::learn::{self, Model};
+use omacull_engine::query::Query;
 use omacull_engine::sidecar::{self, REJECT};
 use omacull_engine::{signals, thumbs};
 
@@ -51,6 +52,15 @@ struct Opening {
     /// The picture to start at, when one was opened rather than a folder.
     select: Option<PathBuf>,
     result: Receiver<io::Result<(Cull, Vec<String>)>>,
+}
+
+/// The search box, while it's open.
+struct Search {
+    text: String,
+    /// Why the text couldn't be read, once Enter was pressed on it.
+    error: Option<String>,
+    /// The box has been given the keyboard.
+    focused: bool,
 }
 
 /// What a folder is picked for.
@@ -128,6 +138,7 @@ pub struct App {
     model: Option<Arc<Model>>,
     /// The model being trained, and whether to say how it went.
     learning: Option<(Receiver<Result<Model, String>>, bool)>,
+    search: Option<Search>,
 }
 
 /// Converts to a monitor's colours, or shows sRGB as it is if its profile
@@ -229,6 +240,7 @@ impl App {
             config: Config::default(),
             model: None,
             learning: None,
+            search: None,
         }
     }
 
@@ -321,7 +333,8 @@ impl App {
             let frame = file_name(&cull.frame().path);
             let name = |i: &usize| file_name(&cull.frames()[*i].path);
             let stacks = cull.manual_stacks().iter().map(|s| s.iter().map(name).collect()).collect();
-            self.state.remember(Place { dir: cull.dir().to_path_buf(), frame, filter: cull.filter(), stacks });
+            let query = cull.query().source().to_owned();
+            self.state.remember(Place { dir: cull.dir().to_path_buf(), frame, filter: cull.filter(), query, stacks });
         }
     }
 
@@ -422,6 +435,11 @@ impl App {
                     cull.go_to(at);
                 }
                 if let Some(place) = place {
+                    // A query that can't be read now (a field since renamed)
+                    // is dropped.
+                    if let Ok(query) = Query::parse(&place.query) {
+                        cull.set_query(query);
+                    }
                     cull.set_filter(place.filter);
                 }
                 if let Some(tree) = &mut self.tree {
@@ -478,15 +496,43 @@ impl App {
         // Nor is one on its way opened.
         self.opening = None;
         self.summary = false;
+        self.search = None;
         self.message = None;
     }
 
-    /// The pictures the filter lets through: what's copied, and what
-    /// LightCraft is handed.
+    /// Open the search box on what the folder is narrowed to now, or give
+    /// it the keyboard again if it's open.
+    fn search(&mut self) {
+        let Some(shoot) = &self.shoot else { return };
+        let text = shoot.cull.query().source().to_owned();
+        match &mut self.search {
+            Some(search) => search.focused = false,
+            None => self.search = Some(Search { text, error: None, focused: false }),
+        }
+    }
+
+    /// Narrow the frames to what `query` lets through, and say how many
+    /// that is.
+    fn narrow(&mut self, query: Query) {
+        let Some(shoot) = &mut self.shoot else { return };
+        let cleared = query.is_empty();
+        shoot.cull.set_query(query);
+        let (shown, total) = (shoot.cull.matching(), shoot.cull.frames().len());
+        let waiting = shoot.cull.unmeasured();
+        self.message = Some(if cleared {
+            ("Search cleared".into(), false)
+        } else {
+            let measuring = if waiting > 0 { format!(" ({waiting} not measured yet)") } else { String::new() };
+            (format!("{shown} of {total} frames match{measuring}"), shown == 0 && waiting == 0)
+        });
+    }
+
+    /// The pictures the filter and the search let through: what's copied,
+    /// and what LightCraft is handed.
     fn shown(&self) -> Vec<PathBuf> {
         let Some(shoot) = &self.shoot else { return Vec::new() };
-        let filter = shoot.cull.filter();
-        shoot.cull.frames().iter().filter(|f| filter.matches(f)).map(|f| f.path.clone()).collect()
+        let cull = &shoot.cull;
+        (0..cull.frames().len()).filter(|&i| cull.matches(i)).map(|i| cull.frames()[i].path.clone()).collect()
     }
 
     /// Ask for the folder to copy what's shown to, if anything is.
@@ -610,6 +656,8 @@ impl App {
                 return self.set_formats(next, ctx);
             }
             Command::Summary => self.summary = !self.summary,
+            Command::Search => self.search(),
+            Command::ClearSearch => self.narrow(Query::default()),
             Command::Back if self.summary => {
                 self.summary = false;
                 return;
@@ -818,13 +866,19 @@ impl App {
         self.finish_copying();
         self.finish_learning();
         self.disk_problems();
-        // Nothing in Omacull takes typing, so no widget keeps the keyboard:
-        // egui gives it to the next button on Tab, which is a key here.
-        ctx.memory_mut(|m| {
-            if let Some(focused) = m.focused() {
-                m.surrender_focus(focused);
-            }
-        });
+        if self.search.is_some() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.search = None;
+        }
+        // Nothing in Omacull takes typing but the search box, so no other
+        // widget keeps the keyboard: egui gives it to the next button on
+        // Tab, which is a key here.
+        if self.search.is_none() {
+            ctx.memory_mut(|m| {
+                if let Some(focused) = m.focused() {
+                    m.surrender_focus(focused);
+                }
+            });
+        }
         if !ctx.egui_wants_keyboard_input() {
             for command in Command::pressed(ctx) {
                 self.run(command, ctx);
@@ -875,6 +929,16 @@ impl App {
             .inner;
         if let Some(command) = command {
             self.run(command, &ctx);
+        }
+        if self.search.is_some() {
+            let bar = egui::Frame::new()
+                .fill(self.theme.dark_background)
+                .inner_margin(egui::Margin::symmetric(8, 4));
+            let applied = egui::Panel::bottom("search").frame(bar).show(ui, |ui| self.search_bar(ui)).inner;
+            if let Some(query) = applied {
+                self.search = None;
+                self.narrow(query);
+            }
         }
         if let Some(formats) = formats {
             self.set_formats(formats, &ctx);
@@ -950,6 +1014,45 @@ impl App {
         }
     }
 
+    /// The search box. Enter reads what's typed: returns the query if it
+    /// can be read, else says why under the box. (Escape closes it in
+    /// `step`, before the shortcuts: egui drops the focus on Escape, and
+    /// Back would take the key.)
+    fn search_bar(&mut self, ui: &mut Ui) -> Option<Query> {
+        let theme = &self.theme;
+        let search = self.search.as_mut()?;
+        let mut applied = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Search").color(theme.dark_foreground));
+            let edit = egui::TextEdit::singleline(&mut search.text)
+                .hint_text("iso:>=3200 focus:<12 shut:yes")
+                .desired_width(420.0);
+            let response = ui.add(edit);
+            if !search.focused {
+                response.request_focus();
+                search.focused = true;
+            }
+            if response.changed() {
+                search.error = None;
+            }
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                match Query::parse(&search.text) {
+                    Ok(query) => applied = Some(query),
+                    Err(e) => {
+                        search.error = Some(e.to_string());
+                        search.focused = false;
+                    }
+                }
+            }
+            let (text, colour) = match &search.error {
+                Some(error) => (error.clone(), theme.red),
+                None => (format!("Enter to apply, Esc to close. Fields: {}", Query::FIELDS), theme.dark_foreground),
+            };
+            ui.add(egui::Label::new(RichText::new(text).color(colour)).truncate());
+        });
+        applied
+    }
+
     /// Where the cull stands, and the filter, format, stacking and
     /// auto-advance switches. Returns the command for a switch clicked, or
     /// the stacking or the formats chosen.
@@ -969,6 +1072,19 @@ impl App {
                                 }
                             }
                         });
+                    let query = shoot.cull.query();
+                    if !query.is_empty() {
+                        let source: String = query.source().chars().take(32).collect();
+                        let ellipsis = if source.len() < query.source().len() { "…" } else { "" };
+                        let tip = format!(
+                            "Edit ({}), clear ({})",
+                            shortcut(Command::Search),
+                            shortcut(Command::ClearSearch)
+                        );
+                        if ui.selectable_label(true, format!("Search: {source}{ellipsis}")).on_hover_text(tip).clicked() {
+                            command = Some(Command::Search);
+                        }
+                    }
                     // Only where there's a choice: more than one kind.
                     let choices = shoot.cull.choices();
                     if !choices.is_empty() {
@@ -1324,10 +1440,14 @@ fn status_line(shoot: &Shoot) -> String {
 
 fn status(cull: &Cull) -> String {
     let counts = cull.counts();
-    let filter = cull.filter();
-    let shown = match filter {
-        Filter::All => String::new(),
-        _ => format!(" ({} shown)", cull.frames().iter().filter(|f| filter.matches(f)).count()),
+    let shown = if cull.filter() == Filter::All && cull.query().is_empty() {
+        String::new()
+    } else {
+        let waiting = match cull.unmeasured() {
+            0 => String::new(),
+            n => format!(", {n} not measured yet"),
+        };
+        format!(" ({} shown{waiting})", cull.matching())
     };
     format!(
         "{}   {} / {}{shown}   {} picks   {} rejects   {} undecided",
@@ -1507,6 +1627,54 @@ mod tests {
             .viewport_output
             .values()
             .any(|v| v.commands.iter().any(|c| matches!(c, egui::ViewportCommand::Close)))
+    }
+
+    #[test]
+    fn field_search_narrows_the_frames_with_a_box_that_takes_typing() {
+        let folder = Folder::with_raws("app-search", 4, &Arw::default());
+        for (i, iso) in [(1, 100), (2, 800), (3, 3200), (4, 6400)] {
+            Arw { iso, ..Arw::default() }.write(&folder.raw(i));
+        }
+        let mut h = Harness::open(&folder, quiet());
+        h.press(Modifiers::COMMAND, Key::F);
+        h.frame(vec![]);
+        assert!(h.app.search.is_some());
+        // The box has the keyboard: X is a letter in it, not a reject.
+        h.press(NONE, Key::X);
+        assert_eq!(h.ratings(), [0, 0, 0, 0]);
+
+        h.frame(vec![Event::Text("colour:red".into())]);
+        h.press(NONE, Key::Enter);
+        let error = h.app.search.as_ref().and_then(|s| s.error.clone()).expect("a term it can't read says why");
+        assert!(error.contains("no field called \"colour\""), "{error}");
+        assert!(h.cull().query().is_empty(), "nothing is narrowed by a query that can't be read");
+
+        // Typed over, it's read.
+        h.app.search.as_mut().unwrap().text.clear();
+        h.frame(vec![]);
+        h.frame(vec![Event::Text("iso:>=3200".into())]);
+        h.press(NONE, Key::Enter);
+        assert!(h.app.search.is_none(), "the box closes on a query that's read");
+        assert_eq!((h.cull().shown_indices(), h.cull().current()), ([2, 3].to_vec(), 2));
+        assert_eq!(h.app.message, Some(("2 of 4 frames match".into(), false)));
+        assert!(status(h.cull()).contains("(2 shown)"));
+        // The keys are keys again.
+        h.press(NONE, Key::X);
+        assert_eq!(h.ratings(), [0, 0, REJECT, 0]);
+
+        // Saved with the folder's place, and put away for good.
+        h.app.remember_place();
+        assert_eq!(h.app.state.place(h.cull().dir()).map(|p| p.query.as_str()), Some("iso:>=3200"));
+        h.press(CMD_SHIFT, Key::F);
+        assert!(h.cull().query().is_empty());
+        assert_eq!(h.cull().shown_indices(), [0, 1, 2, 3]);
+
+        // Escape closes the box and leaves things as they were.
+        h.press(Modifiers::COMMAND, Key::F);
+        h.frame(vec![]);
+        h.press(NONE, Key::Escape);
+        assert!(h.app.search.is_none(), "Escape closes the box");
+        assert!(h.cull().query().is_empty());
     }
 
     #[test]

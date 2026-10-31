@@ -706,7 +706,10 @@ impl Shoot {
     /// Take in what has loaded, and ask for what's wanted next.
     pub fn update(&mut self, ctx: &egui::Context, show: Show) {
         self.dwell();
-        self.faces.update();
+        // Field search asks about these too.
+        for (index, signals) in self.faces.update() {
+            self.cull.set_signals(index, signals);
+        }
         self.suggest(show.suggestions);
         let current = self.cull.current();
         // The loupe's pane shows the current frame; elsewhere, a frame
