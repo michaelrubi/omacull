@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::image::Image;
-use crate::raw::RawFile;
+use crate::query::Query;
+use crate::raw::{Exif, RawFile};
 use crate::sidecar::{self, REJECT};
+use crate::signals::Signals;
 use crate::stacks::{self, Signature, Stacking};
 
 /// The raws a folder is culled for: Sony's, Nikon's, Canon's and Fuji's.
@@ -121,11 +123,15 @@ pub struct Frame {
     pub signature: Option<Signature>,
     /// The mark Omacull suggests for it, while it has none.
     pub suggested: Option<Rating>,
+    /// How it was shot, for field search.
+    pub exif: Option<Exif>,
+    /// What was measured of it, once the background pass has got to it.
+    pub signals: Option<Signals>,
 }
 
 impl Frame {
     pub fn new(path: PathBuf, rating: Rating) -> Self {
-        Self { path, rating, captured: None, signature: None, suggested: None }
+        Self { path, rating, captured: None, signature: None, suggested: None, exif: None, signals: None }
     }
 }
 
@@ -209,6 +215,8 @@ pub struct Cull {
     frames: Vec<Frame>,
     current: usize,
     filter: Filter,
+    /// What field search narrows the frames to, besides the filter.
+    query: Query,
     /// 1 or -1: the way the cursor last moved, for prefetching.
     direction: isize,
     /// Each step is one or more changes, undone together.
@@ -275,7 +283,8 @@ impl Cull {
                     let jpeg = r.read(r.thumbnail().filter(|j| j.len < 1 << 20)?).ok()?;
                     Some(Signature::of(&Image::decode_jpeg(&jpeg).ok()?))
                 });
-                (Frame { path, rating, captured, signature, suggested: None }, problem)
+                let exif = raw.as_ref().map(|r| r.info().exif);
+                (Frame { path, rating, captured, signature, suggested: None, exif, signals: None }, problem)
             })
             .collect();
         let (frames, problems): (Vec<Frame>, Vec<Option<String>>) = read.into_iter().unzip();
@@ -292,6 +301,7 @@ impl Cull {
             frames,
             current: 0,
             filter: Filter::All,
+            query: Query::default(),
             direction: 1,
             undo,
             redo,
@@ -385,9 +395,30 @@ impl Cull {
         members.iter().copied().filter(|&i| self.matches(i)).max_by_key(key)
     }
 
-    /// Whether the filter lets a frame through.
-    fn matches(&self, index: usize) -> bool {
-        self.filter.matches(&self.frames[index])
+    /// Whether the filter and the query both let a frame through.
+    pub fn matches(&self, index: usize) -> bool {
+        self.filter.matches(&self.frames[index]) && self.query.matches(&self.frames[index], self.stack_of[index].is_some())
+    }
+
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+
+    /// How many frames the filter and the query let through, in stacks or
+    /// not.
+    pub fn matching(&self) -> usize {
+        (0..self.frames.len()).filter(|&i| self.matches(i)).count()
+    }
+
+    /// How many frames the query can't be answered for yet, because they
+    /// haven't been measured: 0 where it asks about nothing measured.
+    pub fn unmeasured(&self) -> usize {
+        if self.query.needs_measuring() { self.frames.iter().filter(|f| f.signals.is_none()).count() } else { 0 }
+    }
+
+    /// Take in what was measured of a frame.
+    pub fn set_signals(&mut self, index: usize, signals: Signals) {
+        self.frames[index].signals = Some(signals);
     }
 
     /// The marks Omacull suggests, for undecided frames: these and no
@@ -498,7 +529,20 @@ impl Cull {
     /// frame, the cursor moves to the nearest frame that's in, next first.
     pub fn set_filter(&mut self, filter: Filter) {
         self.filter = filter;
-        if !filter.matches(self.frame()) {
+        self.settle();
+    }
+
+    /// Narrow the frames to what `query` lets through as well as the filter.
+    /// The cursor moves as it does for a filter.
+    pub fn set_query(&mut self, query: Query) {
+        self.query = query;
+        self.settle();
+    }
+
+    /// If the filter and query leave out the current frame, move the cursor
+    /// to the nearest frame that's in, next first.
+    fn settle(&mut self) {
+        if !self.matches(self.current) {
             let to = self.onward(self.current, 1).next().or_else(|| self.onward(self.current, -1).next());
             if let Some(to) = to {
                 self.current = to;
@@ -944,6 +988,71 @@ mod tests {
         assert_eq!(c.current(), 2);
         assert_eq!(c.shown_indices(), [2]);
         assert!(!c.step(Step::Next));
+    }
+
+    #[test]
+    fn opening_reads_how_each_frame_was_shot_for_field_search() {
+        let folder = Folder::with_raws("cull-exif", 3, &Arw::default());
+        for (i, iso) in [(1, 100), (2, 3200), (3, 6400)] {
+            Arw { iso, ..Arw::default() }.write(&folder.raw(i));
+        }
+        let (mut c, _) = Cull::open(&folder.0, Formats::All).unwrap();
+        let isos: Vec<_> = c.frames().iter().map(|f| f.exif.as_ref().and_then(|e| e.iso)).collect();
+        assert_eq!(isos, [Some(100), Some(3200), Some(6400)]);
+        c.set_query(Query::parse("iso:>=3200").unwrap());
+        assert_eq!((c.shown_indices(), c.current()), ([1, 2].to_vec(), 1), "the cursor left the frame the query left out");
+    }
+
+    #[test]
+    fn a_query_narrows_the_frames_with_the_filter_and_moves_the_cursor_like_it() {
+        let mut c = cull(&[0, PICK, 0, PICK]);
+        for (i, iso) in [100, 800, 3200, 6400].into_iter().enumerate() {
+            c.frames[i].exif = Some(Exif { iso: Some(iso), ..Exif::default() });
+        }
+        c.go_to(0);
+        c.set_query(Query::parse("iso:>=3200").unwrap());
+        assert_eq!((c.current(), c.shown_indices(), c.matching()), (2, [2, 3].to_vec(), 2), "next first");
+        // Both must let a frame through.
+        c.set_filter(Filter::AtLeast(PICK));
+        assert_eq!((c.current(), c.shown_indices(), c.matching()), (3, [3].to_vec(), 1));
+        c.set_filter(Filter::All);
+        c.set_query(Query::parse("iso:<=800").unwrap());
+        assert_eq!((c.current(), c.shown_indices()), (1, [0, 1].to_vec()), "else the one before");
+        // Nothing matches: the cursor stays, and only it is shown.
+        c.set_query(Query::parse("iso:>99999").unwrap());
+        assert_eq!((c.current(), c.shown_indices(), c.matching()), (1, [1].to_vec(), 0));
+        c.set_query(Query::default());
+        assert_eq!(c.shown_indices(), [0, 1, 2, 3]);
+        // A frame the cursor is on stays while a mark takes it out of the filter, as with the filter alone.
+        c.go_to(0);
+        c.set_query(Query::parse("rating:0").unwrap());
+        c.mark(PICK);
+        assert!(c.shown(0) && !c.matches(0));
+    }
+
+    #[test]
+    fn frames_are_unmeasured_until_their_signals_come_in() {
+        let mut c = cull(&[0; 3]);
+        c.set_query(Query::parse("iso:>0").unwrap());
+        assert_eq!(c.unmeasured(), 0, "iso is read when the folder opens");
+        c.set_query(Query::parse("focus:<12").unwrap());
+        assert_eq!(c.unmeasured(), 3);
+        c.set_signals(1, Signals { focus: Some(5.0), ..Signals::default() });
+        assert_eq!((c.unmeasured(), c.matching()), (2, 1));
+        c.go_to(0);
+        c.set_query(Query::parse("focus:<12").unwrap());
+        assert_eq!(c.current(), 1, "the cursor goes to the one that matches");
+    }
+
+    #[test]
+    fn a_query_can_ask_for_what_is_in_a_stack() {
+        let mut c = cull(&[0; 4]);
+        c.set_manual_stacks(vec![vec![1, 2]]);
+        c.set_stacking(Stacking::Manual);
+        c.set_query(Query::parse("stacked:yes").unwrap());
+        assert_eq!(c.matching(), 2);
+        c.set_query(Query::parse("stacked:no").unwrap());
+        assert_eq!(c.matching(), 2);
     }
 
     #[test]

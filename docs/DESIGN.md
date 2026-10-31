@@ -62,7 +62,8 @@ Decided in the 2026-10-04 scoping interview.
 - Deleting or moving rejects.
 - Colour labels, keywords, captions, IPTC.
 - A thumbnail grid as a primary view (the filmstrip takes multi-select).
-- A catalogue or search across shoots.
+- A catalogue or search across shoots. (Field search is within the open
+  folder only.)
 - Rendering raws with darktable's edit applied.
 - Any editing.
 
@@ -86,6 +87,40 @@ recent ones. The filmstrip's filters are Bridge's
 Ctrl+Alt keys: Ctrl+Alt+A all, Ctrl+Alt+0 undecided, Ctrl+Alt+1 picks and
 up, Ctrl+Alt+2 to 5 that many stars and up, and Ctrl+Alt+X rejects. A
 frame marked out of the filter stays on screen until the cursor leaves it.
+
+**Field search** (Ctrl+F, Lightroom's Find; Ctrl+Shift+F clears it) narrows
+the filmstrip further, over how each frame was shot and what was measured
+of it, where the keys above only know marks. It's a line of terms, all of
+which must match, opened in a box above the status bar: Enter reads it
+(and says under the box why, if a term can't be), Escape closes the box.
+The mark filter and the search are two things that both must let a frame
+through, so `Show: Picks and up` and `focus:<12` is the soft picks. What's
+searched is part of what "shown" means everywhere: the status bar's count,
+stepping, copies and what LightCraft is handed. It's remembered per
+folder, with the filter, and shown as a "Search:" chip in the status bar.
+
+| Term | Matches |
+|------|---------|
+| `rating:>=3`, `flag:reject`, `flag:undecided` | The mark (`flag:pick` is a star or more) |
+| `iso:>=3200`, `f:<=2.8`, `focal:85`, `shutter:<1/125` | The shooting settings, read when the folder opens. A shutter speed may be a fraction or seconds |
+| `focus:<12`, `eyes:<15` | How crisp it is at the focus point, and at the eyes (what Q shows) |
+| `open:<0.3`, `shut:yes` | How open the eyes are, and whether they look shut |
+| `blown:>5%`, `black:>30%` | How much is blown out, how much is black |
+| `faces:>=3` | How many faces were found |
+| `suggested:yes`, `stacked:no` | Whether a mark is suggested, whether it's in a stack |
+| `camera:7m3`, `lens:"fe 85"`, `name:dsc012` | Part of the model, lens or file name; a bare word looks in all three |
+
+Numbers compare with `>`, `>=`, `<`, `<=` or `=`. A frame that lacks the
+number a term compares (no ISO in a PNG, or not yet measured) doesn't match
+it, which is why `shut:no` is not the opposite of `shut:yes`: neither
+matches a frame whose eyes couldn't be told. The settings come from the raw
+as the folder opens; the measures arrive from the background pass that
+also finds faces, so a query on them fills in as it runs and the status bar
+says how many frames it's still waiting for. There are no `or`s and no
+`not`s: the comparisons are their own opposites. The tokenizer and the
+comparison syntax are LightCraft's catalogue search's (MIT or Apache-2.0);
+the fields are ours. The query isn't written to the decision log: its marks
+record the filter they were made under, as before.
 
 M2's inspection keys: Z zooms to 100% (tap to toggle, hold for a look
 that ends when it's let go), Shift+Z zooms to the focus point and follows
@@ -139,7 +174,7 @@ folder in darktable.
   sidecars. LightCraft is handed the pictures shown instead (below).
 - **Copies:** Ctrl+Shift+E (Lightroom's Export; "Copy what's shown…" in
   the summary) asks for a folder and copies there every picture the
-  filter lets through, each with its sidecar: 500 frames culled to ten and
+  filter and the search let through, each with its sidecar: 500 frames culled to ten and
   the picks shown is those ten, in a folder to hand on. Under Show: All
   it's the whole cull, so of a folder of raws and JPEGs, only the format
   being culled. Frames inside a closed stack count if the filter lets

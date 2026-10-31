@@ -272,6 +272,28 @@ Later:
   LightCraft is told by its name.
 - Copying the selection, and remembering where the last copies went.
 
+## Since: field search (built, to be tried on a real shoot)
+
+Borrowed from LightCraft's catalogue search (its query syntax, not its
+catalogue). In and tested headless; how it works is in DESIGN.md. Still to
+check by hand: the box in a real window (focus, Enter and Escape), how long
+the measures take to arrive on a big folder and whether the "not measured
+yet" count reads well, and which terms get used.
+
+- **Ctrl+F** opens a box over the status bar for a line of terms such as
+  `iso:>=3200 focus:<12 shut:yes`; Ctrl+Shift+F clears it. Settings, the
+  sharpness, eyes and clipping measures, faces, suggestions and stacks, and
+  the model, lens and name are all fields.
+- **ANDed with the mark filter**, and part of what's shown: stepping, the
+  status bar, copies and what LightCraft is handed. Remembered per folder.
+
+Later:
+
+- Saved searches, by name, for the ones used every shoot.
+- Terms for the capture time (`time:`), for a stretch of a shoot.
+- `or` and `not`, if the comparisons turn out not to be enough.
+- A stable shuffle as a sort, from LightCraft, if the filmstrip ever sorts.
+
 ## Not planned
 
 Ingest, deleting or moving rejects, colour labels, keywords and IPTC, a

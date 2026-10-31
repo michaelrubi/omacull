@@ -160,8 +160,10 @@ impl Faces {
         }
     }
 
-    /// Take in what's been found.
-    pub fn update(&mut self) {
+    /// Take in what's been found. Returns what was measured of which
+    /// frames since the last call.
+    pub fn update(&mut self) -> Vec<(usize, Signals)> {
+        let mut measured = Vec::new();
         for found in self.results.try_iter() {
             match found {
                 Found::Looked(index, faces, signals) => {
@@ -171,11 +173,13 @@ impl Faces {
                     }
                     if let Some(signals) = signals {
                         self.measured.insert(index, signals);
+                        measured.push((index, signals));
                     }
                 }
                 Found::Unavailable(why) => self.unavailable = Some(why),
             }
         }
+        measured
     }
 
     /// Look at these frames next, in this order, leaving out what's done.

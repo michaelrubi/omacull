@@ -20,6 +20,9 @@ pub struct Place {
     pub frame: String,
     #[serde(default)]
     pub filter: Filter,
+    /// What field search was narrowed to, as it was typed; empty for none.
+    #[serde(default)]
+    pub query: String,
     /// The stacks made by hand, each as its raws' names.
     #[serde(default)]
     pub stacks: Vec<Vec<String>>,
@@ -204,7 +207,7 @@ mod tests {
         // Where each folder was left, and the filter it had.
         let mut state = loaded;
         let place = |dir: &Path, frame: &str, filter| {
-            Place { dir: dir.to_path_buf(), frame: frame.into(), filter, stacks: vec![] }
+            Place { dir: dir.to_path_buf(), frame: frame.into(), filter, query: String::new(), stacks: vec![] }
         };
         state.remember(place(&a, "DSC00012.ARW", Filter::AtLeast(3)));
         state.remember(place(&b, "DSC00002.ARW", Filter::All));
