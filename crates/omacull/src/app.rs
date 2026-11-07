@@ -1008,8 +1008,9 @@ impl App {
             self.run(command, &ctx);
         }
         match clicked {
-            Some(Some(dir)) => self.open(dir, &ctx),
-            Some(None) => self.run(Command::Open, &ctx),
+            Some(Welcome::Recent(dir)) => self.open(dir, &ctx),
+            Some(Welcome::Forget(dir)) => self.state.remove_recent(&dir),
+            Some(Welcome::Open) => self.run(Command::Open, &ctx),
             None => {}
         }
     }
@@ -1220,9 +1221,8 @@ impl App {
         command
     }
 
-    /// The title, Open… and the recent folders. Returns what was clicked: a
-    /// recent folder, or None for Open….
-    fn empty_state(&self, ui: &mut Ui) -> Option<Option<PathBuf>> {
+    /// The title, Open… and the recent folders. Returns what was clicked.
+    fn empty_state(&self, ui: &mut Ui) -> Option<Welcome> {
         let mut clicked = None;
         ui.vertical_centered(|ui| {
             let space = if self.state.recent.is_empty() { 0.4 } else { 0.18 };
@@ -1235,7 +1235,7 @@ impl App {
             ui.label(RichText::new(tree).color(self.theme.dark_foreground));
             ui.add_space(12.0);
             if ui.button("Open…").clicked() {
-                clicked = Some(None);
+                clicked = Some(Welcome::Open);
             }
             if self.state.recent.is_empty() {
                 return;
@@ -1252,7 +1252,11 @@ impl App {
                     for dir in self.state.recent.iter().take(8) {
                         let size = vec2(ui.available_width(), 26.0);
                         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-                        if response.hovered() {
+                        // An x at the right end, to take the folder off the list.
+                        let x_rect = egui::Rect::from_center_size(pos2(rect.right() - 13.0, rect.center().y), vec2(20.0, 20.0));
+                        let x = ui.interact(x_rect, response.id.with("forget"), Sense::click());
+                        let x = x.on_hover_text("Take it off the list");
+                        if response.hovered() || x.hovered() {
                             ui.painter().rect_filled(rect, 0.0, self.theme.lighter_background);
                         }
                         let painter = ui.painter();
@@ -1260,12 +1264,17 @@ impl App {
                         let (name, foreground) = (file_name(dir), self.theme.foreground);
                         let name = painter.text(left, Align2::LEFT_CENTER, name, big.clone(), foreground);
                         // The folder it's in, shortened from the left to fit.
-                        let room = rect.right() - 6.0 - (name.right() + 24.0);
+                        let right = x_rect.left() - 4.0;
+                        let room = right - (name.right() + 24.0);
                         let parent = elided(painter, &home_relative(dir.parent().unwrap_or(dir)), &small, room);
-                        let right = pos2(rect.right() - 6.0, rect.center().y);
-                        painter.text(right, Align2::RIGHT_CENTER, parent, small.clone(), self.theme.dark_foreground);
-                        if response.clicked() {
-                            clicked = Some(Some(dir.clone()));
+                        let at = pos2(right, rect.center().y);
+                        painter.text(at, Align2::RIGHT_CENTER, parent, small.clone(), self.theme.dark_foreground);
+                        let x_colour = if x.hovered() { self.theme.foreground } else { self.theme.dark_foreground };
+                        painter.text(x_rect.center(), Align2::CENTER_CENTER, "×", big.clone(), x_colour);
+                        if x.clicked() {
+                            clicked = Some(Welcome::Forget(dir.clone()));
+                        } else if response.clicked() {
+                            clicked = Some(Welcome::Recent(dir.clone()));
                         }
                     }
                 });
@@ -1336,6 +1345,14 @@ fn home_relative(path: &Path) -> String {
 }
 
 /// `text` without as much of its start as it takes to fit `width`.
+/// What was clicked with no folder open.
+enum Welcome {
+    Open,
+    Recent(PathBuf),
+    /// The x on a recent folder: it's taken off the list.
+    Forget(PathBuf),
+}
+
 fn elided(painter: &egui::Painter, text: &str, font: &FontId, width: f32) -> String {
     let fits = |t: &str| painter.layout_no_wrap(t.to_owned(), font.clone(), egui::Color32::WHITE).size().x <= width;
     if fits(text) {
@@ -1832,6 +1849,16 @@ mod tests {
         h.wait("the empty folder", |app| app.opening.is_none());
         assert!(h.app.message.as_ref().is_some_and(|(m, problem)| *problem && m.contains("no raws")));
         assert_eq!(h.cull().frames().len(), 4, "the open folder stays");
+    }
+
+    #[test]
+    fn the_x_on_a_recent_folder_takes_it_off_the_list() {
+        let (a, b) = (Folder::new("app-recent-a"), Folder::new("app-recent-b"));
+        let mut h = Harness::new(&[]);
+        h.app.state.recent = vec![a.0.clone(), b.0.clone()];
+        h.click_text("×");
+        assert_eq!(h.app.state.recent, std::slice::from_ref(&b.0), "the first one's x");
+        assert!(h.app.shoot.is_none() && h.app.opening.is_none(), "and nothing is opened");
     }
 
     #[test]
