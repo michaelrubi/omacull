@@ -38,6 +38,10 @@ pub struct Paths {
     pub log: Option<PathBuf>,
     /// The program that opens a folder in darktable.
     pub darktable: String,
+    /// Where the raw developer chosen in the menus is saved.
+    pub config: Option<PathBuf>,
+    /// The program that opens a folder in the file browser.
+    pub files: String,
     /// The faces found in each raw.
     pub faces: Option<PathBuf>,
     /// What was measured of each raw.
@@ -185,6 +189,8 @@ impl App {
             model: log.as_ref().map(|log| log.with_file_name("model.json")),
             log,
             darktable: config.developer.clone(),
+            config: crate::config::path(),
+            files: "xdg-open".into(),
             faces: omacull_engine::faces::default_dir(),
             signals: signals::default_dir(),
         };
@@ -344,7 +350,7 @@ impl App {
     fn darktable(&mut self) {
         let Some(shoot) = &self.shoot else { return };
         let dir = shoot.cull.dir().to_path_buf();
-        let (given, what) = if self.developer() == "lightcraft" {
+        let (given, what) = if file_name(Path::new(&self.paths.darktable)) == "lightcraft" {
             let shown = self.shown();
             if shown.is_empty() {
                 return self.message = Some(("Nothing is shown to open".into(), false));
@@ -355,26 +361,36 @@ impl App {
             (vec![dir.clone()], file_name(&dir))
         };
         self.disk.flush();
-        let started = std::process::Command::new(&self.paths.darktable)
-            .args(&given)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        self.message = Some(match started {
-            Ok(mut child) => {
-                // Reaped when it's closed.
-                std::thread::spawn(move || child.wait());
-                (format!("Opened {what} in {}", self.developer()), false)
-            }
+        self.message = Some(match start(&self.paths.darktable, &given) {
+            Ok(()) => (format!("Opened {what} in {}", self.developer()), false),
             Err(e) => (format!("Couldn't start {}: {e}", self.paths.darktable), true),
+        });
+    }
+
+    /// Hand Ctrl+E to `program` from now on, and save it in the config.
+    fn set_developer(&mut self, program: &str) {
+        self.paths.darktable = program.to_owned();
+        self.config.developer = program.to_owned();
+        let name = crate::config::developer_name(program);
+        let saved = self.paths.config.as_deref().map_or(Ok(()), |path| crate::config::save_developer(path, program));
+        self.message = Some(match saved {
+            Ok(()) => (format!("Raw developer: {name}"), false),
+            Err(e) => (format!("Raw developer: {name}, until Omacull closes: couldn't save config.toml: {e}"), true),
+        });
+    }
+
+    /// Show a folder in the file browser.
+    fn reveal(&mut self, dir: &Path) {
+        self.message = Some(match start(&self.paths.files, &[dir.to_path_buf()]) {
+            Ok(()) => (format!("Opened {} in the file browser", file_name(dir)), false),
+            Err(e) => (format!("Couldn't start {}: {e}", self.paths.files), true),
         });
     }
 
     /// The raw developer's name: darktable, unless the config says
     /// otherwise.
     fn developer(&self) -> String {
-        file_name(Path::new(&self.paths.darktable))
+        crate::config::developer_name(&self.paths.darktable)
     }
 
     /// Open a folder of pictures in the background, or the folder a
@@ -982,8 +998,10 @@ impl App {
                 .exact_size(tree::WIDTH)
                 .show(ui, |ui| tree.ui(ui, &theme, open.as_deref()))
                 .inner;
-            if let Some(dir) = clicked {
-                self.open(dir, &ctx);
+            match clicked {
+                Some(tree::Clicked::Open(dir)) => self.open(dir, &ctx),
+                Some(tree::Clicked::Reveal(dir)) => self.reveal(&dir),
+                None => {}
             }
         }
         if self.summary
@@ -1002,10 +1020,17 @@ impl App {
         let mode = self.shoot.as_ref().map_or(Mode::Loupe, |s| s.mode);
         let mut chosen = None;
         for response in panes.iter().chain(&strip) {
-            response.context_menu(|ui| chosen = chosen.or(context_menu(ui, mode)));
+            response.context_menu(|ui| chosen = chosen.or(context_menu(ui, mode, &self.paths.darktable)));
         }
-        if let Some(command) = chosen {
-            self.run(command, &ctx);
+        match chosen {
+            Some(Chosen::Command(command)) => self.run(command, &ctx),
+            Some(Chosen::Developer(program)) => self.set_developer(program),
+            Some(Chosen::Reveal) => {
+                if let Some(dir) = self.shoot.as_ref().map(|s| s.cull.dir().to_path_buf()) {
+                    self.reveal(&dir);
+                }
+            }
+            None => {}
         }
         match clicked {
             Some(Welcome::Recent(dir)) => self.open(dir, &ctx),
@@ -1168,6 +1193,7 @@ impl App {
         let counts = shoot.cull.counts();
         let total = shoot.cull.frames().len();
         let mut command = None;
+        let mut developer = None;
         let mut open = true;
         egui::Window::new("Cull summary")
             .open(&mut open)
@@ -1206,6 +1232,12 @@ impl App {
                         command = Some(Command::Export);
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Raw developer").color(self.theme.dark_foreground));
+                    egui::ComboBox::from_id_salt("developer")
+                        .selected_text(self.developer())
+                        .show_ui(ui, |ui| developer = developer_menu(ui, &self.paths.darktable));
+                });
                 ui.add_space(8.0);
                 for line in self.learned() {
                     ui.label(RichText::new(line).color(self.theme.dark_foreground));
@@ -1217,6 +1249,9 @@ impl App {
             });
         if !open {
             self.summary = false;
+        }
+        if let Some(program) = developer {
+            self.set_developer(program);
         }
         command
     }
@@ -1331,6 +1366,19 @@ fn pictures(n: usize) -> String {
     if n == 1 { "1 picture".to_owned() } else { format!("{n} pictures") }
 }
 
+/// Start `program` with `args`, on its own.
+fn start(program: &str, args: &[PathBuf]) -> io::Result<()> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    // Reaped when it's closed.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned()
 }
@@ -1370,14 +1418,38 @@ fn shortcut(command: Command) -> String {
     hotkeys::current().command(command).map_or_else(|| "No shortcut".into(), |s| format_shortcut(&s))
 }
 
+/// What's chosen from a right-click on a frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Chosen {
+    Command(Command),
+    /// The raw developer to hand the cull to from now on.
+    Developer(&'static str),
+    /// The open folder, to show in the file browser.
+    Reveal,
+}
+
+/// The raw developers to choose from, `current` ticked. Returns the one
+/// clicked.
+fn developer_menu(ui: &mut Ui, current: &str) -> Option<&'static str> {
+    let mut chosen = None;
+    for &(program, name) in crate::config::DEVELOPERS {
+        if ui.radio(current == program, name).clicked() {
+            chosen = Some(program);
+            ui.close();
+        }
+    }
+    chosen
+}
+
 /// What a right-click on a frame offers, each with its shortcut, for the
-/// keys not yet learnt. Returns the command chosen.
-fn context_menu(ui: &mut Ui, mode: Mode) -> Option<Command> {
+/// keys not yet learnt, and the raw developer to use. Returns what was
+/// chosen.
+fn context_menu(ui: &mut Ui, mode: Mode, developer: &str) -> Option<Chosen> {
     let mut chosen = None;
     let mut item = |ui: &mut Ui, command: Command| {
         let keys = hotkeys::current().command(command).map(|s| format_shortcut(&s)).unwrap_or_default();
         if ui.add(egui::Button::new(command.label()).shortcut_text(keys)).clicked() {
-            chosen = Some(command);
+            chosen = Some(Chosen::Command(command));
         }
     };
     for command in [Command::Pick, Command::Reject, Command::Unmark] {
@@ -1424,14 +1496,20 @@ fn context_menu(ui: &mut Ui, mode: Mode) -> Option<Command> {
         }
     });
     ui.separator();
-    for command in [Command::Export, Command::Darktable, Command::Summary, Command::Folders] {
+    for command in [Command::Export, Command::Darktable] {
         item(ui, command);
     }
+    let mut developer_chosen = None;
+    ui.menu_button("Raw Developer", |ui| developer_chosen = developer_menu(ui, developer));
+    for command in [Command::Summary, Command::Folders] {
+        item(ui, command);
+    }
+    let reveal = ui.button("Open the Folder in the File Browser").clicked();
     ui.separator();
     for command in [Command::Undo, Command::Redo] {
         item(ui, command);
     }
-    chosen
+    chosen.or(developer_chosen.map(Chosen::Developer)).or(reveal.then_some(Chosen::Reveal))
 }
 
 /// The current frame, its place in the folder, and the cull so far.
@@ -2293,7 +2371,16 @@ mod tests {
     }
 
     fn quiet() -> Paths {
-        Paths { cache: None, log: None, darktable: "darktable".into(), faces: None, signals: None, model: None }
+        Paths {
+            cache: None,
+            log: None,
+            darktable: "darktable".into(),
+            config: None,
+            files: "xdg-open".into(),
+            faces: None,
+            signals: None,
+            model: None,
+        }
     }
 
     #[test]
@@ -2422,6 +2509,77 @@ mod tests {
     }
 
     #[test]
+    fn the_raw_developer_is_chosen_from_the_menus_and_saved() {
+        let folder = Folder::with_raws("app-developer", 2, &Arw::default());
+        let config = folder.0.join("config.toml");
+        std::fs::write(&config, "pick = 3\ndeveloper = \"lightcraft\"\n").unwrap();
+        let mut h = Harness::open(&folder, Paths { darktable: "lightcraft".into(), config: Some(config.clone()), ..quiet() });
+        let centre = h.shoot().view().area.center();
+        h.right_click(centre);
+        h.click_text("Raw Developer");
+        h.click_text("OmaLux");
+        assert_eq!(h.app.paths.darktable, "omalux");
+        assert_eq!(h.app.message.clone().unwrap(), ("Raw developer: OmaLux".to_owned(), false));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "pick = 3\ndeveloper = \"omalux\"\n");
+
+        // And from the cull summary, where it's handed over.
+        // (Only its picker: "Open in OmaLux" would start the real one.)
+        h.press(NONE, Key::M);
+        h.click_text("OmaLux");
+        h.click_text("darktable");
+        assert_eq!(h.app.paths.darktable, "darktable");
+        assert_eq!(crate::config::Config::parse(&std::fs::read_to_string(&config).unwrap()).0.developer, "darktable");
+    }
+
+    #[test]
+    fn folders_are_opened_in_the_file_browser() {
+        let root = Folder::new("app-reveal");
+        let shoot = root.0.join("shoot");
+        std::fs::create_dir_all(&shoot).unwrap();
+        Arw::default().write(&shoot.join("DSC00001.ARW"));
+        // A stand-in for the file browser that says what it was given.
+        let script = root.0.join("files.sh");
+        let said = root.0.join("said");
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s' \"$1\" > '{0}.part' && mv '{0}.part' '{0}'\n", said.display()))
+            .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let mut h = Harness::with(Paths { files: script.display().to_string(), ..quiet() }, &[]);
+        h.app.open(shoot.clone(), &h.ctx.clone());
+        h.wait("the folder", |app| app.shoot.is_some());
+        let given = |h: &mut Harness| {
+            let started = Instant::now();
+            while !said.exists() {
+                assert!(started.elapsed() < Duration::from_secs(10), "the file browser wasn't started");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let given = std::fs::read_to_string(&said).unwrap();
+            std::fs::remove_file(&said).unwrap();
+            assert_eq!(h.app.message.clone().unwrap(), ("Opened shoot in the file browser".to_owned(), false));
+            PathBuf::from(given)
+        };
+        let dir = std::fs::canonicalize(&shoot).unwrap();
+
+        // The open folder, from a frame's menu.
+        let centre = h.shoot().view().area.center();
+        h.right_click(centre);
+        h.click_text("Open the Folder in the File Browser");
+        assert_eq!(given(&mut h), dir);
+
+        // Any folder in the tree, from its own, without opening it.
+        h.press(NONE, Key::T);
+        h.wait("the tree", |app| app.tree.as_ref().is_some_and(|t| !t.reading() && !t.rows.is_empty()));
+        let (_, row) = h.app.tree.as_ref().unwrap().rows.iter().find(|(p, _)| p.ends_with("shoot")).unwrap().clone();
+        h.right_click(row.center());
+        h.click_text("Open in the File Browser");
+        assert_eq!(given(&mut h), dir);
+
+        h.app.paths.files = "/nowhere/xdg-open".into();
+        h.right_click(centre);
+        h.click_text("Open the Folder in the File Browser");
+        assert!(h.app.message.as_ref().is_some_and(|(m, problem)| *problem && m.contains("Couldn't start")));
+    }
+
+    #[test]
     fn lightcraft_is_handed_only_whats_shown() {
         let folder = Folder::with_raws("app-lightcraft", 3, &Arw::default());
         // A stand-in for LightCraft, in a folder it would take in whole,
@@ -2453,7 +2611,7 @@ mod tests {
         // The picks and up, and their marks are in their sidecars by then.
         h.press(CMD_ALT, Key::Num1);
         assert_eq!(given(&mut h), [raw(1), raw(3)]);
-        assert_eq!(h.app.message.clone().unwrap(), ("Opened 2 pictures in lightcraft".to_owned(), false));
+        assert_eq!(h.app.message.clone().unwrap(), ("Opened 2 pictures in LightCraft".to_owned(), false));
         assert_eq!(sidecar::read(&raw(3)).unwrap(), Some(4));
         // Everything is the pictures culled, not the folder and what's
         // under it.

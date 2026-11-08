@@ -166,9 +166,12 @@ folder in darktable.
   one (↑ goes higher), opened out to it, each folder with how many raws
   it holds. Folders are read in the background as they're opened out,
   and again each time the tree is shown. A click opens a folder; on the
-  arrow, or on a folder with no raws, it opens out instead.
+  arrow, or on a folder with no raws, it opens out instead. A right-click
+  opens it in the file browser (`xdg-open`), as a frame's right-click
+  does the open folder.
 - **Cull summary:** picks and up, each star, rejects and undecided, with
-  their share, and buttons for the first undecided frame and darktable.
+  their share, and buttons for the first undecided frame and darktable,
+  with the raw developer to use beside it.
 - **darktable:** every mark still queued is written first, then
   `darktable <folder>` is started, which imports the folder and reads the
   sidecars. LightCraft is handed the pictures shown instead (below).
@@ -374,7 +377,7 @@ darktable. There are three settings and one for suggestions:
 |---------|---------|---|
 | `pick` | `1` | The stars a pick (P, and a winner) is written as. |
 | `sidecar` | `"darktable"` | `"adobe"` names sidecars `DSC01234.xmp`, as Lightroom, Bridge, Capture One and most others read them. |
-| `developer` | `"darktable"` | The program Ctrl+E hands the folder to; `"lightcraft"` is handed the pictures shown. |
+| `developer` | `"darktable"` | The program Ctrl+E hands the folder to; `"lightcraft"` is handed the pictures shown. OmaLux, darktable and LightCraft can be chosen from the Raw Developer menu (a frame's right-click) or the cull summary, which write it here. |
 | `confidence` | `0.8` | How sure the model has to be to suggest a mark. |
 
 A reject is always a rating of -1, as Bridge writes it too. A JPEG's

@@ -149,6 +149,10 @@ sidecar = "adobe"          # DSC01234.xmp, as Lightroom and Capture One name it
 developer = "rawtherapee"  # the program Ctrl+E hands the folder to
 ```
 
+OmaLux, darktable and LightCraft can also be chosen from Raw Developer in
+a frame's right-click menu, or in the cull summary (M); the choice is
+saved to `config.toml`.
+
 For [LightCraft](https://github.com/storytold/lightcraft), `sidecar =
 "adobe"` and `developer = "lightcraft"`: it reads the stars as stars and
 a reject as its reject flag (checked against 0.4.0). Ctrl+E hands it only

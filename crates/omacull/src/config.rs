@@ -9,6 +9,8 @@
 //! confidence = 0.9
 //! ```
 
+use std::path::{Path, PathBuf};
+
 use omacull_engine::cull::{PICK, Rating};
 use omacull_engine::sidecar::Naming;
 use serde::Deserialize;
@@ -31,6 +33,47 @@ impl Default for Config {
     fn default() -> Self {
         Self { pick: PICK, sidecar: Naming::Darktable, developer: "darktable".into(), confidence: 0.8 }
     }
+}
+
+/// The raw developers offered in the menus: the program, and its name.
+pub const DEVELOPERS: &[(&str, &str)] = &[("omalux", "OmaLux"), ("darktable", "darktable"), ("lightcraft", "LightCraft")];
+
+/// A developer's name: its own for those offered, else the program's.
+pub fn developer_name(program: &str) -> String {
+    let file = Path::new(program).file_name().map_or(program.into(), |n| n.to_string_lossy().into_owned());
+    DEVELOPERS.iter().find(|(p, _)| *p == file).map_or(file, |(_, name)| (*name).to_owned())
+}
+
+/// Where `config.toml` is.
+pub fn path() -> Option<PathBuf> {
+    crate::hotkeys::config_dir().map(|dir| dir.join("config.toml"))
+}
+
+/// Write `developer = "program"` into the config at `path`, leaving every
+/// other line as it was.
+pub fn save_developer(path: &Path, program: &str) -> std::io::Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => TEMPLATE.to_owned(),
+        Err(e) => return Err(e),
+    };
+    path.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+    std::fs::write(path, with_developer(&text, program))
+}
+
+/// `text` with its `developer` line set to `program`: the one set, else the
+/// one commented out, else a new one at the end.
+fn with_developer(text: &str, program: &str) -> String {
+    let line = format!("developer = {}", toml::Value::String(program.to_owned()));
+    let is_setting = |l: &str| l.strip_prefix("developer").is_some_and(|rest| rest.trim_start().starts_with('='));
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let set = lines.iter().position(|l| is_setting(l.trim()));
+    let commented = || lines.iter().position(|l| l.trim().strip_prefix('#').is_some_and(|l| is_setting(l.trim())));
+    match set.or_else(commented) {
+        Some(i) => lines[i] = line,
+        None => lines.push(line),
+    }
+    lines.iter().map(|l| format!("{l}\n")).collect()
 }
 
 impl Config {
@@ -61,7 +104,7 @@ impl Config {
     /// every setting, commented out, if there's none. Returns warnings
     /// about problems in it.
     pub fn load() -> (Self, Vec<String>) {
-        let Some(path) = crate::hotkeys::config_dir().map(|dir| dir.join("config.toml")) else {
+        let Some(path) = path() else {
             return (Self::default(), Vec::new());
         };
         match std::fs::read_to_string(&path) {
@@ -96,8 +139,9 @@ const TEMPLATE: &str = "\
 # and LightCraft writes.
 # sidecar = \"darktable\"
 #
-# The program the folder is handed to (Ctrl+E), as `program folder`.
-# \"lightcraft\" is handed the pictures shown instead, not the folder.
+# The program the folder is handed to (Ctrl+E), as `program folder`, such
+# as \"omalux\". \"lightcraft\" is handed the pictures shown instead, not the
+# folder. The Raw Developer menu (right-click a frame) sets it here too.
 # developer = \"darktable\"
 
 # How sure the model trained on your decisions has to be before it suggests
@@ -135,5 +179,24 @@ mod tests {
         let (config, warnings) = Config::parse("picks = 3\n");
         assert_eq!(config, Config::default());
         assert!(warnings[0].contains("failed to parse"), "{warnings:?}");
+    }
+
+    #[test]
+    fn the_developer_is_written_in_place_and_nothing_else_changes() {
+        let developer = |text: &str| Config::parse(text).0.developer;
+        // The template's commented-out line, set.
+        let set = with_developer(TEMPLATE, "omalux");
+        assert_eq!(developer(&set), "omalux");
+        assert_eq!(set.lines().count(), TEMPLATE.lines().count());
+        assert_eq!(set.lines().filter(|l| l.contains("developer =")).count(), 1, "{set}");
+        // One already set is changed, and the comments about it aren't.
+        let text = "pick = 3\n# developer = \"darktable\"\ndeveloper = \"lightcraft\"\nconfidence = 0.9\n";
+        let set = with_developer(text, "omalux");
+        assert_eq!(set, "pick = 3\n# developer = \"darktable\"\ndeveloper = \"omalux\"\nconfidence = 0.9\n");
+        // None at all: one at the end.
+        assert_eq!(with_developer("pick = 3", "omalux"), "pick = 3\ndeveloper = \"omalux\"\n");
+        assert_eq!(developer_name("omalux"), "OmaLux");
+        assert_eq!(developer_name("/usr/bin/lightcraft"), "LightCraft");
+        assert_eq!(developer_name("/opt/rt/rawtherapee"), "rawtherapee");
     }
 }
