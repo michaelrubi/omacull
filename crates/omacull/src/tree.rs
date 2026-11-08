@@ -21,6 +21,15 @@ enum Listing {
     Failed(String),
 }
 
+/// What was done to a folder in the tree.
+#[derive(Debug, PartialEq)]
+pub enum Clicked {
+    /// Clicked, to open.
+    Open(PathBuf),
+    /// Chosen from its right-click menu, to show in the file browser.
+    Reveal(PathBuf),
+}
+
 pub struct Tree {
     /// The folder at the top; ↑ goes to the one above.
     pub root: PathBuf,
@@ -95,8 +104,9 @@ impl Tree {
         self.listings.values().any(|l| matches!(l, Listing::Reading))
     }
 
-    /// The tree, with `open` marked. Returns the folder clicked, to open.
-    pub fn ui(&mut self, ui: &mut Ui, theme: &Theme, open: Option<&Path>) -> Option<PathBuf> {
+    /// The tree, with `open` marked. Returns the folder clicked, and what
+    /// for.
+    pub fn ui(&mut self, ui: &mut Ui, theme: &Theme, open: Option<&Path>) -> Option<Clicked> {
         for (dir, listed) in self.rx.try_iter() {
             let listing = match listed {
                 Ok(folders) => Listing::Read(folders),
@@ -131,7 +141,7 @@ impl Tree {
         depth: usize,
         theme: &Theme,
         open: Option<&Path>,
-        clicked: &mut Option<PathBuf>,
+        clicked: &mut Option<Clicked>,
     ) {
         let folders = match self.listing(dir) {
             Listing::Reading => {
@@ -181,9 +191,14 @@ impl Tree {
                         self.expanded.insert(folder.path.clone());
                     }
                 } else {
-                    *clicked = Some(folder.path.clone());
+                    *clicked = Some(Clicked::Open(folder.path.clone()));
                 }
             }
+            response.context_menu(|ui| {
+                if ui.button("Open in the File Browser").clicked() {
+                    *clicked = Some(Clicked::Reveal(folder.path.clone()));
+                }
+            });
             if folder.nested && self.expanded.contains(&folder.path) {
                 self.folder(ui, &folder.path, depth + 1, theme, open, clicked);
             }

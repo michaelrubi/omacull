@@ -21,8 +21,8 @@ It is an independent project, not part of Omarchy.
    zooming and switching views are single keys. Rebindable in
    `~/.config/omacull/hotkeys.toml`.
 4. **The files are the database.** Marks live in XMP sidecars beside the
-   raws. No catalogue, no import step. Raws are never moved, renamed,
-   modified or deleted.
+   raws. No catalogue, no import step. Raws are never moved, renamed or
+   modified, and deleted only by Delete Rejects, when the user says yes.
 5. **Omarchy-native.** Wayland, colours from the active Omarchy theme and
    following theme switches live, behaves well as a Hyprland tile.
 6. **Opinionated, not configurable.** Same as Omapix: good defaults over
@@ -59,7 +59,7 @@ Decided in the 2026-10-04 scoping interview.
 ### Out
 
 - Ingest from cards, renaming, backup copies.
-- Deleting or moving rejects.
+- Moving rejects. (Deleting them is in: see Delete Rejects.)
 - Colour labels, keywords, captions, IPTC.
 - A thumbnail grid as a primary view (the filmstrip takes multi-select).
 - A catalogue or search across shoots. (Field search is within the open
@@ -166,9 +166,12 @@ folder in darktable.
   one (↑ goes higher), opened out to it, each folder with how many raws
   it holds. Folders are read in the background as they're opened out,
   and again each time the tree is shown. A click opens a folder; on the
-  arrow, or on a folder with no raws, it opens out instead.
+  arrow, or on a folder with no raws, it opens out instead. A right-click
+  opens it in the file browser (`xdg-open`), as a frame's right-click
+  does the open folder.
 - **Cull summary:** picks and up, each star, rejects and undecided, with
-  their share, and buttons for the first undecided frame and darktable.
+  their share, and buttons for the first undecided frame and darktable,
+  with the raw developer to use beside it.
 - **darktable:** every mark still queued is written first, then
   `darktable <folder>` is started, which imports the folder and reads the
   sidecars. LightCraft is handed the pictures shown instead (below).
@@ -190,6 +193,16 @@ folder in darktable.
   short isn't taken for a whole one, and keeps its date. Where the
   filesystem can share the data (btrfs, as Omarchy's is) the copies take
   no room until they're changed.
+- **Delete Rejects:** Ctrl+Backspace (Lightroom's Delete Rejected Photos;
+  also in a frame's right-click menu and the summary) asks "Are you sure
+  you want to delete 12 photos? They will be permanently removed from the
+  disk", and on Delete deletes every reject in the cull, shown or not,
+  with its sidecars named either way (`omacull_engine::delete`). Only
+  what's culled: under the format switch's RAW, the JPEG beside a
+  rejected raw stays. Gone for good, not to the trash. Every mark still
+  queued is written first, then the folder is read again (closed if
+  nothing is left in it). While it asks, keys do nothing but Escape,
+  which cancels; deleting takes a click.
 - **Places:** each folder's frame (by name) and filter are remembered in
   `state.toml` when another folder is opened and when Omacull closes, for
   the 200 most recent folders, and come back when it's opened again
@@ -374,7 +387,7 @@ darktable. There are three settings and one for suggestions:
 |---------|---------|---|
 | `pick` | `1` | The stars a pick (P, and a winner) is written as. |
 | `sidecar` | `"darktable"` | `"adobe"` names sidecars `DSC01234.xmp`, as Lightroom, Bridge, Capture One and most others read them. |
-| `developer` | `"darktable"` | The program Ctrl+E hands the folder to; `"lightcraft"` is handed the pictures shown. |
+| `developer` | `"darktable"` | The program Ctrl+E hands the folder to; `"lightcraft"` is handed the pictures shown. OmaLux, darktable and LightCraft can be chosen from the Raw Developer menu (a frame's right-click) or the cull summary, which write it here. |
 | `confidence` | `0.8` | How sure the model has to be to suggest a mark. |
 
 A reject is always a rating of -1, as Bridge writes it too. A JPEG's

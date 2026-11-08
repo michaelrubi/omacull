@@ -28,7 +28,8 @@ it, [say how it went](CONTRIBUTING.md).
 - **Marks the way Bridge and Lightroom do:** P picks, X rejects, U
   unmarks, 1 to 5 are stars, Ctrl+Z undoes. Marks go straight into XMP
   sidecars darktable reads, leaving any edit already in them byte for byte
-  as it was. Raws are never moved, changed or deleted.
+  as it was. Raws are never moved or changed, and deleted only when you
+  ask (below).
 - **Inspection:** Z for 100% (hold it for a look), on a real development
   of the raw. H histogram, J clipping, S focus peaking, F the camera's
   focus point, Shift+Z to zoom to it, I the shooting settings.
@@ -55,6 +56,9 @@ it, [say how it went](CONTRIBUTING.md).
 - **The keepers on their own:** Ctrl+Shift+E copies what's shown (the
   picks, say, of a folder of 500) to another folder, each with its
   sidecar. Nothing is moved, and nothing already there is replaced.
+- **Rid of the rejects:** Ctrl+Backspace (or Delete rejects… in the
+  summary) deletes every reject in the cull, with its sidecar, once you've
+  said yes. They're gone for good, not to the trash.
 
 ![Surveying a stack: the signals under each frame, and which one they favour](docs/screenshots/survey.jpg)
 
@@ -148,6 +152,10 @@ pick = 3                   # the stars a pick is written as
 sidecar = "adobe"          # DSC01234.xmp, as Lightroom and Capture One name it
 developer = "rawtherapee"  # the program Ctrl+E hands the folder to
 ```
+
+OmaLux, darktable and LightCraft can also be chosen from Raw Developer in
+a frame's right-click menu, or in the cull summary (M); the choice is
+saved to `config.toml`.
 
 For [LightCraft](https://github.com/storytold/lightcraft), `sidecar =
 "adobe"` and `developer = "lightcraft"`: it reads the stars as stars and

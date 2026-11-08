@@ -2,6 +2,7 @@
 
 pub mod color;
 pub mod cull;
+pub mod delete;
 pub mod develop;
 pub mod disk;
 pub mod export;
