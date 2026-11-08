@@ -56,6 +56,7 @@ pub enum Command {
     FirstUndecided,
     Darktable,
     Export,
+    DeleteRejects,
     Eyes,
     FaceStrip,
     StackSelection,
@@ -133,6 +134,7 @@ impl Command {
         Command::FirstUndecided,
         Command::Darktable,
         Command::Export,
+        Command::DeleteRejects,
         Command::Eyes,
         Command::FaceStrip,
         Command::StackSelection,
@@ -179,6 +181,7 @@ impl Command {
         Command::Export,
         Command::ClearSearch,
         Command::Darktable,
+        Command::DeleteRejects,
         Command::Search,
         Command::FaceStrip,
         Command::StackSelection,
@@ -274,6 +277,7 @@ impl Command {
             Command::FirstUndecided => "First Undecided Frame",
             Command::Darktable => "Open in the Raw Developer",
             Command::Export => "Copy What's Shown to a Folder…",
+            Command::DeleteRejects => "Delete Rejects from the Disk…",
             Command::Eyes => "Zoom to the Eyes (Again: the Next Face)",
             Command::FaceStrip => "Face Close-Ups",
             Command::StackSelection => "Stack the Selection",
@@ -347,6 +351,8 @@ impl Command {
             // Lightroom's Edit In, and its Export.
             Command::Darktable => s(CMD, Key::E),
             Command::Export => s(CMD_SHIFT, Key::E),
+            // Lightroom's Delete Rejected Photos.
+            Command::DeleteRejects => s(CMD, Key::Backspace),
             Command::Eyes => s(Modifiers::NONE, Key::E),
             Command::FaceStrip => s(Modifiers::SHIFT, Key::E),
             // Lightroom's Ctrl+G groups into a stack, and G-ish opens it.

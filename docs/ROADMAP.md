@@ -255,6 +255,9 @@ window. How both work is in DESIGN.md.
 - **Copy what's shown** (Ctrl+Shift+E, and in the summary): every picture
   the filter lets through goes to a folder that's asked for, with its
   sidecar. Copied, not moved; nothing there is replaced.
+- **Delete Rejects** (Ctrl+Backspace, the right-click menu and the
+  summary): asks, then deletes the rejects culled and their sidecars for
+  good. Tested headlessly; not tried by hand yet.
 - **LightCraft** as the raw developer: `developer = "lightcraft"`, with
   `sidecar = "adobe"` so that Omacull and LightCraft keep one sidecar
   between them. Stars arrive as stars and a reject as its reject flag.
@@ -296,6 +299,6 @@ Later:
 
 ## Not planned
 
-Ingest, deleting or moving rejects, colour labels, keywords and IPTC, a
+Ingest, moving rejects, colour labels, keywords and IPTC, a
 grid view, a catalogue, editing. See "Out" in DESIGN.md. Any of these can
 be reopened once the tool is in daily use.

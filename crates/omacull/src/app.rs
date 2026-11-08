@@ -56,6 +56,8 @@ struct Opening {
     /// The picture to start at, when one was opened rather than a folder.
     select: Option<PathBuf>,
     result: Receiver<io::Result<(Cull, Vec<String>)>>,
+    /// What to say once it's read, when it's read again after deleting.
+    then: Option<(String, bool)>,
 }
 
 /// The search box, while it's open.
@@ -134,6 +136,9 @@ pub struct App {
     tree: Option<Tree>,
     /// The cull summary is open.
     summary: bool,
+    /// The rejects asked about, while the user is asked whether to delete
+    /// them.
+    deleting: Option<Vec<PathBuf>>,
     /// Finds faces; a stand-in in tests.
     finder: Finder,
     config: Config,
@@ -242,6 +247,7 @@ impl App {
             display: Arc::new(Display::srgb()),
             tree: None,
             summary: false,
+            deleting: None,
             finder: std::sync::Arc::new(|| Err("Faces aren't looked for".into())),
             config: Config::default(),
             model: None,
@@ -379,6 +385,72 @@ impl App {
         });
     }
 
+    /// Ask whether to delete the rejects: every one culled, whether shown
+    /// or not, and no picture that isn't culled.
+    fn ask_to_delete(&mut self) {
+        let Some(shoot) = &self.shoot else { return };
+        let rejects: Vec<PathBuf> =
+            shoot.cull.frames().iter().filter(|f| f.rating == REJECT).map(|f| f.path.clone()).collect();
+        if rejects.is_empty() {
+            self.message = Some(("No rejects to delete".into(), false));
+        } else {
+            self.deleting = Some(rejects);
+        }
+    }
+
+    /// Delete the rejects asked about, with their sidecars, and read the
+    /// folder again.
+    fn delete_rejects(&mut self, ctx: &egui::Context) {
+        let (Some(rejects), Some(shoot)) = (self.deleting.take(), &self.shoot) else { return };
+        let dir = shoot.cull.dir().to_path_buf();
+        // No mark on its way writes a sidecar back afterwards.
+        self.disk.flush();
+        let failed: Vec<String> = rejects
+            .iter()
+            .filter_map(|picture| omacull_engine::delete::delete(picture).err().map(|e| format!("{}: {e}", file_name(picture))))
+            .collect();
+        let deleted = photos(rejects.len() - failed.len());
+        let said = match (failed.first(), failed.len()) {
+            (None, _) => (format!("Deleted {deleted}"), false),
+            (Some(first), 1) => (format!("Deleted {deleted}; couldn't delete {first}"), true),
+            (Some(first), n) => (format!("Deleted {deleted}; couldn't delete {n}, e.g. {first}"), true),
+        };
+        if let Some(tree) = &mut self.tree {
+            tree.refresh();
+        }
+        self.open(dir, ctx);
+        if let Some(opening) = &mut self.opening {
+            opening.then = Some(said);
+        }
+    }
+
+    /// Are you sure? Deletes on Delete; Cancel, Escape or a click outside
+    /// leaves them.
+    fn delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(rejects) = &self.deleting else { return };
+        let mut delete = false;
+        let modal = egui::Modal::new(egui::Id::new("delete rejects")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            let asked = format!("Are you sure you want to delete {}?", photos(rejects.len()));
+            ui.label(RichText::new(asked).size(16.0).color(self.theme.foreground));
+            ui.add_space(4.0);
+            let told = "They will be permanently removed from the disk, with their sidecars. This can't be undone.";
+            ui.label(RichText::new(told).color(self.theme.dark_foreground));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                delete = ui.button(RichText::new("Delete").color(self.theme.red)).clicked();
+                if ui.button("Cancel").clicked() {
+                    ui.close();
+                }
+            });
+        });
+        if delete {
+            self.delete_rejects(ctx);
+        } else if modal.should_close() {
+            self.deleting = None;
+        }
+    }
+
     /// Show a folder in the file browser.
     fn reveal(&mut self, dir: &Path) {
         self.message = Some(match start(&self.paths.files, &[dir.to_path_buf()]) {
@@ -414,7 +486,7 @@ impl App {
             ctx.request_repaint();
         });
         self.message = Some((format!("Opening {}…", dir.display()), false));
-        self.opening = Some(Opening { dir, select, result: rx });
+        self.opening = Some(Opening { dir, select, result: rx, then: None });
     }
 
     fn finish_opening(&mut self, ctx: &egui::Context) {
@@ -424,7 +496,7 @@ impl App {
             Err(TryRecvError::Disconnected) => Err(io::Error::other("reading the folder failed")),
             Ok(result) => result,
         };
-        let Opening { dir, select, .. } = self.opening.take().unwrap();
+        let Opening { dir, select, then, .. } = self.opening.take().unwrap();
         match result {
             Ok((mut cull, problems)) => {
                 self.log_passes();
@@ -469,10 +541,16 @@ impl App {
                     };
                     (text, true)
                 });
+                self.message = self.message.take().or(then);
                 let faces = (self.paths.faces.clone(), self.paths.signals.clone(), self.finder.clone());
                 let mut shoot = Shoot::new(cull, self.paths.cache.clone(), faces, self.display.clone(), ctx);
                 shoot.assist = self.assist();
                 self.shoot = Some(shoot);
+            }
+            // Nothing left in it to cull.
+            Err(_) if then.is_some() => {
+                self.close();
+                self.message = then;
             }
             Err(e) => {
                 if !dir.is_dir() {
@@ -680,6 +758,7 @@ impl App {
             }
             Command::Darktable => self.darktable(),
             Command::Export => self.export(ctx),
+            Command::DeleteRejects => self.ask_to_delete(),
             Command::Learn => self.learn(ctx, true),
             Command::Histogram
             | Command::Info
@@ -895,7 +974,13 @@ impl App {
                 }
             });
         }
-        if !ctx.egui_wants_keyboard_input() {
+        // While asking whether to delete, the keys are the dialog's: Escape
+        // is its Cancel.
+        if self.deleting.is_some() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                self.deleting = None;
+            }
+        } else if !ctx.egui_wants_keyboard_input() {
             for command in Command::pressed(ctx) {
                 self.run(command, ctx);
             }
@@ -1009,6 +1094,7 @@ impl App {
         {
             self.run(command, &ctx);
         }
+        self.delete_dialog(&ctx);
         let pasteboard = egui::Frame::new().fill(self.theme.pasteboard());
         let mut clicked = None;
         let mut panes = Vec::new();
@@ -1231,6 +1317,10 @@ impl App {
                     if copy.on_hover_text(shortcut(Command::Export)).clicked() {
                         command = Some(Command::Export);
                     }
+                    let delete = ui.add_enabled(counts.rejects > 0, egui::Button::new("Delete rejects…"));
+                    if delete.on_hover_text(shortcut(Command::DeleteRejects)).clicked() {
+                        command = Some(Command::DeleteRejects);
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Raw developer").color(self.theme.dark_foreground));
@@ -1364,6 +1454,10 @@ fn win(disk: &Disk, shoot: &mut Shoot, marks: &[(usize, Rating)], auto_advance: 
 /// How many pictures, in words.
 fn pictures(n: usize) -> String {
     if n == 1 { "1 picture".to_owned() } else { format!("{n} pictures") }
+}
+
+fn photos(n: usize) -> String {
+    if n == 1 { "1 photo".to_owned() } else { format!("{n} photos") }
 }
 
 /// Start `program` with `args`, on its own.
@@ -1505,6 +1599,8 @@ fn context_menu(ui: &mut Ui, mode: Mode, developer: &str) -> Option<Chosen> {
         item(ui, command);
     }
     let reveal = ui.button("Open the Folder in the File Browser").clicked();
+    ui.separator();
+    item(ui, Command::DeleteRejects);
     ui.separator();
     for command in [Command::Undo, Command::Redo] {
         item(ui, command);
@@ -2529,6 +2625,58 @@ mod tests {
         h.click_text("darktable");
         assert_eq!(h.app.paths.darktable, "darktable");
         assert_eq!(crate::config::Config::parse(&std::fs::read_to_string(&config).unwrap()).0.developer, "darktable");
+    }
+
+    #[test]
+    fn rejects_are_deleted_only_once_the_user_says_so() {
+        let folder = Folder::with_raws("app-delete", 4, &Arw::default());
+        let mut h = Harness::open(&folder, quiet());
+        let delete = |h: &mut Harness| h.press(Modifiers::COMMAND, Key::Backspace);
+        delete(&mut h);
+        assert!(h.app.deleting.is_none());
+        assert_eq!(h.app.message.clone().unwrap(), ("No rejects to delete".to_owned(), false));
+
+        h.press(NONE, Key::X);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::X);
+        assert_eq!(h.ratings(), [REJECT, 0, REJECT, 0]);
+        let there = || (1..=4).filter(|&i| folder.raw(i).exists()).collect::<Vec<_>>();
+
+        // Asked, and the keys are the dialog's meanwhile: Escape leaves them.
+        delete(&mut h);
+        h.click_text("Are you sure you want to delete 2 photos?");
+        h.press(NONE, Key::P);
+        assert_eq!(h.ratings(), [REJECT, 0, REJECT, 0], "nothing is marked while asking");
+        h.press(NONE, Key::Escape);
+        assert!(h.app.deleting.is_none());
+        // So does Cancel.
+        delete(&mut h);
+        h.click_text("Cancel");
+        h.frame(vec![]);
+        assert!(h.app.deleting.is_none());
+        assert_eq!(there(), [1, 2, 3, 4]);
+
+        // Delete removes them and their sidecars, and the folder is read again.
+        delete(&mut h);
+        h.click_text("Delete");
+        h.wait("the folder again", |app| app.opening.is_none());
+        assert_eq!(there(), [2, 4]);
+        assert!(!sidecar::path_for(&folder.raw(1)).exists() && !sidecar::path_for(&folder.raw(3)).exists());
+        assert_eq!(h.cull().frames().len(), 2);
+        assert_eq!(h.app.message.clone().unwrap(), ("Deleted 2 photos".to_owned(), false));
+
+        // With nothing left, the folder is closed.
+        h.press(NONE, Key::Home);
+        h.press(NONE, Key::X);
+        h.press(NONE, Key::ArrowRight);
+        h.press(NONE, Key::X);
+        delete(&mut h);
+        h.click_text("Delete");
+        h.wait("the folder again", |app| app.opening.is_none());
+        assert_eq!(there(), [] as [usize; 0]);
+        assert!(h.app.shoot.is_none());
+        assert_eq!(h.app.message.clone().unwrap(), ("Deleted 2 photos".to_owned(), false));
     }
 
     #[test]
